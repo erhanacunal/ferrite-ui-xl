@@ -216,6 +216,10 @@ pub struct ObjPool {
     pub overlay: Option<crate::types::Rect>,
     /// Retained layers: roots, plane alphas, the running pass's scope (`layer.rs`).
     pub layers: crate::layer::Layers,
+    /// `FLEX_AUTO` containers waiting for their automatic layout (`vm_flex.rs`).
+    pub(crate) flex_pending: Vec<WidgetId>,
+    /// A layout is running: its own writes queue nothing.
+    pub(crate) flex_busy: bool,
 }
 
 impl ObjPool {
@@ -247,6 +251,8 @@ impl ObjPool {
             render: RenderState::new(),
             overlay: None,
             layers: crate::layer::Layers::new(),
+            flex_pending: Vec::new(),
+            flex_busy: false,
         }
     }
 

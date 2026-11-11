@@ -24,6 +24,7 @@ pub fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
 
 /// Check if the back buffer has any dirty widgets.
 pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
+    crate::vm::flex_flush(ctx);
     if !ctx.objs.render.maybe_dirty {
         return false;
     }
@@ -82,6 +83,7 @@ impl PaintList {
 /// Dirty-mode counterpart of the list `render_buffered_content` returns: the
 /// dirty on_paint widgets, collected *before* `render_dirty` clears the flags.
 pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
+    crate::vm::flex_flush(ctx);
     if !ctx.objs.render.maybe_dirty {
         return;
     }
@@ -144,6 +146,7 @@ pub fn capture_paint<P: Platform>(
 /// custom drawing belongs to this back buffer, on top of the background just
 /// drawn — painting after the swap would reach only one of the two buffers.
 pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
+    crate::vm::flex_flush(ctx);
     let mut paint = PaintList::new();
     let buf = ctx.lcd.back_buf();
     // Layers are a dirty-mode feature.
@@ -363,6 +366,7 @@ fn redraw_behind_region<P: Platform>(
 /// Draw the entire widget tree from scratch (initial draw or full redraw).
 /// Iterative DFS using cached order — no recursion, no stack growth.
 pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
+    crate::vm::flex_flush(ctx);
     ctx.objs.ensure_dfs();
     ctx.objs.geo_begin();
     let active = {
@@ -449,6 +453,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// This prevents hidden panels from overwriting visible siblings that share
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
+    crate::vm::flex_flush(ctx);
     if !ctx.objs.render.maybe_dirty {
         return;
     }

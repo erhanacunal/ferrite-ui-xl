@@ -41,7 +41,7 @@ Varsayım: XL bare-metal + Embassy üzerinde kalır.
   `target/golden/<senaryo>/*_diff.png`).
 - [ ] **1c Referans ölçümleri (cihaz):** `scripts/perf_baseline.py` (kartta XL firmware +
   WiFi gerekli) örnek başına `ferrite_cli.py perf` çıktısını `perf/baseline/`'a yazar.
-- [ ] **1d Native flex** (aşağıya bakın). Seviye 1 tamam, seviye 2 bekliyor.
+- [x] **1d Native flex** (aşağıya bakın). Seviye 1 ve 2 tamam.
 
 Kabul kriteri: testler geçiyor, sim örnekleri çalışıyor, tablet cihazda açılıyor,
 perf değerleri ferrite-ui ile aynı (±%2).
@@ -63,7 +63,14 @@ sonuç verir. Layout'un maliyeti raster'a göre küçük, ayrı bir çekirdeğe 
   .fl ile bire bir aynı. Test: `runtime::flex_tests`, `testdata/flex/flex_test.fl`
   programını iki şekilde derleyip (`gen.py`) tüm widget'ları karşılaştırıyor.
   Bu programda VM komut sayısı 274.850 → 160.631.
-- **Seviye 2, otomatik layout:** layout'u etkileyen prop'lar değiştiğinde container
+- [x] **Seviye 2, otomatik layout (opt-in: `FLEX_AUTO` = 128, flex mode bit 7):** bit'i
+  olmayan container'lar bugünkü gibi davranır (flex çocuklarını elle konumlandıran kod
+  bozulmasın diye). lib/flex.fl bit'i yok sayar, eski cihazlarda `flexLayout()` gerekir.
+  Bekleyen container'lar `ObjPool::flex_pending`'te (widget flag'lerinde boş bit yok).
+  Test: `flex_auto.fl` (FLEX_AUTO, çağrı yok) ile `flex_manual.fl` (her okumadan önce
+  `flexLayout`) aynı gözlemleri ve aynı ağacı vermeli; okumasız yazmadan sonra render
+  geçişi layout'u güncelliyor.
+  Tasarım: layout'u etkileyen prop'lar değiştiğinde container
   "layout dirty" işaretlenir: `size`, `visible`, `flex*`, `border`/`padding`, çocuk
   eklenmesi/çıkarılması/taşınması, büyümeyen çocuğun ana eksen boyutu.
   - Layout VM burst'ünün sonunda (render/commit öncesi) native olarak çalışır.

@@ -2548,6 +2548,54 @@ mod flex_tests {
             assert_eq!(a, b, "widget {} (fl vs native)", a.0);
         }
     }
+
+    /// Geometry of every live widget and the values `flex_auto_body.fl`
+    /// observed (children of its first widget), after `steps` passes.
+    fn run_auto(code: &[u8], steps: usize) -> (Vec<(ObjPtr, ObjPtr, i16, i16, u16, u16)>, Vec<i32>) {
+        let mut rt = super::multi_tests::boot(&[(b"main", code.to_vec())]);
+        for _ in 0..steps {
+            rt.step();
+        }
+        assert_eq!(rt.error_code, 0);
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let objs = &rt.ctx.objs;
+        let geo = (0..objs.ptr_count() as ObjPtr)
+            .map(WidgetId)
+            .filter(|&w| objs.is_live(w))
+            .map(|w| {
+                let x = objs.get(w);
+                (w.0, x.parent.0, x.location.x, x.location.y, x.size.w, x.size.h)
+            })
+            .collect();
+        let mut obs = Vec::new();
+        let mut c = objs.get(objs.get(objs.root).first_child).first_child;
+        while c.is_some() {
+            obs.push(objs.get(c).value as i32);
+            c = objs.get(c).next_sibling;
+        }
+        (geo, obs)
+    }
+
+    #[test]
+    fn flex_auto_matches_explicit_layout() {
+        let auto = include_bytes!("../testdata/flex/flex_auto.prg");
+        let manual = include_bytes!("../testdata/flex/flex_manual.prg");
+        // After setup: every read saw the laid-out value.
+        let (ga, oa) = run_auto(auto, 0);
+        let (gm, om) = run_auto(manual, 0);
+        assert_eq!(oa, om, "observations (auto vs flexLayout calls)");
+        assert_eq!(&oa[..4], &[100, 130, 80, 130]);
+        assert_eq!(oa[6], 80, "nested auto column stretched its child");
+        assert_eq!(*oa.last().unwrap(), 50, "a plain container is not laid out again");
+        assert_eq!(ga, gm, "tree after setup");
+        let setup_geo = ga;
+        // loop() changes a size without reading anything: the render pass
+        // lays the auto row out. (Enough passes for loop() to get there.)
+        let (ga, _) = run_auto(auto, 200);
+        let (gm, _) = run_auto(manual, 200);
+        assert!(ga != setup_geo, "loop() changed the tree");
+        assert_eq!(ga, gm, "tree after a write with no read");
+    }
 }
 
 #[cfg(all(test, feature = "mock"))]

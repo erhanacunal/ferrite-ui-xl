@@ -19,6 +19,8 @@ use crate::render;
 
 #[path = "vm_flex.rs"]
 mod flex;
+pub use flex::FLEX_AUTO;
+pub(crate) use flex::flush as flex_flush;
 use crate::strpool;
 use crate::pool::{ObjPool, ObjPtr, PTR_NONE};
 use crate::types::{Edges, Offset, Size};
@@ -2086,6 +2088,10 @@ impl Vm {
             }
             OP_W_GET => {
                 let prop_id = self.read_u8();
+                // FLEX_AUTO: a position or size reads the laid-out value.
+                if matches!(prop_id, PROP_LOC_X | PROP_LOC_Y | PROP_SIZE_W | PROP_SIZE_H) {
+                    flex::flush(ctx);
+                }
                 if self.target.is_some() {
                     let v = self.get_scalar_prop(ctx, prop_id);
                     self.push(v);
@@ -2602,6 +2608,7 @@ impl Vm {
                 let (widget, prop) = self.pop2();
                 let (widget, prop) = (WidgetId(widget as ObjPtr), prop as u8);
                 let now = ctx.systick.millis();
+                flex::flush(ctx); // FLEX_AUTO: tween from the laid-out value
                 self.start_anim(ctx, widget, prop, to, duration, ctrl, on_end, now);
             }
             OP_STOP_ANIM => {
@@ -3083,6 +3090,7 @@ impl Vm {
             return;
         }
         self.set_scalar_prop(ctx, prop_id, val);
+        ctx.objs.flex_note(self.target, prop_id);
         if prop_id == PROP_FONT_ID {
             if let Some(fs) = ctx.fs.as_ref() {
                 ctx.fonts.find_or_load(val as u8, fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
@@ -3112,6 +3120,7 @@ impl Vm {
     fn w_set_len<P: Platform>(&mut self, ctx: &mut Ctx<P>, prop_id: u8, data: &[u8]) {
         if self.target.is_some() {
             self.set_compound_prop(prop_id, data, ctx);
+            ctx.objs.flex_note(self.target, prop_id);
             if prop_id == PROP_LOCATION && ctx.objs.is_active_layer_root(self.target) {
                 return;
             }
@@ -3561,6 +3570,7 @@ impl Vm {
             };
             if val != Self::get_scalar_prop_on(ctx, a.target, a.prop_id) {
                 Self::set_scalar_prop_on(ctx, a.target, a.prop_id, val);
+                ctx.objs.flex_note(a.target, a.prop_id);
                 // The setter marked a location change as a move
                 // (`mark_moved`); `mark_dirty` would list it as changed and
                 // keep its pixels from being shifted.

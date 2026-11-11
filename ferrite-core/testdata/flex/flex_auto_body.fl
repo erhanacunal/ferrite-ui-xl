@@ -1,0 +1,139 @@
+// flex_auto_body.fl — FLEX_AUTO scenario (runtime::flex_tests), included by
+// flex_auto.fl (AUTO = 1: FLEX_AUTO containers, no flexLayout() calls) and
+// flex_manual.fl (AUTO = 0: plain containers, flexLayout() before every
+// read). Both must observe the same values and end with the same tree.
+// Observations go to children of `res` (value = observed number).
+
+#include "flex.fl"
+
+var res: widget;
+var row: widget;
+var a: widget;
+var b: widget;
+var kc: widget;
+var kd: widget;
+var inner: widget;
+var row2: widget;
+var x: widget;
+var y: widget;
+var frames = 0;
+
+fn obs(v) {
+    var w: widget = alloc();
+    target(w);
+    parent(res);
+    set(value, v);
+}
+
+// The manual program's explicit layout; nothing for FLEX_AUTO.
+fn lay(w: widget) {
+    if (AUTO == 0) {
+        flexLayout(w);
+    }
+}
+
+fn setup() {
+    res = alloc();
+    target(res);
+    parent(0);
+
+    row = alloc();
+    target(row);
+    parent(0);
+    set(size, 400, 100);
+    set(flex, FLEX_ROW | (AUTO * FLEX_AUTO));
+    a = alloc();
+    target(a);
+    parent(row);
+    set(size, 50, 20);
+    b = alloc();
+    target(b);
+    parent(row);
+    set(size, 50, 20);
+    kc = alloc();
+    target(kc);
+    parent(row);
+    set(size, 50, 20);
+    lay(row);
+    target(kc);
+    obs(get(loc_x));                       // 100
+
+    target(a); set(size_w, 80);
+    lay(row);
+    target(kc);
+    obs(get(loc_x));                       // 130
+
+    target(b); set(visible, 0);
+    lay(row);
+    target(kc);
+    obs(get(loc_x));                       // 80
+
+    kd = alloc();
+    target(kd);
+    parent(row);
+    set(size, 10, 30);
+    lay(row);
+    target(kd);
+    obs(get(loc_x));                       // 130
+
+    target(row);
+    set(padding, 4, 0, 0, 6);
+    set(flex, FLEX_ROW | JUSTIFY_END | ITEMS_CENTER | (AUTO * FLEX_AUTO));
+    lay(row);
+    target(a);
+    obs(get(loc_x));
+    target(a);
+    obs(get(loc_y));
+
+    // Nested auto container: a column that stretches its child.
+    target(a);
+    set(flex, FLEX_COLUMN | ITEMS_STRETCH | (AUTO * FLEX_AUTO));
+    inner = alloc();
+    target(inner);
+    parent(a);
+    set(size, 10, 5);
+    lay(row);
+    target(inner);
+    obs(get(size_w));                      // a's width (80)
+
+    target(row); set(size_w, 600);
+    lay(row);
+    target(kd);
+    obs(get(loc_x));
+
+    target(kc); set(flex_grow, 1);
+    lay(row);
+    target(kc);
+    obs(get(size_w));
+    target(kd);
+    obs(get(loc_x));
+
+    // Plain container in both programs: no automatic layout.
+    row2 = alloc();
+    target(row2);
+    parent(0);
+    set(size, 300, 50);
+    set(flex, FLEX_ROW);
+    x = alloc();
+    target(x);
+    parent(row2);
+    set(size, 50, 20);
+    y = alloc();
+    target(y);
+    parent(row2);
+    set(size, 50, 20);
+    flexLayout(row2);
+    target(x); set(size_w, 70);
+    target(y);
+    obs(get(loc_x));                       // 50: not laid out again
+}
+
+fn loop() {
+    // Write without reading: the render pass lays the auto row out.
+    if (frames == 1) {
+        target(a); set(size_w, 30);
+        lay(row);
+    }
+    frames++;
+    yield_op();
+}

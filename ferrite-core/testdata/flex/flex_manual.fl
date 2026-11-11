@@ -1,0 +1,3 @@
+// Plain containers, flexLayout() before every read (see flex_auto_body.fl).
+const AUTO = 0;
+#include "flex_auto_body.fl"

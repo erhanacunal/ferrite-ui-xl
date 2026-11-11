@@ -895,6 +895,7 @@ impl ObjPool {
             self.get_mut(last).next_sibling = child;
         }
         self.dfs_valid = false;
+        self.flex_mark(parent);
     }
 
     /// Compute widget's absolute border-box rect in screen coordinates.
@@ -1085,6 +1086,7 @@ impl ObjPool {
                 }
             }
         }
+        self.flex_mark(parent);
         // Free the whole subtree.
         let mut stack: Vec<WidgetId> = Vec::new();
         stack.push(root);

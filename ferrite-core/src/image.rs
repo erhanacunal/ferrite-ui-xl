@@ -69,6 +69,7 @@ const FLAG_ALPHA: u8 = 0x04;
 /// Image metadata from flash. Pixel data is streamed during drawing.
 /// RAM cost: ~32 bytes (palette stays in flash, read to stack during draw),
 /// plus the decoded pixels of a JPEG image.
+#[derive(Clone)]
 pub struct Image {
     pub image_id: u8,
     pub width: u16,
@@ -719,6 +720,25 @@ impl ImageList {
             *img = Image::empty();
         }
         self.count = 0;
+    }
+
+    /// Make this list hold the images `other` holds (the render context's
+    /// copy of the VM's list): copies the ones missing (decoded pixels
+    /// included); starts over if it holds one `other` doesn't.
+    pub fn sync_from(&mut self, other: &ImageList) {
+        let mine = &self.images[..self.count as usize];
+        let theirs = &other.images[..other.count as usize];
+        if mine.len() == theirs.len() && mine.iter().zip(theirs).all(|(a, b)| a.image_id == b.image_id) {
+            return;
+        }
+        if mine.iter().any(|i| other.find(i.image_id).is_none()) {
+            self.clear();
+        }
+        for img in &other.images[..other.count as usize] {
+            if self.find(img.image_id).is_none() {
+                self.add(img.clone());
+            }
+        }
     }
 
     /// Add an image to the list. Returns false if full.

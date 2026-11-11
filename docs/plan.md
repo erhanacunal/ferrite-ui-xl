@@ -174,6 +174,12 @@ kaydedilip liste olarak gönderilir (2d).
 | 3a+ | Buffered render modu kaldırıldı (yalnız dirty): tek `FLAG_DIRTY`, widget başına tek önceki rect; taşınacak durum azaldı | Testler, golden iki modda aynı |
 | 3b ✓ | Tek çekirdekte iki havuz (`view.rs`, `Ctx::view`, `render::with_view`; mesajlar `RenderMsg`): VM havuzu + render havuzu. Render fazında senkron: arena'nın kullanılan kısmı + işaretçi tablosu kopyalanır, VM'in dirty/changed bilgisi devredilip VM'de temizlenir; `will_move` render tarafında (kopyadan önce eski mutlak rect'ler). Render yalnız kendi havuzunu okur | Golden aynı; kopya maliyeti (perf) |
 | 3c | Render havuzu + render fazı ayrı çekirdekte (exynos CPU2; LCD/G2D/GPU sahipliği ve kesmeleri oraya). Dokunma girişi (`FullInput`: basma geri bildirimi, kaydırma çubuğu, slider) bugün `render_dirty`'yi doğrudan çağırıyor: mesaja dönmeli. VM çekirdeği frame sonunda kopyayı bırakır, beklemez | Kartta perf A/B, golden (sim tek çekirdek kalır) |
+
+3c alt adımları:
+- **3c-1 ✓** Render tarafının kendi `Ctx`'i (`Ctx::render_ctx`): render havuzu + aynı donanıma ulaşan lcd/flash + kopyalanan font/resim/fs. Tek çekirdekte, eşzamanlı (sim + kart: golden aynı, perf gürültü içinde).
+- **3c-2** Devir el sıkışması: render bağlamı bir sahiplik bayrağı arkasında (IDLE: VM çekirdeği senkronlar / BUSY: render tarafı çalışır); `render_dirty` = "teslim et, meşgulse sonraki pass'e bırak". Render sonrası işler (`flush_dirty`, katman yerleşimi) render tarafına; VM'in ekrana doğrudan çizimi (`on_paint`, çizim builtin'leri, klavye overlay'i, hata ekranı) render tarafı IDLE iken. Tek çekirdekte hâlâ eşzamanlı çalıştırılır.
+- **3c-3** exynos CPU2: render döngüsü CPU2'de (executor yok, `wfe`/`sev`); G2D kesmesi CPU2'ye, GPU/G2D/katman sahipliği CPU2'de; L1 temizlikleri (set/way yereldir) çizen çekirdekte. Standby'da CPU2 park. Kartta perf A/B.
+
 | 3d | VM'in ekrana doğrudan çizimi (`on_paint` dışı `fillRect`…) ve `on_paint` listeleri render çekirdeğine liste olarak; C okumaları (`snapshot.rs`) seqlock'lu snapshot'tan | `paint` örneği, `--stale` |
 
 ### Riskler

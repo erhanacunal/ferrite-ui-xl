@@ -76,6 +76,7 @@ pub const RES_ANY: u8 = 0xFF;
 
 /// Flash dosya sistemi — mount edilince header RAM'de tutulur.
 /// Resource table flash'ta kalır, ihtiyaç olunca okunur.
+#[derive(Clone)]
 pub struct Fs {
     pub version: u16,
     pub screen_w: u16,

@@ -47,6 +47,7 @@ const BITMAP_BUF_SIZE: usize = 128;
 pub const EMBEDDED_FONT_ID: u8 = 0;
 
 /// Glyph + codepoint storage — ROM reference (embedded) or heap-allocated (flash-loaded).
+#[derive(Clone)]
 enum GlyphData {
     Static {
         glyphs: &'static [GfxGlyph],
@@ -91,6 +92,23 @@ pub struct Font {
     /// to own the buffer, never read directly.
     #[allow(dead_code)]
     bitmap_ram: Vec<u8>,
+}
+
+impl Clone for Font {
+    fn clone(&self) -> Self {
+        let bitmap_ram = self.bitmap_ram.clone();
+        // A cached bitmap is pointed at in the copy's own buffer.
+        let embedded_bitmap = if self.bitmap_ram.is_empty() { self.embedded_bitmap } else { bitmap_ram.as_ptr() };
+        Font {
+            font_id: self.font_id,
+            bpp: self.bpp,
+            y_advance: self.y_advance,
+            glyphs: self.glyphs.clone(),
+            bitmap_addr: self.bitmap_addr,
+            embedded_bitmap,
+            bitmap_ram,
+        }
+    }
 }
 
 // Font only holds a const pointer — Send/Sync safe (single core, no ISR access)
@@ -921,6 +939,25 @@ impl FontList {
             return self.add(font);
         }
         false
+    }
+
+    /// Make this list hold the fonts `other` holds (the render context's copy
+    /// of the VM's list): copies the ones missing; starts over if it holds
+    /// one `other` doesn't.
+    pub fn sync_from(&mut self, other: &FontList) {
+        if self.fonts.len() == other.fonts.len()
+            && self.fonts.iter().zip(&other.fonts).all(|(a, b)| a.font_id == b.font_id)
+        {
+            return;
+        }
+        if self.fonts.iter().any(|f| other.find(f.font_id).is_none()) {
+            self.fonts.clear();
+        }
+        for f in &other.fonts {
+            if self.find(f.font_id).is_none() {
+                self.fonts.push(f.clone());
+            }
+        }
     }
 
     /// Get the embedded font (font_id = 0). Panics if not added.

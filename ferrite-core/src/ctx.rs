@@ -21,14 +21,23 @@ use crate::fs::Fs;
 use crate::image::ImageList;
 use crate::pool::ObjPool;
 
+extern crate alloc;
+
 pub struct Ctx<P: Platform> {
     pub lcd: LcdImpl<P::LcdB>,
     pub flash: FlashImpl<P::FlashB>,
     pub fonts: FontList,
     pub images: ImageList,
     pub objs: ObjPool,
-    /// The render pool: the renderer's copy of `objs` (`view.rs`).
+    /// The render pool: the renderer's copy of `objs` (`view.rs`), unless
+    /// `render_ctx` holds it.
     pub view: ObjPool,
+    /// The render side's own context (plan step 3c), when the board gives
+    /// one: its `objs` is the render pool, its `lcd`/`flash` reach the same
+    /// hardware, its fonts/images/fs are copies kept up to date at each sync
+    /// (`render::with_view`). None = the renderer works on `self` with the
+    /// pools swapped.
+    pub render_ctx: Option<alloc::boxed::Box<Ctx<P>>>,
     pub fs: Option<Fs>,
     pub backlight: BacklightImpl<P::BacklightB>,
     pub rtc: RtcImpl<P::RtcB>,
@@ -42,4 +51,14 @@ pub struct Ctx<P: Platform> {
     pub cursor_visible: bool,
     /// Task slots and the requests the VMs queue (`multi_program`).
     pub tasks: crate::task::TaskTable,
+}
+
+impl<P: Platform> Ctx<P> {
+    /// The pool the renderer works on (`view.rs`).
+    pub fn render_pool(&self) -> &ObjPool {
+        match &self.render_ctx {
+            Some(r) => &r.objs,
+            None => &self.view,
+        }
+    }
 }

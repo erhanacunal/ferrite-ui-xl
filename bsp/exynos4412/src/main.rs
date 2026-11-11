@@ -178,6 +178,27 @@ fn main(_args: BootArgs) -> ! {
     net::start(pmic, mct);
     println!("ferrite: up, entering runtime");
 
+    // The render side's own context (plan step 3c): same LCD and flash
+    // (statics behind zero-sized backends), everything else idle.
+    let render_ctx = Some(Box::new(Ctx::<Exynos4412Platform> {
+        lcd: LcdImpl::with_backend(lcd::FimdLcd),
+        flash: FlashImpl::with_backend(flash::RamFlash),
+        fonts: FontList::new(),
+        images: ImageList::new(),
+        objs: ferrite_core::pool::ObjPool::view(),
+        view: ferrite_core::pool::ObjPool::view(),
+        render_ctx: None,
+        fs: None,
+        backlight: BacklightImpl::with_backend(backlight::GpioBacklight),
+        rtc: RtcImpl::with_backend(rtc::new()),
+        usart: UsartImpl::with_backend(usart::HwUart),
+        systick: SystickImpl::init(),
+        gpio: ferrite_core::gpio::GpioImpl::none(),
+        eeprom: ferrite_core::eeprom::EepromImpl::none(),
+        audio: ferrite_core::audio::AudioImpl::with_backend(audio::new(pmic)),
+        cursor_visible: false,
+        tasks: ferrite_core::task::TaskTable::new(),
+    }));
     let ctx = Box::new(Ctx::<Exynos4412Platform> {
         lcd: LcdImpl::with_backend(lcd),
         flash: FlashImpl::with_backend(flash::RamFlash),
@@ -185,6 +206,7 @@ fn main(_args: BootArgs) -> ! {
         images: ImageList::new(),
         objs: ObjPool::new(),
         view: ferrite_core::pool::ObjPool::view(),
+        render_ctx,
         fs: None,
         backlight: BacklightImpl::with_backend(backlight::GpioBacklight),
         rtc: RtcImpl::with_backend(rtc::new()),

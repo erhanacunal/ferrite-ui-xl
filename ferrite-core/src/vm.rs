@@ -4051,6 +4051,7 @@ mod anim_tests {
             images: ImageList::new(),
             objs: ObjPool::new(),
             view: ObjPool::view(),
+            render_ctx: None,
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),

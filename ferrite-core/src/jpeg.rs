@@ -124,6 +124,14 @@ impl AlignedBuf {
     }
 }
 
+impl Clone for AlignedBuf {
+    fn clone(&self) -> Self {
+        let mut b = AlignedBuf::new(self.len).expect("image copy");
+        b.bytes_mut().copy_from_slice(self.bytes());
+        b
+    }
+}
+
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
         // SAFETY: allocated in `new` with this exact layout.

@@ -108,6 +108,33 @@ fn main() {
         }
     };
 
+    // The render side's own context (plan step 3c): same framebuffer and
+    // flash, everything else idle. `FERRITE_SIM_ONE_CTX=1`: none (the
+    // renderer swaps pools inside the VM's context instead).
+    let render_ctx = if std::env::var("FERRITE_SIM_ONE_CTX").is_ok_and(|v| v == "1") {
+        None
+    } else {
+        Some(Box::new(Ctx::<SimPlatform> {
+            lcd: lcd::new(fb.clone()),
+            flash: flash.clone(),
+            fonts: FontList::new(),
+            images: ImageList::new(),
+            objs: ferrite_core::pool::ObjPool::view(),
+            view: ferrite_core::pool::ObjPool::view(),
+            render_ctx: None,
+            fs: None,
+            backlight: backlight::new(),
+            rtc: rtc::init(),
+            usart: usart::init(),
+            systick: systick::Systick::handle(),
+            audio: ferrite_core::audio::AudioImpl::with_backend(audio::SimAudio::new(None)),
+            jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
+            gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
+            eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(None)),
+            cursor_visible: false,
+            tasks: ferrite_core::task::TaskTable::new(),
+        }))
+    };
     let ctx = Box::new(Ctx::<SimPlatform> {
         lcd: lcd::new(fb.clone()),
         flash,
@@ -115,6 +142,7 @@ fn main() {
         images: ImageList::new(),
         objs: ObjPool::new(),
         view: ferrite_core::pool::ObjPool::view(),
+        render_ctx,
         fs: None,
         backlight: backlight::new(),
         rtc: rtc::init(),

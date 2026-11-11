@@ -226,12 +226,40 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
 pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -> R) -> R {
     debug_assert!(!ctx.objs.is_view(), "nested render");
     crate::vm::flex_flush(ctx);
+    if let Some(mut r) = ctx.render_ctx.take() {
+        // The render side's own context (step 3c).
+        sync_render_ctx(ctx, &mut r);
+        let out = f(&mut r);
+        ctx.objs.mirror_layers(&r.objs);
+        ctx.render_ctx = Some(r);
+        return out;
+    }
     ctx.objs.sync_view(&mut ctx.view);
     core::mem::swap(&mut ctx.objs, &mut ctx.view);
     let r = f(ctx);
     core::mem::swap(&mut ctx.objs, &mut ctx.view);
     ctx.objs.mirror_layers(&ctx.view);
     r
+}
+
+/// Hand the VM context's state over to the render context `r`: the pool
+/// (`ObjPool::sync_view`), the fonts and images the VM loaded, the
+/// filesystem, the orientation, the cursor blink.
+fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>) {
+    ctx.objs.sync_view(&mut r.objs);
+    r.fonts.sync_from(&ctx.fonts);
+    r.images.sync_from(&ctx.images);
+    if r.fs.is_none() != ctx.fs.is_none() {
+        r.fs = ctx.fs.clone();
+    } else if let (Some(a), Some(b)) = (&mut r.fs, &ctx.fs) {
+        if a.checksum != b.checksum {
+            *a = b.clone();
+        }
+    }
+    if r.lcd.is_portrait() != ctx.lcd.is_portrait() {
+        r.lcd.set_portrait(ctx.lcd.is_portrait());
+    }
+    r.cursor_visible = ctx.cursor_visible;
 }
 
 fn render_all_view<P: Platform>(ctx: &mut Ctx<P>) {
@@ -322,7 +350,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     crate::vm::flex_flush(ctx);
-    if !ctx.objs.needs_sync() && !ctx.view.render.maybe_dirty {
+    if !ctx.objs.needs_sync() && !ctx.render_pool().render.maybe_dirty {
         return;
     }
     with_view(ctx, render_dirty_view);
@@ -3966,6 +3994,7 @@ mod shift_tests {
             images: ImageList::new(),
             objs: ObjPool::new(),
             view: ObjPool::view(),
+            render_ctx: None,
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),

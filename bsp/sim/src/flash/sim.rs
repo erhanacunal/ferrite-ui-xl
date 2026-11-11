@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::vec::Vec;
 
 use super::FlashBackend;
@@ -6,12 +7,11 @@ use super::FlashBackend;
 const FLASH_SIZE: usize = 32 * 1024 * 1024; // W25Q256 = 32 MiB
 const SECTOR_SIZE: usize = 4096;
 
-// `Clone` so `Platform::FlashB` is satisfied. The VM clones the flash handle
-// once at load for flash-execution cache refills; the sim never uses flash-exec,
-// so this clone (a full image copy) is not on any hot path.
+// `Clone` shares the image: the render context reads the same flash (and
+// the VM's flash-execution handle sees writes).
 #[derive(Clone)]
 pub struct FileFlash {
-    image: RefCell<Vec<u8>>,
+    image: Rc<RefCell<Vec<u8>>>,
 }
 
 impl FileFlash {
@@ -19,7 +19,7 @@ impl FileFlash {
     pub fn new(mut bytes: Vec<u8>) -> Self {
         bytes.resize(FLASH_SIZE, 0xFF);
         Self {
-            image: RefCell::new(bytes),
+            image: Rc::new(RefCell::new(bytes)),
         }
     }
 

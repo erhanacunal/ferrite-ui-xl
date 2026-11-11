@@ -497,7 +497,7 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// still passes for its own work (presents, polled keys, messages from
     /// other cores).
     pub fn idle_ms(&self) -> Option<u32> {
-        if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.render.maybe_dirty || self.ctx.view.render.maybe_dirty {
+        if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.render.maybe_dirty || self.ctx.render_pool().render.maybe_dirty {
             return Some(0);
         }
         if self.ctx.objs.layers.placed {
@@ -2411,6 +2411,7 @@ mod mem_detail_tests {
             images: ImageList::new(),
             objs: ObjPool::new(),
             view: ObjPool::view(),
+            render_ctx: None,
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),

@@ -154,6 +154,13 @@ pub(crate) struct RenderState {
     /// drawing builtins go to `paint_rec` while `painting` is up.
     pub(crate) paint_rec: crate::dl::Recorder,
     pub(crate) painting: core::cell::Cell<bool>,
+    /// VM pool, with a render context (`render::records`): the VM's drawing
+    /// outside `on_paint` goes to `screen_rec` (`Vm::draw_op`), closed into
+    /// a `Draw::Screen` at the next `on_paint` recording or sync.
+    pub(crate) screen_rec: crate::dl::Recorder,
+    /// VM pool: drawing for the render side, in order (`view::Draw`), handed
+    /// over at the next sync; render pool: what the next job replays.
+    pub(crate) draws: Vec<crate::view::Draw>,
     /// Each `on_paint` widget's last paint list, by widget id.
     pub(crate) paints: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, crate::dl::List>>,
     /// The look key each widget last drew with (dumps: a widget in a layer is
@@ -186,6 +193,8 @@ impl RenderState {
             dl_cache: core::cell::RefCell::new(crate::dl::Cache::new()),
             paint_rec: crate::dl::Recorder::new(),
             painting: core::cell::Cell::new(false),
+            screen_rec: crate::dl::Recorder::new(),
+            draws: Vec::new(),
             paints: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             drawn_keys: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             snapshot: crate::snapshot::Snapshot::new(),

@@ -1357,27 +1357,28 @@ fn build_fault_dialog<P: PlatformRuntime>(
 // ============================================================================
 
 fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: &mut P::Input) {
-    render::reclaim(ctx);
+    let idle = render::reclaim(ctx);
     if !P::render_due() {
         return;
     }
     let mut paint = render::PaintList::new();
-    render::collect_dirty_paint(ctx, &mut paint);
-    // The board renderer may keep on_paint drawing in captures it draws itself.
-    let painting = !paint.is_empty();
-    if painting {
-        // Captures and on_paint draw on the screen: after the last render.
-        render::wait_idle(ctx);
-    }
-    let paint = render::capture_paint(ctx, &paint, |ctx, one| run_paint(ctx, tasks, one));
-    if painting {
-        // This pass waited for the last render (and on_paint may draw right
-        // after this one): handing it over would only add its cost.
-        render::render_dirty_here(ctx);
-    } else {
+    if render::records(ctx) {
+        // The render side draws (step 3d): on_paint is recorded now and
+        // handed over with this render (`render::run_job` replays it into
+        // captures before the render, on the screen after it). While the
+        // last render still runs the dirty bits wait for the next pass.
+        if idle {
+            render::collect_dirty_paint(ctx, &mut paint);
+            run_paint(ctx, tasks, &paint);
+        }
         render::render_dirty(ctx);
+    } else {
+        render::collect_dirty_paint(ctx, &mut paint);
+        // The board renderer may keep on_paint drawing in captures it draws itself.
+        let paint = render::capture_paint(ctx, &paint, |ctx, one| run_paint(ctx, tasks, one));
+        render::render_dirty(ctx);
+        run_paint(ctx, tasks, &paint);
     }
-    run_paint(ctx, tasks, &paint);
     input.draw_overlay(ctx, false);
     ctx.lcd.flush_dirty();
     snapshot_fill(ctx, tasks);

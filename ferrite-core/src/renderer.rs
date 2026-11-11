@@ -427,4 +427,158 @@ mod tests {
         crate::render::render_dirty(&mut ctx);
         assert_eq!(take(), [(KIND_GAUGE, 100 * 100)]);
     }
+
+    std::thread_local! {
+        /// What the screen, the captures and the renders saw, in order.
+        static EVENTS: RefCell<Vec<alloc::string::String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn event(e: alloc::string::String) {
+        EVENTS.with(|v| v.borrow_mut().push(e));
+    }
+
+    /// Logs its fills.
+    struct LogLcd;
+    impl crate::lcd::LcdBackend for LogLcd {
+        const WIDTH: u16 = 800;
+        const HEIGHT: u16 = 480;
+        fn begin_frame(&mut self) {}
+        fn end_frame(&mut self) {}
+        fn back_buf(&self) -> u8 {
+            0
+        }
+        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
+            event(std::format!("fill {color} {x},{y},{w},{h}"));
+        }
+        fn begin_pixels(&self, _x: u16, _y: u16, _w: u16, _h: u16) {}
+        fn write_pixel(&self, _color: u16) {}
+        fn send_command(&self, _cmd: u16) {}
+        fn send_data(&self, _data: u16) {}
+    }
+
+    /// Takes whole renders (logged, draws nothing) and captures widgets with
+    /// the background 0xCAFE.
+    struct PaintRenderer;
+    impl WidgetRenderer<PaintPlatform> for PaintRenderer {
+        const COMPOSES: bool = true;
+        const CAPTURES: bool = true;
+        fn compose(_: &Ctx<PaintPlatform>, _: &[Rect]) -> bool {
+            event("render".into());
+            true
+        }
+        fn capture_begin(ctx: &Ctx<PaintPlatform>, id: WidgetId, _: &Rect) -> bool {
+            let take = ctx.objs.get(id).background_color == 0xCAFE;
+            event(std::format!("{} {}", if take { "capture" } else { "declined" }, id.0));
+            take
+        }
+        fn capture_end(_: &Ctx<PaintPlatform>, id: WidgetId) {
+            event(std::format!("captured {}", id.0));
+        }
+    }
+
+    struct PaintPlatform;
+    impl Platform for PaintPlatform {
+        type LcdB = LogLcd;
+        type FlashB = MockFlash;
+        type TouchB = MockTouch;
+        type BacklightB = MockBacklight;
+        type RtcB = MockRtc;
+        type UsartB = MockUsart;
+        type SystickB = MockSystick;
+        type AudioB = crate::audio::NoAudio;
+        #[cfg(feature = "jpeg")]
+        type JpegB = crate::jpeg::NoJpeg;
+        type GpioB = MockGpio;
+        type EepromB = MockEeprom;
+        type Renderer = PaintRenderer;
+    }
+
+    fn paint_ctx(objs: ObjPool) -> Ctx<PaintPlatform> {
+        Ctx {
+            lcd: LcdImpl::with_backend(LogLcd),
+            flash: FlashImpl::with_backend(MockFlash),
+            fonts: FontList::new(),
+            images: ImageList::new(),
+            objs,
+            view: ObjPool::view(),
+            render_ctx: None,
+            render_away: false,
+            fs: None,
+            backlight: BacklightImpl::with_backend(MockBacklight),
+            rtc: RtcImpl::with_backend(MockRtc),
+            usart: UsartImpl::with_backend(MockUsart),
+            systick: SystickImpl::init(),
+            audio: crate::audio::AudioImpl::none(),
+            #[cfg(feature = "jpeg")]
+            jpeg: crate::jpeg::JpegImpl::none(),
+            gpio: GpioImpl::with_backend(MockGpio::default()),
+            eeprom: crate::eeprom::EepromImpl::with_backend(MockEeprom::default()),
+            cursor_visible: false,
+            tasks: crate::task::TaskTable::new(),
+        }
+    }
+
+    /// One fill, recorded as the VM records (screen coordinates, no scissor).
+    fn fill_list(lcd: &LcdImpl<LogLcd>, x: u16, y: u16, color: u16) -> crate::dl::List {
+        let rec = crate::dl::Recorder::new();
+        rec.begin(lcd);
+        crate::canvas::Canvas::fill_rect(&rec, x, y, 40, 40, color);
+        rec.end();
+        let list = rec.list().compact();
+        list
+    }
+
+    /// Step 3d: the VM's drawing reaches the render side as lists, and the job
+    /// draws them where they would have gone: direct drawing first, a captured
+    /// `on_paint` into its capture (scissored to the box), then the render,
+    /// then the other `on_paint` lists on the screen.
+    #[test]
+    fn the_render_job_replays_the_vms_drawing_around_the_render() {
+        use crate::view::Draw;
+        let mut ctx = paint_ctx(ObjPool::new());
+        ctx.render_ctx = Some(alloc::boxed::Box::new(paint_ctx(ObjPool::view())));
+        let root = ctx.objs.alloc_widget().unwrap();
+        ctx.objs.root = root;
+        ctx.objs.get_mut(root).size = Size { w: 800, h: 480 };
+        let mk = |ctx: &mut Ctx<PaintPlatform>, x, y, bg| {
+            let id = ctx.objs.alloc_widget().unwrap();
+            ctx.objs.add_child(root, id);
+            let g = ctx.objs.get_mut(id);
+            g.location = Offset { x, y };
+            g.size = Size { w: 100, h: 50 };
+            g.background_color = bg;
+            id
+        };
+        let taken = mk(&mut ctx, 790, 20, 0xCAFE);
+        let declined = mk(&mut ctx, 10, 10, 0x1234);
+        crate::render::render_dirty(&mut ctx);
+        EVENTS.with(|v| v.borrow_mut().clear());
+
+        let screen = fill_list(&ctx.lcd, 0, 400, 1);
+        let mine = fill_list(&ctx.lcd, 780, 10, 2);
+        let theirs = fill_list(&ctx.lcd, 0, 0, 3);
+        ctx.objs.render.draws.push(Draw::Screen(screen));
+        ctx.objs.render.draws.push(Draw::Paint(taken, mine));
+        ctx.objs.render.draws.push(Draw::Paint(declined, theirs));
+        ctx.objs.mark_dirty(taken);
+        ctx.objs.mark_dirty(declined);
+        crate::render::render_dirty(&mut ctx);
+        let got = EVENTS.with(|v| core::mem::take(&mut *v.borrow_mut()));
+        assert_eq!(
+            got,
+            [
+                "fill 1 0,400,40,40".to_string(),
+                std::format!("capture {}", taken.0),
+                "fill 2 790,20,10,30".to_string(),
+                std::format!("captured {}", taken.0),
+                std::format!("declined {}", declined.0),
+                "render".to_string(),
+                "fill 3 0,0,40,40".to_string(),
+            ]
+        );
+        let r = ctx.render_ctx.as_ref().unwrap();
+        assert!(r.objs.render.draws.is_empty() && ctx.objs.render.draws.is_empty());
+        assert_eq!(r.objs.render.paints.borrow().len(), 2, "kept for dumps");
+        assert!(!ctx.objs.needs_sync());
+    }
 }

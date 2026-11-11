@@ -217,7 +217,7 @@ fn redraw_behind_region<P: Platform>(
 /// Draw the entire widget tree from scratch (initial draw or full redraw).
 /// Iterative DFS using cached order — no recursion, no stack growth.
 pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
-    with_view(ctx, render_all_view);
+    with_view(ctx, |c| run_job(c, RenderJob::All));
 }
 
 /// A render the render side runs (`Platform::render_start`, `run_job`).
@@ -230,11 +230,72 @@ pub enum RenderJob {
 }
 
 /// Runs `job` on the render context `r` (already synced): the render side's
-/// whole work, on whichever core holds `r`.
+/// whole work, on whichever core holds `r`. The VM's drawing handed over
+/// with the sync (`view::Draw`) goes where it would have drawn: direct
+/// drawing and captured `on_paint` before the render, the other `on_paint`
+/// lists on the screen after it.
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
+    let draws = core::mem::take(&mut r.objs.render.draws);
+    let mut later = alloc::vec::Vec::new();
+    for d in draws {
+        match d {
+            crate::view::Draw::Screen(list) => list.replay(&r.lcd),
+            crate::view::Draw::Paint(id, list) => {
+                if capture_list(r, id, &list) {
+                    keep_paint(r, id, list);
+                } else {
+                    later.push((id, list));
+                }
+            }
+        }
+    }
     match job {
         RenderJob::Dirty => render_dirty_view(r),
         RenderJob::All => render_all_view(r),
+    }
+    for (id, list) in later {
+        if r.objs.is_tree_visible(id) {
+            list.replay(&r.lcd);
+            r.objs.screen_touched();
+        }
+        keep_paint(r, id, list);
+    }
+}
+
+/// The VM's drawing is recorded for the render side (`view::Draw`): there
+/// is a render context, here or away.
+#[inline]
+pub fn records<P: Platform>(ctx: &Ctx<P>) -> bool {
+    ctx.render_ctx.is_some() || ctx.render_away
+}
+
+/// `capture_paint` for a recorded `on_paint` list: replayed into the board
+/// renderer's capture with the scissor on the widget's box, if it takes it.
+fn capture_list<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: &crate::dl::List) -> bool {
+    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || !r.objs.is_tree_visible(id) {
+        return false;
+    }
+    let abs = r.objs.absolute_rect(id);
+    let Some(boxed) = abs.intersection(&screen_rect(&r.lcd)) else {
+        return false;
+    };
+    if !<P::Renderer as WidgetRenderer<P>>::capture_begin(r, id, &abs) {
+        return false;
+    }
+    let scissor = r.lcd.scissor();
+    r.lcd.set_scissor(Some(boxed));
+    list.replay(&r.lcd);
+    r.lcd.set_scissor(scissor);
+    <P::Renderer as WidgetRenderer<P>>::capture_end(r, id);
+    true
+}
+
+/// Keeps `list` as `id`'s last paint list (dumps).
+fn keep_paint<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: crate::dl::List) {
+    let mut paints = r.objs.render.paints.borrow_mut();
+    paints.insert(id, list);
+    if paints.len() > 2 * PAINT_MAX {
+        paints.retain(|&w, _| r.objs.get(w).flags & FLAG_HAS_ON_PAINT != 0);
     }
 }
 
@@ -269,14 +330,13 @@ pub fn wait_idle<P: Platform>(ctx: &mut Ctx<P>) {
 
 /// Sync and start `job`: on the render side (another core) if the board
 /// takes it, else here.
-/// `away` false = here even if the board would take it.
-fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob, away: bool) {
+fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
     let Some(mut r) = ctx.render_ctx.take() else {
         with_view(ctx, |c| run_job(c, job));
         return;
     };
     sync_render_ctx(ctx, &mut r);
-    match if away { P::render_start(r, job) } else { Err(r) } {
+    match P::render_start(r, job) {
         Ok(()) => ctx.render_away = true,
         Err(mut r) => {
             run_job(&mut r, job);
@@ -416,18 +476,6 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// This prevents hidden panels from overwriting visible siblings that share
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
-    render_dirty_job(ctx, true);
-}
-
-/// `render_dirty` on this core, for a caller that would wait for the job
-/// anyway (`on_paint` after it): handing it over would only add the
-/// hand-over's cost (cache cleans, a cold cache on the other core).
-pub fn render_dirty_here<P: Platform>(ctx: &mut Ctx<P>) {
-    wait_idle(ctx);
-    render_dirty_job(ctx, false);
-}
-
-fn render_dirty_job<P: Platform>(ctx: &mut Ctx<P>, away: bool) {
     crate::vm::flex_flush(ctx);
     // Still drawing the last one elsewhere: the next pass hands this over
     // (dirty bits and messages wait in the VM pool).
@@ -437,7 +485,7 @@ fn render_dirty_job<P: Platform>(ctx: &mut Ctx<P>, away: bool) {
     if !ctx.objs.needs_sync() && !ctx.render_pool().render.maybe_dirty {
         return;
     }
-    submit(ctx, RenderJob::Dirty, away);
+    submit(ctx, RenderJob::Dirty);
 }
 
 fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {

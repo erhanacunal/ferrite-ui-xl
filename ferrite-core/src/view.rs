@@ -9,7 +9,10 @@
 //!   changed list;
 //! - the [`RenderMsg`]s queued since the last sync, replayed in order on the
 //!   render pool's render-owned state (`RenderState`, `layers`);
-//! - the `on_paint` lists recorded since then.
+//! - the `on_paint` lists recorded since then;
+//! - with a render context, the VM's drawing ([`Draw`]: its direct drawing
+//!   and its `on_paint` drawing, recorded on the VM's core), replayed by the
+//!   next job (`render::run_job`).
 //!
 //! The render pool keeps everything the renderer owns (`RenderState`: records,
 //! epochs, display lists, geometry; the layers' activity), and its own pending
@@ -27,6 +30,18 @@ use crate::layer::{Layers, Scope};
 use crate::pool::{CHANGED_MAX, ObjPool, ObjPtr};
 use crate::types::{Offset, Rect};
 use crate::widget::{FLAG_DIRTY, FLAG_HAS_ON_PAINT, RenderRec, WidgetId};
+
+/// Drawing the VM recorded for the render side (plan step 3d), in the order
+/// it happened.
+pub(crate) enum Draw {
+    /// Drawing builtins outside `on_paint`, replayed on the screen before
+    /// the render (they ran before it).
+    Screen(crate::dl::List),
+    /// A widget's `on_paint` drawing (screen coordinates, no scissor): into
+    /// its capture before the render if the board renderer takes it, else on
+    /// the screen after the render (`render::run_job`).
+    Paint(WidgetId, crate::dl::List),
+}
 
 /// What the VM pool did to render-owned state, replayed on the render pool.
 #[derive(Clone, Copy)]
@@ -70,7 +85,35 @@ impl ObjPool {
 
     /// The VM pool has something for the render pool.
     pub(crate) fn needs_sync(&self) -> bool {
-        self.render.maybe_dirty || !self.render.msgs.is_empty() || !self.render.paints.borrow().is_empty()
+        self.render.maybe_dirty
+            || !self.render.msgs.is_empty()
+            || !self.render.paints.borrow().is_empty()
+            || !self.render.draws.is_empty()
+            || self.render.screen_rec.busy()
+    }
+
+    /// The canvas the VM's direct drawing records into (`render::records`):
+    /// a recording against `lcd` is started on first use.
+    pub(crate) fn screen_rec<B: crate::lcd::LcdBackend>(&self, lcd: &crate::lcd::LcdImpl<B>) -> &crate::dl::Recorder {
+        let rec = &self.render.screen_rec;
+        if !rec.busy() {
+            rec.begin(lcd);
+        }
+        rec
+    }
+
+    /// Closes the direct-drawing recording into the queue (before an
+    /// `on_paint` recording, at a sync), keeping the order.
+    pub(crate) fn close_screen_rec(&mut self) {
+        let rec = &self.render.screen_rec;
+        if !rec.busy() {
+            return;
+        }
+        rec.end();
+        let list = rec.list().compact();
+        if !list.ops.is_empty() {
+            self.render.draws.push(Draw::Screen(list));
+        }
     }
 
     /// Live widgets with a dirty bit.
@@ -99,6 +142,8 @@ impl ObjPool {
     /// render pool `view` (self = the VM pool).
     pub(crate) fn sync_view(&mut self, view: &mut ObjPool) {
         debug_assert!(!self.is_view && view.is_view);
+        self.close_screen_rec();
+        view.render.draws.append(&mut self.render.draws);
         let mut msgs = core::mem::take(&mut self.render.msgs);
         let cleared = msgs.iter().any(|m| matches!(m, RenderMsg::Clear));
         // The render pool's own pending dirty bits survive the copy.

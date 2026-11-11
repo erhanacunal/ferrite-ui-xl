@@ -466,6 +466,11 @@ impl Recorder {
         true
     }
 
+    /// Between `begin` and `end`.
+    pub fn busy(&self) -> bool {
+        self.busy.get()
+    }
+
     /// End the recording (the list stays until the next `begin`).
     pub fn end(&self) {
         self.busy.set(false);

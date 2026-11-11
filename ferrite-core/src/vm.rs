@@ -36,11 +36,16 @@ use alloc::vec::Vec;
 use crate::syscfg::try_alloc_slice;
 
 /// Run `$body` with `$c` = the canvas VM drawing goes to: the `on_paint`
-/// recorder while one is recording (`Vm::run_paint`), else the screen.
+/// recorder while one is recording (`Vm::run_paint`), the direct-drawing
+/// recorder when the render side draws (`render::records`, step 3d), else
+/// the screen.
 macro_rules! canvas {
     ($ctx:expr, |$c:ident| $body:block) => {
         if $ctx.objs.render.painting.get() {
             let $c = &$ctx.objs.render.paint_rec;
+            $body
+        } else if render::records($ctx) {
+            let $c = $ctx.objs.screen_rec(&$ctx.lcd);
             $body
         } else {
             let $c = &$ctx.lcd;
@@ -1298,9 +1303,13 @@ impl Vm {
         if n == 0 {
             return;
         }
-        render::wait_idle(ctx);
+        // With a render context the render side replays it (`render::run_job`).
+        if render::records(ctx) {
+            self.record_paint(ctx, offset, &ids[..n], false);
+            return;
+        }
         if crate::dl::enabled() {
-            self.record_paint(ctx, offset, &ids[..n]);
+            self.record_paint(ctx, offset, &ids[..n], true);
             return;
         }
         let Some(arr_id) = ctx.objs.arr_from(&ids[..n]) else {
@@ -1314,11 +1323,17 @@ impl Vm {
         ctx.objs.arr_free(arr_id);
     }
 
-    /// Display lists: run the `on_paint` dispatcher once per widget with the
-    /// drawing builtins recording (`draw_op`), replay each list where the
-    /// drawing would have gone and keep it as the widget's paint list
-    /// (`ObjPool::render.paints`). Pixel-identical to drawing directly.
-    fn record_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, offset: CodeAddr, ids: &[i32]) {
+    /// Run the `on_paint` dispatcher once per widget with the drawing
+    /// builtins recording (`draw_op`). `direct` (display lists, no render
+    /// context): replay each list where the drawing would have gone and keep
+    /// it as the widget's paint list (`ObjPool::render.paints`); else queue
+    /// it for the render side (`view::Draw::Paint`). Pixel-identical to
+    /// drawing directly.
+    fn record_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, offset: CodeAddr, ids: &[i32], direct: bool) {
+        if !direct {
+            // Direct drawing before it stays before it.
+            ctx.objs.close_screen_rec();
+        }
         for &raw in ids {
             if self.state == VmState::Error {
                 break;
@@ -1341,8 +1356,14 @@ impl Vm {
             state.paint_rec.end();
             let list = state.paint_rec.list().compact();
             crate::dl::PAINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            list.replay(&ctx.lcd);
             let id = WidgetId::from_vm(raw);
+            if !direct {
+                ctx.objs.render.draws.push(crate::view::Draw::Paint(id, list));
+                continue;
+            }
+            list.replay(&ctx.lcd);
+            ctx.objs.screen_touched();
+            let state = &ctx.objs.render;
             let mut paints = state.paints.borrow_mut();
             paints.insert(id, list);
             // Forget widgets that are gone or no longer paint.
@@ -1358,8 +1379,11 @@ impl Vm {
     /// `exec_one`'s body (one copy per canvas type).
     #[inline(never)]
     fn draw_op<P: Platform>(&mut self, ctx: &mut Ctx<P>, op: u8) {
-        render::wait_idle(ctx);
-        ctx.objs.screen_touched();
+        // `on_paint` drawing being recorded touches the screen when its list
+        // is replayed (after the render, as it ran before).
+        if !ctx.objs.render.painting.get() {
+            ctx.objs.screen_touched();
+        }
         match op {
             OP_FILL_RECT => canvas!(ctx, |c| {
                 let (wh, color) = self.pop2();
@@ -4175,6 +4199,40 @@ mod anim_tests {
         ctx.objs.sync_view(&mut ctx.view);
         assert!(!ctx.view.rendered(root));
         assert!(ctx.view.root.is_none());
+    }
+
+    /// Step 3d: with a render context the drawing builtins record (no wait
+    /// for a render running elsewhere); the next render hands the list over.
+    #[test]
+    fn direct_drawing_is_recorded_for_the_render_side() {
+        crate::mock::render_elsewhere(true);
+        let mut ctx = mock_ctx();
+        let mut r = mock_ctx();
+        r.objs = ObjPool::view();
+        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        let root = one_widget(&mut ctx);
+        ctx.objs.root = root;
+        crate::render::render_dirty(&mut ctx);
+        assert!(ctx.render_away);
+        let mut vm = Vm::new();
+        for color in [1, 2] {
+            vm.push((10 << 16) | 20);
+            vm.push((30 << 16) | 40);
+            vm.push(color);
+            vm.draw_op(&mut ctx, OP_FILL_RECT);
+        }
+        assert!(ctx.render_away, "recorded, not waited for");
+        assert!(ctx.objs.render.screen_rec.busy());
+        assert_eq!(ctx.objs.render.screen_rec.list().ops.len(), 2);
+        assert!(ctx.objs.needs_sync());
+        crate::mock::finish_render();
+        crate::render::render_dirty(&mut ctx);
+        assert!(!ctx.objs.render.screen_rec.busy() && ctx.objs.render.draws.is_empty());
+        assert!(ctx.render_away, "handed over with the next render");
+        crate::mock::finish_render();
+        crate::render::wait_idle(&mut ctx);
+        assert!(ctx.render_ctx.as_ref().unwrap().objs.render.draws.is_empty(), "replayed by the job");
+        crate::mock::render_elsewhere(false);
     }
 
     #[test]

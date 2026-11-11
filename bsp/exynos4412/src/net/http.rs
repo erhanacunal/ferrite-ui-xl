@@ -11,6 +11,7 @@
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
+//! | `POST /api/dl?on=0\|1` | widget drawing recorded into display lists and replayed (`ferrite_core::dl::ENABLED`), for A/B measurements |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
 //! | `POST /api/cpu?mhz=N` | wanted CPU clock, one of 200..1400 in steps of 100 (`cpuclock`), applied by CPU0 after the next pass under the thermal cap; without `mhz` the current one |
@@ -334,6 +335,24 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 _ => {
                     let on = crate::lcd::LAYER_BLITS.load(Ordering::Relaxed);
+                    text(socket, "400 Bad Request", if on { "on=0|1 (now on)
+" } else { "on=0|1 (now off)
+" }).await?;
+                }
+            }
+        }
+        (b"POST", b"/api/dl") => {
+            use core::sync::atomic::Ordering;
+            match query_param(query, b"on") {
+                Some(v @ (b"0" | b"1")) => {
+                    let on = v == b"1";
+                    ferrite_core::dl::ENABLED.store(on, Ordering::Relaxed);
+                    text(socket, "200 OK", if on { "display lists on
+" } else { "display lists off
+" }).await?;
+                }
+                _ => {
+                    let on = ferrite_core::dl::ENABLED.load(Ordering::Relaxed);
                     text(socket, "400 Bad Request", if on { "on=0|1 (now on)
 " } else { "on=0|1 (now off)
 " }).await?;

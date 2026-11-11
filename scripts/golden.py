@@ -3,6 +3,7 @@
     python scripts/golden.py            # check against golden/hashes.json
     python scripts/golden.py --update   # record the current frames as golden
     python scripts/golden.py --only tablet_clock,scroll
+    python scripts/golden.py --dl       # same check, widgets drawn through display lists
 
 Each scenario in golden/scenarios.json builds its example with ferrite-ui's
 compiler (FERRITE_UI, default ../ferrite-ui), runs the release sim on its
@@ -51,7 +52,7 @@ def build_image(example, cache):
     return cache[example]
 
 
-def run(name, sc, img):
+def run(name, sc, img, env=None):
     out = OUT / name
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob("frame_*"):
@@ -62,7 +63,7 @@ def run(name, sc, img):
         args += ["--tap", f"{x},{y},{ms}"]
     for sw in sc.get("swipes", []):
         args += ["--swipe", ",".join(str(v) for v in sw)]
-    r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=env)
     if r.returncode != 0:
         raise RuntimeError(f"sim exited {r.returncode}: {r.stderr.strip()[-300:]}")
     frames = {}
@@ -93,6 +94,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--update", action="store_true", help="record the current frames as golden")
     ap.add_argument("--only", help="comma-separated scenario names")
+    ap.add_argument("--dl", action="store_true",
+                    help="draw widgets through display lists (FERRITE_SIM_DL=1); must match the same golden frames")
     a = ap.parse_args()
 
     scenarios = json.loads(SCENARIOS.read_text(encoding="utf-8"))["scenarios"]
@@ -112,7 +115,7 @@ def main():
             print(f"SKIP {name}: {err}")
             skipped.append(name)
             continue
-        frames = run(name, sc, img)
+        frames = run(name, sc, img, dict(os.environ, FERRITE_SIM_DL="1") if a.dl else None)
         if a.update:
             golden[name] = frames
             gdir = OUT / f"{name}.golden"

@@ -1621,7 +1621,7 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
         return;
     }
     if !P::Renderer::draw(ctx, id, abs, clip) {
-        draw_widget_body(ctx, &ctx.lcd, id, abs, clip);
+        draw_body(ctx, id, abs, clip);
     }
     crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
 }
@@ -1631,7 +1631,19 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
 ///
 /// [`DefaultRenderer`]: crate::renderer::DefaultRenderer
 pub fn draw_default<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
-    draw_widget_body(ctx, &ctx.lcd, id, abs, clip);
+    draw_body(ctx, id, abs, clip);
+}
+
+/// The built-in drawing on the screen: directly, or (`dl::ENABLED`) recorded
+/// into the pool's display list and replayed (`dl.rs`; same calls, same pixels).
+fn draw_body<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
+    let rec = &ctx.objs.render.dl;
+    if crate::dl::enabled() && rec.begin(&ctx.lcd) {
+        draw_widget_body(ctx, rec, id, abs, clip);
+        rec.end_replay(&ctx.lcd);
+    } else {
+        draw_widget_body(ctx, &ctx.lcd, id, abs, clip);
+    }
 }
 
 fn draw_widget_body<P: Platform, C: Canvas>(
@@ -4094,5 +4106,122 @@ mod shift_tests {
         move_to(&mut a, panel, 28, 30);
         render_dirty(&mut a);
         assert!(a.lcd.backend().moved.get() > 0);
+    }
+
+    /// Every kind of widget in a 128×128 scene: labels (ROM font, single and
+    /// multi-line), progress/slider/checkbox/radio, input, dropdown, gauge,
+    /// graph (filled: its pen interleaves with the fill), shapes.
+    fn all_kinds(ctx: &mut Ctx<Plat<false>>) {
+        use crate::widget::*;
+        ctx.fonts.add(crate::font::Font::from_embedded(
+            &crate::embedded_font::GLYPHS,
+            &crate::embedded_font::CODEPOINTS,
+            &crate::embedded_font::BITMAP,
+            crate::embedded_font::Y_ADVANCE,
+            crate::embedded_font::BPP,
+        ));
+        let root = ctx.objs.root;
+        let mut add = |kind: u8, r: Rect, bg: u16, f: &dyn Fn(&mut ObjPool, WidgetId)| {
+            let id = rect(&mut ctx.objs, root, r, bg, 0, 255);
+            ctx.objs.get_mut(id).kind = kind;
+            ctx.objs.get_mut(id).border_color = 0xFFE0;
+            f(&mut ctx.objs, id);
+        };
+        let text = |o: &mut ObjPool, id: WidgetId, t: &[u8]| {
+            let s = o.str_alloc(t).unwrap();
+            o.update_ext(id, |e| {
+                e.text_id = s;
+                e.font_id = 0;
+                e.text_color = 0xFFFF;
+            });
+        };
+        add(KIND_LABEL, Rect::new(2, 2, 60, 14), 0, &|o, id| text(o, id, b"Hi there"));
+        add(KIND_LABEL, Rect::new(64, 2, 60, 30), 0x2104, &|o, id| {
+            text(o, id, b"two lines of text");
+            o.get_mut(id).flags |= FLAG_MULTI_LINE;
+        });
+        add(KIND_PROGRESS, Rect::new(2, 34, 50, 8), 0x2104, &|o, id| {
+            o.get_mut(id).value = 40;
+            o.update_ext(id, |e| e.press_color = 0x07E0);
+        });
+        add(KIND_SLIDER, Rect::new(56, 34, 50, 10), 0x2104, &|o, id| {
+            o.get_mut(id).value = 70;
+            o.update_ext(id, |e| {
+                e.press_color = 0xF800;
+                e.border_radius = 4;
+            });
+        });
+        add(KIND_CHECKBOX, Rect::new(2, 46, 14, 14), 0x4208, &|o, id| o.get_mut(id).flags |= FLAG_CHECKED);
+        add(KIND_RADIO, Rect::new(20, 46, 14, 14), 0x4208, &|o, id| o.get_mut(id).flags |= FLAG_CHECKED);
+        add(KIND_INPUT, Rect::new(38, 46, 60, 16), 0x0000, &|o, id| text(o, id, b"edit"));
+        add(KIND_DROPDOWN, Rect::new(2, 64, 60, 16), 0x3186, &|o, id| text(o, id, b"a\nb"));
+        add(KIND_GAUGE, Rect::new(64, 64, 40, 40), 0x18E3, &|o, id| {
+            o.get_mut(id).value = 30;
+            o.update_ext(id, |e| {
+                e.press_color = 0x05FF;
+                e.text_color = 0xF800;
+            });
+        });
+        add(KIND_GRAPH, Rect::new(2, 84, 60, 30), 0x0841, &|o, id| {
+            let a = o.arr_from(&[3, 9, 1, 7, 12, 5, 8, 2]).unwrap();
+            o.get_mut(id).value = a as crate::widget::WValue;
+            o.update_ext(id, |e| {
+                e.text_color = 0x07FF;
+                e.image_id = GRAPH_FLAG_FILL;
+                e.gradient_color = 0x8010;
+            });
+        });
+        add(KIND_CIRCLE, Rect::new(106, 34, 20, 20), 0xF81F, &|o, id| { o.update_ext(id, |e| e.border = Edges { top: 2, right: 2, bottom: 2, left: 2 }); });
+        add(KIND_ELLIPSE, Rect::new(100, 106, 26, 14), 0x07E0, &|_, _| {});
+        add(KIND_LINE, Rect::new(64, 106, 30, 20), 0, &|o, id| { o.update_ext(id, |e| e.border = Edges { top: 3, right: 3, bottom: 3, left: 3 }); });
+        add(KIND_POLYGON, Rect::new(106, 64, 20, 30), 0xFD20, &|o, id| {
+            text(o, id, b"0,0 19,10 4,29");
+            o.update_ext(id, |e| e.border = Edges { top: 1, right: 1, bottom: 1, left: 1 });
+        });
+    }
+
+    /// Draw every widget (pre-order) clipped to `clip`, directly or recorded
+    /// into a display list and replayed.
+    fn draw_tree(ctx: &Ctx<Plat<false>>, clip: &ClipRegion, record: bool) {
+        fn walk(ctx: &Ctx<Plat<false>>, id: WidgetId, clip: &ClipRegion, record: bool) {
+            let abs = ctx.objs.absolute_rect(id);
+            if record {
+                let rec = crate::dl::Recorder::new();
+                assert!(rec.begin(&ctx.lcd));
+                draw_widget_body(ctx, &rec, id, &abs, clip);
+                assert!(!rec.list().ops.is_empty() || id != ctx.objs.root);
+                rec.end_replay(&ctx.lcd);
+            } else {
+                draw_widget_body(ctx, &ctx.lcd, id, &abs, clip);
+            }
+            let mut c = ctx.objs.get(id).first_child;
+            while c.is_some() {
+                walk(ctx, c, clip, record);
+                c = ctx.objs.get(c).next_sibling;
+            }
+        }
+        walk(ctx, ctx.objs.root, clip, record);
+    }
+
+    #[test]
+    fn replayed_display_lists_match_direct_drawing() {
+        let mut part = ClipRegion::from_rect(Rect::new(0, 0, S as u16, S as u16));
+        part.subtract(&Rect::new(30, 20, 50, 70));
+        for clip in [ClipRegion::from_rect(Rect::new(0, 0, S as u16, S as u16)), part] {
+            let mut direct = ctx::<false>();
+            scene(&mut direct);
+            all_kinds(&mut direct);
+            let mut replayed = ctx::<false>();
+            scene(&mut replayed);
+            all_kinds(&mut replayed);
+            draw_tree(&direct, &clip, false);
+            draw_tree(&replayed, &clip, true);
+            let (a, b) = (direct.lcd.backend().px.borrow(), replayed.lcd.backend().px.borrow());
+            let lit = a.iter().filter(|&&p| p != 0).count();
+            assert!(lit > S * S / 2, "scene drew too little ({lit} px)");
+            let diff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+            assert_eq!(diff, 0, "{diff} pixels differ");
+            assert!(direct.lcd.scissor() == replayed.lcd.scissor());
+        }
     }
 }

@@ -146,6 +146,8 @@ pub(crate) struct RenderState {
     pub(crate) geo: Vec<crate::geo::Geo>,
     pub(crate) geo_stack: Vec<u32>,
     pub(crate) geo_valid: bool,
+    /// Display-list recorder for widget drawing (`dl.rs`, `render::draw_body`).
+    pub(crate) dl: crate::dl::Recorder,
 }
 
 impl RenderState {
@@ -158,6 +160,7 @@ impl RenderState {
             settled_epoch: u32::MAX,
             shifted: Vec::new(),
             shift_keep: Vec::new(),
+            dl: crate::dl::Recorder::new(),
             geo: Vec::new(),
             geo_stack: Vec::new(),
             geo_valid: false,

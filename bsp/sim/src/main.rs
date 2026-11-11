@@ -43,6 +43,10 @@ use touch::CalParams;
 fn main() {
     let (fsimage_path, taps, eeprom_path, audio_out) = parse_args();
     let dump = platform::Dump::from_args();
+    // `FERRITE_SIM_DL=1`: widget drawing goes through display lists (record + replay).
+    if std::env::var_os("FERRITE_SIM_DL").is_some() {
+        ferrite_core::dl::ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
 
     systick::init();
     if let Some(d) = &dump {

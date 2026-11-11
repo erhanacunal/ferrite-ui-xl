@@ -1384,7 +1384,8 @@ impl<B: LcdBackend> LcdImpl<B> {
             return;
         }
         let w = right as u16 - left + 1;
-        let x_base = left.saturating_sub(full_x.max(0) as u16);
+        // Position in the gradient: the box may start left of the screen.
+        let x_base = (left as i32 - full_x as i32).max(0) as u16;
         self.begin_pixels(left as u16, y as u16, w, 1);
         let mut grad = GradientStep::new(c1, c2, x_base, grad_w);
         for _ in 0..w {
@@ -1598,7 +1599,8 @@ impl<B: LcdBackend> LcdImpl<B> {
             return;
         }
         let w = right as u16 - left + 1;
-        let x_base = left.saturating_sub(full_x.max(0) as u16);
+        // Position in the gradient: the box may start left of the screen.
+        let x_base = (left as i32 - full_x as i32).max(0) as u16;
         self.begin_pixels(left, y as u16, w, 1);
         let mut grad = GradientStep::new(c1, c2, x_base, grad_w);
         for _ in 0..w {

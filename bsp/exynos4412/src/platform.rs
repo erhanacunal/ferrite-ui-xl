@@ -77,6 +77,21 @@ impl Platform for Exynos4412Platform {
     const DEFAULT_CB_QUEUE: usize = 64;
     // RAM-backed: a CRC of the image takes a few ms.
     const VERIFY_FS_ON_BOOT: bool = true;
+
+    fn render_start(
+        r: alloc::boxed::Box<Ctx<Self>>,
+        job: ferrite_core::render::RenderJob,
+    ) -> Result<(), alloc::boxed::Box<Ctx<Self>>> {
+        crate::rcore::render_start(r, job)
+    }
+
+    fn render_poll() -> Option<alloc::boxed::Box<Ctx<Self>>> {
+        crate::rcore::render_poll()
+    }
+
+    fn render_wait() {
+        crate::rcore::render_wait()
+    }
 }
 
 static mut KEYS: Option<PowerKeys> = None;
@@ -224,10 +239,14 @@ impl PlatformRuntime for Exynos4412Platform {
     fn frame_end(ctx: &mut Ctx<Self>) {
         PASSES.fetch_add(1, Ordering::Relaxed);
         if DIAG {
+            ferrite_core::render::wait_idle(ctx);
             draw_diag(ctx);
         }
-        // Show what this pass drew (shadow -> scanned buffer, at a vsync).
-        lcd::flush();
+        // Show what this pass drew (shadow -> scanned buffer, at a vsync),
+        // unless the render core is drawing (it is presented after).
+        if !ctx.render_away {
+            lcd::flush();
+        }
         // The compositor switched on/off over HTTP: repaint everything.
         crate::compose::service(ctx);
         // A CPU clock asked for over HTTP.
@@ -237,8 +256,9 @@ impl PlatformRuntime for Exynos4412Platform {
         // Config writes (touch calibration…): save once they settle.
         crate::flash::save_if_dirty(false);
         // An FS image uploaded over HTTP, a restart request (net/).
+        // (Screen grabs read the shadow: not while the render core draws.)
         #[cfg(feature = "wifi")]
-        crate::net::service();
+        crate::net::service(!ctx.render_away);
         crate::net::dl_service(ctx);
         // FIMD window 1 test picture (HTTP `POST /api/overlay`).
         #[cfg(feature = "wifi")]
@@ -277,6 +297,7 @@ impl PlatformRuntime for Exynos4412Platform {
 /// - Touch is polled, so nothing touched meanwhile is delivered.
 fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
     let mct = Mct::new();
+    ferrite_core::render::wait_idle(ctx);
     lcd::flush_wait();
     ctx.audio.stop();
     let gpu = crate::gpu::suspend();

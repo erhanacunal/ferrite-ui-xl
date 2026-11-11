@@ -1298,6 +1298,7 @@ impl Vm {
         if n == 0 {
             return;
         }
+        render::wait_idle(ctx);
         if crate::dl::enabled() {
             self.record_paint(ctx, offset, &ids[..n]);
             return;
@@ -1357,6 +1358,7 @@ impl Vm {
     /// `exec_one`'s body (one copy per canvas type).
     #[inline(never)]
     fn draw_op<P: Platform>(&mut self, ctx: &mut Ctx<P>, op: u8) {
+        render::wait_idle(ctx);
         ctx.objs.screen_touched();
         match op {
             OP_FILL_RECT => canvas!(ctx, |c| {
@@ -2427,10 +2429,12 @@ impl Vm {
                 ctx.objs.str_free(str_id);
             }
             OP_BEGIN_FRAME => {
+                render::wait_idle(ctx);
                 ctx.objs.screen_touched();
                 ctx.lcd.begin_frame();
             }
             OP_END_FRAME => {
+                render::wait_idle(ctx);
                 ctx.objs.screen_touched();
                 ctx.lcd.end_frame();
             }
@@ -2492,6 +2496,7 @@ impl Vm {
                 self.push(ctx.systick.millis() as i32);
             }
             OP_FPGA_CMD => {
+                render::wait_idle(ctx);
                 ctx.objs.screen_touched();
                 // fpgaCmd(cmd, data) — raw FPGA command + data
                 let (cmd, data) = self.pop2();
@@ -2500,6 +2505,7 @@ impl Vm {
                 ctx.lcd.send_data(data);
             }
             OP_FPGA_DAT => {
+                render::wait_idle(ctx);
                 ctx.objs.screen_touched();
                 // fpgaData(data) — raw FPGA data (after a cmd)
                 let data = self.pop() as u16;
@@ -4052,6 +4058,7 @@ mod anim_tests {
             objs: ObjPool::new(),
             view: ObjPool::view(),
             render_ctx: None,
+            render_away: false,
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),
@@ -4168,6 +4175,40 @@ mod anim_tests {
         ctx.objs.sync_view(&mut ctx.view);
         assert!(!ctx.view.rendered(root));
         assert!(ctx.view.root.is_none());
+    }
+
+    #[test]
+    fn a_render_running_elsewhere_gets_what_changed_meanwhile_next() {
+        crate::mock::render_elsewhere(true);
+        let mut ctx = mock_ctx();
+        let mut r = mock_ctx();
+        r.objs = ObjPool::view();
+        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        let root = one_widget(&mut ctx);
+        ctx.objs.root = root;
+        ctx.objs.get_mut(root).size = crate::types::Size { w: 800, h: 480 };
+        let child = one_widget(&mut ctx);
+        ctx.objs.add_child(root, child);
+        ctx.objs.get_mut(child).size = crate::types::Size { w: 40, h: 30 };
+        crate::render::render_dirty(&mut ctx);
+        assert!(ctx.render_away && crate::mock::render_pending());
+        assert!(ctx.render_ctx.is_none());
+        // Changed while the job runs: kept in the VM pool, not handed over.
+        ctx.objs.get_mut(child).background_color = 0x0F0F;
+        ctx.objs.mark_dirty(child);
+        crate::render::render_dirty(&mut ctx);
+        assert!(ctx.objs.get(child).is_dirty(), "waits for the render side");
+        crate::mock::finish_render();
+        // Taken back, then handed over.
+        crate::render::render_dirty(&mut ctx);
+        assert!(!ctx.objs.get(child).is_dirty());
+        assert!(ctx.render_away);
+        crate::mock::finish_render();
+        crate::render::wait_idle(&mut ctx);
+        let r = ctx.render_ctx.as_ref().expect("back");
+        assert_eq!(r.objs.get(child).background_color, 0x0F0F);
+        assert!(r.objs.rendered(child) && !r.objs.get(child).is_dirty());
+        crate::mock::render_elsewhere(false);
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub struct Ctx<P: Platform> {
     /// (`render::with_view`). None = the renderer works on `self` with the
     /// pools swapped.
     pub render_ctx: Option<alloc::boxed::Box<Ctx<P>>>,
+    /// `render_ctx` is away running a job (`Platform::render_start`): the
+    /// screen belongs to the render side until `render::wait_idle`.
+    pub render_away: bool,
     pub fs: Option<Fs>,
     pub backlight: BacklightImpl<P::BacklightB>,
     pub rtc: RtcImpl<P::RtcB>,

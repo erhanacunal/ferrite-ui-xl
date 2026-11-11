@@ -80,6 +80,7 @@ mod net;
 mod overlay_test;
 mod perf;
 mod platform;
+mod rcore;
 mod renderer;
 mod rtc;
 mod storage;
@@ -173,6 +174,11 @@ fn main(_args: BootArgs) -> ! {
         Ok(how) => println!("ferrite: {}", how),
         Err(e) => println!("ferrite: CPU2 ERROR {:?}, LCD presents on CPU0", e),
     }
+    // Render jobs on CPU2 (plan step 3c), when it is not the presenter.
+    match rcore::start() {
+        Ok(()) => println!("ferrite: render core CPU2"),
+        Err(e) => println!("ferrite: render core off ({:?}), rendering on CPU0", e),
+    }
     // WiFi: CPU0 powers the chip (PMIC on I2C0), CPU3 joins and serves.
     #[cfg(feature = "wifi")]
     net::start(pmic, mct);
@@ -188,6 +194,7 @@ fn main(_args: BootArgs) -> ! {
         objs: ferrite_core::pool::ObjPool::view(),
         view: ferrite_core::pool::ObjPool::view(),
         render_ctx: None,
+        render_away: false,
         fs: None,
         backlight: BacklightImpl::with_backend(backlight::GpioBacklight),
         rtc: RtcImpl::with_backend(rtc::new()),
@@ -207,6 +214,7 @@ fn main(_args: BootArgs) -> ! {
         objs: ObjPool::new(),
         view: ferrite_core::pool::ObjPool::view(),
         render_ctx,
+        render_away: false,
         fs: None,
         backlight: BacklightImpl::with_backend(backlight::GpioBacklight),
         rtc: RtcImpl::with_backend(rtc::new()),

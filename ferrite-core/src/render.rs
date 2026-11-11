@@ -220,11 +220,78 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
     with_view(ctx, render_all_view);
 }
 
+/// A render the render side runs (`Platform::render_start`, `run_job`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenderJob {
+    /// `render_dirty`.
+    Dirty,
+    /// `render_all`.
+    All,
+}
+
+/// Runs `job` on the render context `r` (already synced): the render side's
+/// whole work, on whichever core holds `r`.
+pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
+    match job {
+        RenderJob::Dirty => render_dirty_view(r),
+        RenderJob::All => render_all_view(r),
+    }
+}
+
+/// Takes the render context back if its job is done (non-blocking): false
+/// while it still runs elsewhere. The runtime calls it every pass: what
+/// waits for the screen (the present in `frame_end`) must not wait for a
+/// render pass to collect a finished job.
+pub fn reclaim<P: Platform>(ctx: &mut Ctx<P>) -> bool {
+    if !ctx.render_away {
+        return true;
+    }
+    match P::render_poll() {
+        Some(r) => {
+            ctx.objs.mirror_layers(&r.objs);
+            ctx.render_ctx = Some(r);
+            ctx.render_away = false;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Waits until no render job runs elsewhere: call before drawing on the
+/// screen outside the renderer (VM drawing, `on_paint`, the keyboard, error
+/// screens) or presenting.
+#[inline]
+pub fn wait_idle<P: Platform>(ctx: &mut Ctx<P>) {
+    while !reclaim(ctx) {
+        P::render_wait();
+    }
+}
+
+/// Sync and start `job`: on the render side (another core) if the board
+/// takes it, else here.
+/// `away` false = here even if the board would take it.
+fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob, away: bool) {
+    let Some(mut r) = ctx.render_ctx.take() else {
+        with_view(ctx, |c| run_job(c, job));
+        return;
+    };
+    sync_render_ctx(ctx, &mut r);
+    match if away { P::render_start(r, job) } else { Err(r) } {
+        Ok(()) => ctx.render_away = true,
+        Err(mut r) => {
+            run_job(&mut r, job);
+            ctx.objs.mirror_layers(&r.objs);
+            ctx.render_ctx = Some(r);
+        }
+    }
+}
+
 /// Run `f` on the render pool (`view.rs`): flush pending layouts, hand the
 /// VM pool's tree and messages over, swap the pools so `ctx.objs` is the
 /// render pool during `f`, swap back, mirror the layers.
 pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -> R) -> R {
     debug_assert!(!ctx.objs.is_view(), "nested render");
+    wait_idle(ctx);
     crate::vm::flex_flush(ctx);
     if let Some(mut r) = ctx.render_ctx.take() {
         // The render side's own context (step 3c).
@@ -349,11 +416,28 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// This prevents hidden panels from overwriting visible siblings that share
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
+    render_dirty_job(ctx, true);
+}
+
+/// `render_dirty` on this core, for a caller that would wait for the job
+/// anyway (`on_paint` after it): handing it over would only add the
+/// hand-over's cost (cache cleans, a cold cache on the other core).
+pub fn render_dirty_here<P: Platform>(ctx: &mut Ctx<P>) {
+    wait_idle(ctx);
+    render_dirty_job(ctx, false);
+}
+
+fn render_dirty_job<P: Platform>(ctx: &mut Ctx<P>, away: bool) {
     crate::vm::flex_flush(ctx);
+    // Still drawing the last one elsewhere: the next pass hands this over
+    // (dirty bits and messages wait in the VM pool).
+    if !reclaim(ctx) {
+        return;
+    }
     if !ctx.objs.needs_sync() && !ctx.render_pool().render.maybe_dirty {
         return;
     }
-    with_view(ctx, render_dirty_view);
+    submit(ctx, RenderJob::Dirty, away);
 }
 
 fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
@@ -3995,6 +4079,7 @@ mod shift_tests {
             objs: ObjPool::new(),
             view: ObjPool::view(),
             render_ctx: None,
+            render_away: false,
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),

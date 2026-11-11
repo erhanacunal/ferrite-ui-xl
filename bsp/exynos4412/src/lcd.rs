@@ -469,9 +469,10 @@ fn wait_rows(y0: usize, y1: usize) {
         if y1 <= lo || y0 >= hi {
             break;
         }
-        // The G2D present (this core's): take band ends here, as the
-        // interrupt may be masked; a G2D that never finishes is given up.
-        if !PRESENTER.load(Ordering::Relaxed) {
+        // The G2D present (CPU0's): take band ends here, as the interrupt
+        // may be masked; a G2D that never finishes is given up. The render
+        // core (CPU2) leaves both to CPU0's interrupt (`rcore`).
+        if !PRESENTER.load(Ordering::Relaxed) && cpu::id() == 0 {
             polls += 1;
             if polls < G2D_POLLS {
                 g2d_poll();

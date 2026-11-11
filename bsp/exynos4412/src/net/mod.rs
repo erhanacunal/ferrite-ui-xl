@@ -861,9 +861,10 @@ pub fn dl_service(ctx: &mut ferrite_core::ctx::Ctx<crate::platform::Exynos4412Pl
 }
 
 /// CPU0, once per main-loop pass (`frame_end`): cheap unless the network
-/// asked for something.
-pub fn service() {
-    if SCREEN_WANTED.swap(false, Ordering::AcqRel) {
+/// asked for something. `screen_ok`: nothing draws on the shadow now (no
+/// render job on CPU2), so a screen grab may read it.
+pub fn service(screen_ok: bool) {
+    if screen_ok && SCREEN_WANTED.swap(false, Ordering::AcqRel) {
         let shot = crate::lcd::grab();
         SCREEN.lock(|s| *s.borrow_mut() = shot);
         SCREEN_READY.store(true, Ordering::Release);

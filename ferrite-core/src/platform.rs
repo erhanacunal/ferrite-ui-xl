@@ -5,6 +5,8 @@
 ///
 /// The framework (`Ctx`, `Vm`, `render`, etc.) is then generic over
 /// `P: Platform`, giving it access to all hardware through a single parameter.
+extern crate alloc;
+
 use crate::audio::AudioBackend;
 use crate::backlight::BacklightBackend;
 use crate::eeprom::EepromBackend;
@@ -125,4 +127,27 @@ pub trait Platform: Sized {
     /// `writefs` and SD flashing always verify. Off by default: it reads
     /// the entire image, ~8 s per MB on the bit-banged Nextion SPI.
     const VERIFY_FS_ON_BOOT: bool = false;
+
+    /// Run `job` on the render context `r` somewhere else (another core;
+    /// plan step 3c). `Ok` = taken: [`Platform::render_poll`] hands `r` back
+    /// once the job is done, and until then nothing may draw on the screen.
+    /// `Err(r)` = run it here (the default).
+    fn render_start(
+        r: alloc::boxed::Box<crate::ctx::Ctx<Self>>,
+        _job: crate::render::RenderJob,
+    ) -> Result<(), alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+        Err(r)
+    }
+
+    /// The render context, once the job [`Platform::render_start`] took is
+    /// done; None while it runs.
+    fn render_poll() -> Option<alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+        None
+    }
+
+    /// One wait step while a render job runs elsewhere and this core needs
+    /// the screen.
+    fn render_wait() {
+        core::hint::spin_loop();
+    }
 }

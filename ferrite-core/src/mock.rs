@@ -199,4 +199,66 @@ impl Platform for MockPlatform {
     type GpioB = MockGpio;
     type EepromB = MockEeprom;
     type Renderer = crate::renderer::DefaultRenderer;
+
+    #[cfg(feature = "host")]
+    fn render_start(
+        r: alloc::boxed::Box<crate::ctx::Ctx<Self>>,
+        job: crate::render::RenderJob,
+    ) -> Result<(), alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+        if !RENDER_ELSEWHERE.with(|e| e.get()) {
+            return Err(r);
+        }
+        RENDER_SIDE.with(|s| *s.borrow_mut() = Some((r, job, false)));
+        Ok(())
+    }
+
+    #[cfg(feature = "host")]
+    fn render_poll() -> Option<alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+        RENDER_SIDE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.as_ref().is_some_and(|(_, _, done)| *done) { s.take().map(|(r, _, _)| r) } else { None }
+        })
+    }
+
+    #[cfg(feature = "host")]
+    fn render_wait() {
+        // Nobody else would run it: finish it here.
+        finish_render();
+    }
+}
+
+#[cfg(feature = "host")]
+type RenderSide = Option<(alloc::boxed::Box<crate::ctx::Ctx<MockPlatform>>, crate::render::RenderJob, bool)>;
+
+#[cfg(feature = "host")]
+std::thread_local! {
+    /// `MockPlatform::render_start` keeps jobs for [`finish_render`] (a
+    /// render side on "another core") instead of declining them.
+    static RENDER_ELSEWHERE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static RENDER_SIDE: core::cell::RefCell<RenderSide> = const { core::cell::RefCell::new(None) };
+}
+
+/// Make `MockPlatform` take render jobs and hold them until [`finish_render`].
+#[cfg(feature = "host")]
+pub fn render_elsewhere(on: bool) {
+    RENDER_ELSEWHERE.with(|e| e.set(on));
+}
+
+/// A job is held and not run yet.
+#[cfg(feature = "host")]
+pub fn render_pending() -> bool {
+    RENDER_SIDE.with(|s| s.borrow().as_ref().is_some_and(|(_, _, done)| !*done))
+}
+
+/// Run the held job ("the other core"); `render_poll` then hands it back.
+#[cfg(feature = "host")]
+pub fn finish_render() {
+    RENDER_SIDE.with(|s| {
+        if let Some((r, job, done)) = s.borrow_mut().as_mut() {
+            if !*done {
+                crate::render::run_job(r, *job);
+                *done = true;
+            }
+        }
+    });
 }

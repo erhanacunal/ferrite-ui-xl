@@ -14,6 +14,7 @@
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
+//! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; counters in `/api/status` `rcore` |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
@@ -385,6 +386,17 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", "snapshot set\n").await?;
             } else {
                 text(socket, "400 Bad Request", "track=0|1 and/or stale=0|1\n").await?;
+            }
+        }
+        (b"POST", b"/api/rcore") => {
+            // Render jobs on CPU2 or CPU0 (`rcore::ENABLED`), for A/B measurements.
+            use core::sync::atomic::Ordering;
+            match query_param(query, b"on") {
+                Some(v @ (b"0" | b"1")) => {
+                    crate::rcore::ENABLED.store(v == b"1", Ordering::Relaxed);
+                    text(socket, "200 OK", if v == b"1" { "render core on\n" } else { "render core off\n" }).await?;
+                }
+                _ => text(socket, "400 Bad Request", "on=0|1\n").await?,
             }
         }
         (b"POST", b"/api/dl") => {
@@ -855,6 +867,18 @@ fn status_json() -> String {
             snapshot::stale(),
             snapshot::READS.load(Relaxed),
             snapshot::STALE_DIFF.load(Relaxed)
+        );
+    }
+    {
+        // Render core (`/api/rcore`): jobs, busy and longest job (µs) since the last status.
+        let (jobs, busy, max) = crate::rcore::take_stats();
+        let _ = write!(
+            s,
+            ",\"rcore\":{{\"on\":{},\"jobs\":{},\"busy_us\":{},\"max_us\":{}}}",
+            crate::rcore::running(),
+            jobs,
+            busy,
+            max
         );
     }
     {

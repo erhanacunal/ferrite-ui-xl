@@ -219,7 +219,7 @@ pub trait InputHandler<P: PlatformRuntime>: Sized {
 
     /// Draw any overlay (on-screen keyboard) on top of the rendered frame.
     /// `buffered` selects the double-buffered redraw cadence.
-    fn draw_overlay(&mut self, _ctx: &Ctx<P>, _buffered: bool) {}
+    fn draw_overlay(&mut self, _ctx: &mut Ctx<P>, _buffered: bool) {}
 
     /// Reset input state when a new program is flashed at runtime.
     fn reset(&mut self, _ctx: &mut Ctx<P>) {}
@@ -497,7 +497,7 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// still passes for its own work (presents, polled keys, messages from
     /// other cores).
     pub fn idle_ms(&self) -> Option<u32> {
-        if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.render.maybe_dirty || self.ctx.render_pool().render.maybe_dirty {
+        if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.render.maybe_dirty || self.ctx.render_away || self.ctx.render_pool().render.maybe_dirty {
             return Some(0);
         }
         if self.ctx.objs.layers.placed {
@@ -630,6 +630,7 @@ impl<P: PlatformRuntime> Runtime<P> {
         lap!(MISC);
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
+        render::reclaim(&mut self.ctx);
         P::frame_end(&mut self.ctx);
         lap!(FRAME_END);
         {
@@ -1356,14 +1357,26 @@ fn build_fault_dialog<P: PlatformRuntime>(
 // ============================================================================
 
 fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: &mut P::Input) {
+    render::reclaim(ctx);
     if !P::render_due() {
         return;
     }
     let mut paint = render::PaintList::new();
     render::collect_dirty_paint(ctx, &mut paint);
     // The board renderer may keep on_paint drawing in captures it draws itself.
+    let painting = !paint.is_empty();
+    if painting {
+        // Captures and on_paint draw on the screen: after the last render.
+        render::wait_idle(ctx);
+    }
     let paint = render::capture_paint(ctx, &paint, |ctx, one| run_paint(ctx, tasks, one));
-    render::render_dirty(ctx);
+    if painting {
+        // This pass waited for the last render (and on_paint may draw right
+        // after this one): handing it over would only add its cost.
+        render::render_dirty_here(ctx);
+    } else {
+        render::render_dirty(ctx);
+    }
     run_paint(ctx, tasks, &paint);
     input.draw_overlay(ctx, false);
     ctx.lcd.flush_dirty();
@@ -1404,6 +1417,7 @@ pub fn show_error<P: PlatformRuntime>(
     code: u8,
     vm_fault: Option<(u8, CodeAddr)>,
 ) {
+    render::wait_idle(ctx);
     let sw = ctx.lcd.width();
     let sh = ctx.lcd.height();
     let bg = P::BG_COLOR;
@@ -1819,7 +1833,10 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
         }
     }
 
-    fn draw_overlay(&mut self, ctx: &Ctx<P>, buffered: bool) {
+    fn draw_overlay(&mut self, ctx: &mut Ctx<P>, buffered: bool) {
+        if self.kb.visible && (buffered || self.kb.dirty) {
+            render::wait_idle(ctx);
+        }
         if buffered {
             if self.kb.visible {
                 self.kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
@@ -1859,6 +1876,7 @@ impl FullInput {
         // Keyboard intercept.
         if self.kb.visible && y >= self.kb.top() {
             self.kb.handle_press(x, y);
+            render::wait_idle(ctx);
             self.kb
                 .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, self.kb.pressed_key, true);
             return;
@@ -2001,6 +2019,7 @@ impl FullInput {
                 self.handle_key_action(ctx, tasks, action);
             }
             if !self.kb.dirty && self.kb.visible {
+                render::wait_idle(ctx);
                 self.kb
                     .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
             }
@@ -2412,6 +2431,7 @@ mod mem_detail_tests {
             objs: ObjPool::new(),
             view: ObjPool::view(),
             render_ctx: None,
+            render_away: false,
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),

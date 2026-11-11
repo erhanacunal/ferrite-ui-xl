@@ -1,0 +1,9 @@
+/target
+.claude/
+.deepseek/
+__pycache__/
+*.pyc
+*.bin
+*.hex
+*.dbg
+test_size.*

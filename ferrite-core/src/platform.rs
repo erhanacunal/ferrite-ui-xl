@@ -1,0 +1,127 @@
+/// Platform trait — groups all hardware backend implementations for a BSP.
+///
+/// Each BSP crate defines a marker struct (e.g. `NextionPlatform`) and
+/// implements this trait, mapping associated types to concrete backends.
+///
+/// The framework (`Ctx`, `Vm`, `render`, etc.) is then generic over
+/// `P: Platform`, giving it access to all hardware through a single parameter.
+#[cfg(feature = "audio")]
+use crate::audio::AudioBackend;
+use crate::backlight::BacklightBackend;
+use crate::eeprom::EepromBackend;
+use crate::flash::FlashBackend;
+use crate::gpio::GpioBackend;
+#[cfg(feature = "jpeg")]
+use crate::jpeg::JpegBackend;
+use crate::lcd::LcdBackend;
+use crate::renderer::WidgetRenderer;
+use crate::rtc::RtcBackend;
+use crate::systick::SystickBackend;
+use crate::touch::TouchBackend;
+use crate::usart::UsartBackend;
+
+// --- Capability bits for `Platform::CAPS` ---
+//
+// Board-level optional features the framework can query at compile time
+// (`P::CAPS & CAP_AUDIO != 0` folds to a constant). Alpha blending is NOT
+// here — it lives on `LcdBackend::HAS_ALPHA`, next to the blend methods.
+// Each bit must be mirrored in the board's `tools/devices/<id>.json`
+// (`caps.audio` / `caps.video` / `caps.jpeg` / `caps.multi_program` / `caps.superops`) so the designer and build tools agree
+// with the firmware.
+
+/// Board has a real audio output backend (`audio` feature, `Platform::AudioB`).
+pub const CAP_AUDIO: u32 = 1 << 0;
+/// Reserved: board can stream video resources.
+pub const CAP_VIDEO: u32 = 1 << 1;
+/// Board decodes JPEG images (`jpeg` feature, `Platform::JpegB`).
+pub const CAP_JPEG: u32 = 1 << 2;
+/// Board runs several programs at once (`multi_program` feature: task opcodes).
+pub const CAP_MULTI_PROGRAM: u32 = 1 << 3;
+/// Board's VM runs superinstructions (`superops` feature, opcodes 0x45..=0x4D).
+pub const CAP_SUPEROPS: u32 = 1 << 4;
+
+// `Sized`: `Renderer` is generic over the platform itself.
+pub trait Platform: Sized {
+    type LcdB: LcdBackend;
+    // `Clone` so the VM can take its own flash handle for flash-execution cache
+    // refills (backends are stateless MMIO drivers — see `flash::FlashBackend`).
+    type FlashB: FlashBackend + Clone;
+    type TouchB: TouchBackend;
+    type BacklightB: BacklightBackend;
+    type RtcB: RtcBackend;
+    type UsartB: UsartBackend;
+    type SystickB: SystickBackend;
+    // Sound output — only with the `audio` feature, which a BSP enables
+    // when its board has audio hardware (`NoAudio` is a placeholder).
+    #[cfg(feature = "audio")]
+    type AudioB: AudioBackend;
+    // JPEG image decoder (FI mode 3) — only with the `jpeg` feature.
+    #[cfg(feature = "jpeg")]
+    type JpegB: JpegBackend;
+    // User GPIO header (`pinMode`/`pinWrite`/`pinRead`); boards without one
+    // use `ferrite_core::gpio::NoGpio`.
+    type GpioB: GpioBackend;
+    // User-data EEPROM (`eepromRead`/`eepromWrite`/…); boards without one
+    // use `ferrite_core::eeprom::NoEeprom`.
+    type EepromB: EepromBackend;
+    // How widgets are drawn (`renderer`); boards without their own use
+    // `ferrite_core::renderer::DefaultRenderer`.
+    type Renderer: WidgetRenderer<Self>;
+
+    // --- Flash layout (Rust's stand-in for C-style per-board `#define`s) ---
+    //
+    // The resource flash is partitioned into a config sector and the resource
+    // filesystem. Boards whose firmware lives on a *separate* chip (Nextion,
+    // epaper, sim) keep the historical layout: config at sector 0, FS at
+    // sector 1. Boards that boot from the *same* SPI NOR as the resources
+    // (e.g. tdo_y13, where the F1C100s BootROM loads firmware from offset 0)
+    // push both regions past the reserved firmware area by overriding these.
+
+    /// Flash address of the persistent config store (one 4 KB sector).
+    const CONFIG_BASE: u32 = crate::config::DEFAULT_CONFIG_BASE;
+
+    /// Flash address where the resource filesystem (TOC + resources) begins —
+    /// this is the destination `writefs` flashes to. Must leave a 4 KB sector
+    /// below it for [`Platform::CONFIG_BASE`].
+    const FS_BASE: u32 = crate::fs::DEFAULT_FS_BASE;
+
+    /// Optional board capabilities — OR of the `CAP_*` bits above. Only set
+    /// a bit when the corresponding backend is real (keep CAPS truthful).
+    const CAPS: u32 = 0;
+    // Default background color for the board (used when no widget has a background).
+    const DEFAULT_BG_COLOR: u16 = 0x0000; // black
+
+    /// Maximum concurrent property tweens (`animate`) the VM keeps live. Sized
+    /// per board to its RAM budget — bigger boards animate richer scenes. The
+    /// default suits the small RAM boards (Nextion, epaper); tdo_y13 raises it.
+    const ANIM_SLOTS: usize = 8;
+
+    // --- Runtime pool sizes when RES_SYSCFG leaves a field at 0 (or the
+    // image has no syscfg) — 0 here = the ferrite-core built-in default
+    // (`pool::DEFAULT_*`, the VM's `STACK_SIZE` / `CALL_STACK_SIZE` /
+    // `CB_QUEUE_SIZE`). Boards with lots of RAM raise them so programs get
+    // more room without a `"memory"` block. An explicit syscfg value wins.
+
+    /// Object arena bytes (widgets, strings, arrays).
+    const DEFAULT_ARENA_BYTES: usize = 0;
+    /// Object pointers (≤ `pool::MAX_OBJECTS`).
+    const DEFAULT_MAX_OBJECTS: usize = 0;
+    /// VM eval stack depth (≤ 255).
+    const DEFAULT_EVAL_STACK: usize = 0;
+    /// VM call stack depth (≤ 255).
+    const DEFAULT_CALL_STACK: usize = 0;
+    /// VM callback queue length (≤ 255).
+    const DEFAULT_CB_QUEUE: usize = 0;
+
+    /// Copy each font's glyph bitmaps into RAM when the font is loaded, so
+    /// text rendering does not read the resource flash per glyph. Worth it
+    /// where that flash is slow to reach (SPI NOR: a command + address per
+    /// read) and RAM is plentiful; off on the small RAM boards.
+    const CACHE_FONT_BITMAPS: bool = false;
+
+    /// Check the whole flash image against its CRC (`Fs::verify`) at every
+    /// boot; a mismatch shows error 9 instead of running a corrupt program.
+    /// `writefs` and SD flashing always verify. Off by default: it reads
+    /// the entire image, ~8 s per MB on the bit-banged Nextion SPI.
+    const VERIFY_FS_ON_BOOT: bool = false;
+}

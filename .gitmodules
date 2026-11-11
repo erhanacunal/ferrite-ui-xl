@@ -1,0 +1,3 @@
+[submodule "vendor/exynos_4412_rs"]
+	path = vendor/exynos_4412_rs
+	url = https://github.com/erhanacunal/exynos-4412-rs.git

@@ -1,0 +1,255 @@
+/// Simple linked-list heap allocator for bare-metal use.
+///
+/// The arena is not a fixed-size static: the BSP hands over a RAM region at
+/// startup — on nextion, all RAM between the end of `.bss` (`__sheap`) and the
+/// stack reserve (`_heap_end`), both provided by the linker script.
+/// First-fit allocation with free-block coalescing.
+/// Single-threaded (no locking) — safe for Cortex-M3 bare-metal.
+///
+/// Usage:
+///   heap::init(start, len) at startup, then use Box/Vec from `extern crate alloc`.
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr;
+
+/// Minimum block size (header + at least 1 usable byte, aligned to 4)
+const MIN_BLOCK: usize = HEADER_SIZE + 4;
+
+/// Sentinel: free_list / next == NULL_OFFSET means end of list.
+const NULL_OFFSET: u16 = 0xFFFF;
+
+/// Largest usable arena: block offsets/sizes are u16 and 0xFFFF is the NULL
+/// sentinel, so a larger region is truncated to this.
+const MAX_HEAP_SIZE: usize = 0xFFFC;
+
+/// Block header — 4 bytes total
+#[repr(C)]
+struct BlockHeader {
+    size: u16,
+    next: u16,
+}
+
+const HEADER_SIZE: usize = core::mem::size_of::<BlockHeader>(); // 4
+
+/// Global allocator state
+struct FerriHeap {
+    base: *mut u8,
+    size: usize,
+    free_list: u16,
+    initialized: bool,
+}
+
+static mut HEAP: FerriHeap = FerriHeap {
+    base: ptr::null_mut(),
+    size: 0,
+    free_list: 0,
+    initialized: false,
+};
+
+// === Offset helpers ===
+
+#[inline]
+unsafe fn heap_base() -> *mut u8 {
+    unsafe { HEAP.base }
+}
+
+#[inline]
+unsafe fn block_at(offset: u16) -> *mut BlockHeader {
+    unsafe { heap_base().add(offset as usize).cast() }
+}
+
+#[inline]
+unsafe fn offset_of(block: *mut BlockHeader) -> u16 {
+    unsafe { (block as usize - heap_base() as usize) as u16 }
+}
+
+/// Initialize the heap over `[start, start + len)`. Must be called once at
+/// startup before any allocation.
+///
+/// The start is rounded up to 4 bytes and the length down to a multiple of 4,
+/// capped at [`MAX_HEAP_SIZE`].
+///
+/// # Safety
+/// The region must be valid, writable RAM that nothing else uses (no statics,
+/// not the stack) for the rest of the program.
+pub unsafe fn init(start: *mut u8, len: usize) {
+    unsafe {
+        let pad = start.align_offset(4);
+        let size = (len.saturating_sub(pad) & !3).min(MAX_HEAP_SIZE);
+        HEAP.base = start.add(pad);
+        HEAP.size = size;
+
+        let first = block_at(0);
+        (*first).size = size as u16;
+        (*first).next = NULL_OFFSET;
+        HEAP.free_list = 0;
+        HEAP.initialized = true;
+    }
+}
+
+/// Arena size in bytes (0 before `init`, or when another allocator is the
+/// global one).
+pub fn size() -> usize {
+    // esp-alloc: every region (internal SRAM + PSRAM).
+    #[cfg(feature = "epaper")]
+    return esp_alloc::HEAP.stats().size;
+
+    #[cfg_attr(feature = "epaper", allow(unreachable_code))]
+    unsafe {
+        if HEAP.initialized { HEAP.size } else { 0 }
+    }
+}
+
+/// Return (total_free_bytes, largest_free_block) for diagnostics. esp-alloc
+/// (epaper) does not track its largest block: 0 = unknown.
+pub fn stats() -> (usize, usize) {
+    #[cfg(feature = "epaper")]
+    return (esp_alloc::HEAP.free(), 0);
+
+    #[cfg_attr(feature = "epaper", allow(unreachable_code))]
+    unsafe {
+        if !HEAP.initialized {
+            return (0, 0);
+        }
+        let mut total = 0usize;
+        let mut largest = 0usize;
+        let mut off = HEAP.free_list;
+        while off != NULL_OFFSET {
+            let block = block_at(off);
+            let size = (*block).size as usize;
+            total += size;
+            if size > largest {
+                largest = size;
+            }
+            off = (*block).next;
+        }
+        (total, largest)
+    }
+}
+
+fn align_up(val: usize, align: usize) -> usize {
+    (val + align - 1) & !(align - 1)
+}
+
+unsafe fn alloc_inner(layout: Layout) -> *mut u8 {
+    unsafe {
+        if !HEAP.initialized {
+            return ptr::null_mut();
+        }
+
+        let align = layout.align().max(4);
+        let size = align_up(layout.size() + HEADER_SIZE, align).max(MIN_BLOCK);
+
+        if size > HEAP.size {
+            return ptr::null_mut();
+        }
+        let size16 = size as u16;
+
+        let mut prev_off = NULL_OFFSET;
+        let mut cur_off = HEAP.free_list;
+
+        while cur_off != NULL_OFFSET {
+            let current = block_at(cur_off);
+            let cur_size = (*current).size;
+
+            if cur_size >= size16 {
+                let remaining = cur_size - size16;
+
+                if remaining >= MIN_BLOCK as u16 {
+                    let new_off = cur_off + size16;
+                    let new_free = block_at(new_off);
+                    (*new_free).size = remaining;
+                    (*new_free).next = (*current).next;
+                    (*current).size = size16;
+
+                    if prev_off == NULL_OFFSET {
+                        HEAP.free_list = new_off;
+                    } else {
+                        (*block_at(prev_off)).next = new_off;
+                    }
+                } else {
+                    if prev_off == NULL_OFFSET {
+                        HEAP.free_list = (*current).next;
+                    } else {
+                        (*block_at(prev_off)).next = (*current).next;
+                    }
+                }
+
+                return heap_base().add(cur_off as usize + HEADER_SIZE);
+            }
+
+            prev_off = cur_off;
+            cur_off = (*current).next;
+        }
+
+        ptr::null_mut()
+    }
+}
+
+unsafe fn dealloc_inner(ptr: *mut u8, _layout: Layout) {
+    if ptr.is_null() {
+        return;
+    }
+
+    unsafe {
+        let block_off = (ptr as usize - heap_base() as usize - HEADER_SIZE) as u16;
+        let block = block_at(block_off);
+
+        let mut prev_off = NULL_OFFSET;
+        let mut cur_off = HEAP.free_list;
+
+        while cur_off != NULL_OFFSET && cur_off < block_off {
+            prev_off = cur_off;
+            cur_off = (*block_at(cur_off)).next;
+        }
+
+        (*block).next = cur_off;
+        if prev_off == NULL_OFFSET {
+            HEAP.free_list = block_off;
+        } else {
+            (*block_at(prev_off)).next = block_off;
+        }
+
+        if cur_off != NULL_OFFSET {
+            let block_end = block_off + (*block).size;
+            if block_end == cur_off {
+                (*block).size += (*block_at(cur_off)).size;
+                (*block).next = (*block_at(cur_off)).next;
+            }
+        }
+
+        if prev_off != NULL_OFFSET {
+            let prev = block_at(prev_off);
+            let prev_end = prev_off + (*prev).size;
+            if prev_end == block_off {
+                (*prev).size += (*block).size;
+                (*prev).next = (*block).next;
+            }
+        }
+    }
+}
+
+// === Global allocator ===
+
+struct FerriAllocator;
+
+unsafe impl GlobalAlloc for FerriAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { alloc_inner(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { dealloc_inner(ptr, layout) }
+    }
+}
+
+// The tiny static heap is the global allocator only on bare-metal targets that
+// have no other one: the GD32 (nextion). The epaper BSP uses `esp_alloc`, the
+// tdo_y13 BSP uses the f1c100s HAL's thread-safe allocator (`external_alloc`),
+// and the host simulator uses the std allocator — none want this heap.
+#[cfg(all(
+    not(feature = "epaper"),
+    not(feature = "host"),
+    not(feature = "external_alloc")
+))]
+#[global_allocator]
+static ALLOCATOR: FerriAllocator = FerriAllocator;

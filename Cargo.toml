@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["ferrite-core", "bsp/sim", "bsp/exynos4412"]
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+lto = true
+debug = false

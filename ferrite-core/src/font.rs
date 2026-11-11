@@ -33,7 +33,8 @@ extern crate alloc;
 use crate::fs::{Fs, RES_FONT};
 use alloc::vec::Vec;
 use crate::flash::{FlashBackend, FlashImpl};
-use crate::lcd::{LcdBackend, LcdImpl, lerp_rgb565};
+use crate::canvas::Canvas;
+use crate::lcd::lerp_rgb565;
 use crate::types::Rect;
 
 // Re-exported from ferrite-core — the framework's canonical glyph type.
@@ -417,9 +418,9 @@ impl Font {
     }
 
     /// Draw a single Unicode character.
-    pub fn draw_char<L: LcdBackend, F: FlashBackend>(
+    pub fn draw_char<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         flash: &FlashImpl<F>,
         ch: char,
         cx: i16,
@@ -435,9 +436,9 @@ impl Font {
     }
 
     /// Draw a UTF-8 encoded string. Returns the X position after the last glyph.
-    pub fn draw_str<L: LcdBackend, F: FlashBackend>(
+    pub fn draw_str<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         flash: &FlashImpl<F>,
         text: &[u8],
         mut x: i16,
@@ -456,9 +457,9 @@ impl Font {
 
     // --- Internal: draw one BMP codepoint ---
 
-    fn draw_cp<L: LcdBackend, F: FlashBackend>(
+    fn draw_cp<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         flash: &FlashImpl<F>,
         cp: u16,
         cx: i16,
@@ -603,9 +604,9 @@ impl Font {
 
     // --- 1bpp draw implementations (unchanged) ---
 
-    fn draw_opaque<L: LcdBackend, F: FlashBackend>(
+    fn draw_opaque<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
         bitmap_offset: u16,
@@ -646,9 +647,9 @@ impl Font {
         }
     }
 
-    fn draw_transparent<L: LcdBackend, F: FlashBackend>(
+    fn draw_transparent<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
         bitmap_offset: u16,
@@ -699,9 +700,9 @@ impl Font {
 
     // --- 2bpp anti-aliased draw ---
 
-    fn draw_2bpp<L: LcdBackend, F: FlashBackend>(
+    fn draw_2bpp<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
         bitmap_offset: u16,
@@ -750,9 +751,9 @@ impl Font {
 
     /// 2bpp glyph blended over the existing pixels (`LcdBackend::HAS_ALPHA`
     /// backends only); zero-coverage pixels are left untouched.
-    fn draw_2bpp_blend<L: LcdBackend, F: FlashBackend>(
+    fn draw_2bpp_blend<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
         bitmap_offset: u16,
@@ -814,7 +815,7 @@ impl Font {
 
 /// Blend a row of glyph coverage at (x, y), without its uncovered ends.
 #[inline]
-fn blend_coverage<L: LcdBackend>(lcd: &LcdImpl<L>, x: i16, y: i16, fg: u16, row: &[u8]) {
+fn blend_coverage<L: Canvas>(lcd: &L, x: i16, y: i16, fg: u16, row: &[u8]) {
     let Some(first) = row.iter().position(|&a| a != 0) else {
         return;
     };

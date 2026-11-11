@@ -114,6 +114,9 @@ pub struct DisplayList { cmds: Vec<DrawCmd>, arena: Vec<u8> }
 | 2d | `on_paint` Recorder üzerinden; exynos ARGB capture listeden üretilen bir optimizasyon olur | `paint` örneği, `captured_on_paint_*` |
 | 2e | `GET /api/dl?id=` dump, sim'de liste görüntüleyici | elle kontrol |
 
+- [x] **2a** (2026-11-11): `ferrite-core/src/canvas.rs` (`Canvas` + `Pen`, GAT `Pen<'a>`; `LcdImpl` doğrudan yönlendirir). `render.rs` çizim yardımcıları, `draw_widget_body`, `draw_field`, `draw_label_text`, `draw_bg_image`, `draw_widget_image`, `draw_polygon_shape`, `font`, `image` (`PixelCursor` dahil) ve `keyboard` `&impl Canvas` alır; `B::HAS_ALPHA` → `has_alpha()`. Kare/katman/present/portrait `LcdImpl`'de kaldı. 198 test, golden 13/13 piksel aynı.
+  - VM çizim opcode'ları (`fillRect`, `drawText`…) hâlâ `ctx.lcd`: 2d'de `on_paint` ile birlikte Recorder'a bağlanacak. Kaydırma çubuğu ve restore yolları pass seviyesinde, widget listesine girmez.
+
 Çalışma anında açma/kapama: `dl::ENABLED` + `POST /api/dl?on=0|1`. `ExynosRenderer::draw`,
 `compose` ve sprite cache'inin sözleşmesi değişmez, sadece imzaları uyarlanır.
 

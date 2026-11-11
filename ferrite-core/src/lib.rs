@@ -26,6 +26,7 @@ pub mod usart;
 
 // --- Framework modules ---
 
+pub mod canvas;
 pub mod clip;
 pub mod config;
 pub mod fb;
@@ -62,9 +63,9 @@ pub mod widget;
 #[cfg(feature = "mock")]
 #[allow(dead_code)]
 fn _mock_instantiation_guard() {
-    use crate::mock::{MockFlash, MockLcd, MockPlatform as M};
+    use crate::mock::{MockFlash, MockPlatform as M};
     let _: fn(&keyboard::Keyboard, &lcd::Lcd, &font::FontList, &flash::Flash) =
-        keyboard::Keyboard::draw::<MockLcd, MockFlash>;
+        keyboard::Keyboard::draw::<lcd::Lcd, MockFlash>;
     let _: fn(&mut ctx::Ctx<M>) = render::render_dirty::<M>;
     let _: fn(&mut ctx::Ctx<M>) = render::render_all::<M>;
     let _: fn(&mut ctx::Ctx<M>) -> render::PaintList =

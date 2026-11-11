@@ -3,7 +3,8 @@ use crate::ctx::Ctx;
 use crate::lcd::{self};
 use crate::types::{Color, Edges, Offset, Rect};
 use crate::pool::ObjPool;
-use crate::lcd::{LcdBackend, LcdImpl};
+use crate::canvas::{Canvas, Pen};
+use crate::lcd::LcdBackend;
 use crate::platform::Platform;
 use crate::renderer::WidgetRenderer;
 use crate::widget::{
@@ -16,7 +17,7 @@ use crate::widget::{
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
 /// swapped in portrait mode (`LcdImpl::width`/`height`).
 #[inline]
-pub fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
+pub fn screen_rect<B: Canvas>(lcd: &B) -> Rect {
     Rect::new(0, 0, lcd.width(), lcd.height())
 }
 
@@ -1620,7 +1621,7 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
         return;
     }
     if !P::Renderer::draw(ctx, id, abs, clip) {
-        draw_widget_body(ctx, id, abs, clip);
+        draw_widget_body(ctx, &ctx.lcd, id, abs, clip);
     }
     crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
 }
@@ -1630,11 +1631,12 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
 ///
 /// [`DefaultRenderer`]: crate::renderer::DefaultRenderer
 pub fn draw_default<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
-    draw_widget_body(ctx, id, abs, clip);
+    draw_widget_body(ctx, &ctx.lcd, id, abs, clip);
 }
 
-fn draw_widget_body<P: Platform>(
+fn draw_widget_body<P: Platform, C: Canvas>(
     ctx: &Ctx<P>,
+    c: &C,
     id: WidgetId,
     abs: &Rect,
     clip: &ClipRegion,
@@ -1653,7 +1655,7 @@ fn draw_widget_body<P: Platform>(
     let draw_bg =
         !freeform && (bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE));
     // See draw_widget — background opacity, blending-capable backends only.
-    let alpha = if ctx.lcd.has_alpha() { ext.alpha } else { 255 };
+    let alpha = if c.has_alpha() { ext.alpha } else { 255 };
     let gdir = if bg_color == widget.background_color {
         ctx.objs.gradient_dir(id)
     } else {
@@ -1671,8 +1673,8 @@ fn draw_widget_body<P: Platform>(
         // label — repaints the whole widget over content drawn after it.
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
         for cr in clip.iter() {
-            ctx.lcd.set_scissor(Some(*cr));
-            if ctx.lcd.smooth() {
+            c.set_scissor(Some(*cr));
+            if c.smooth() {
                 // Anti-aliased: background first, then one border ring over
                 // it. The fill reaches halfway under the ring, so the ring's
                 // soft inner edge blends over the background rather than over
@@ -1681,10 +1683,10 @@ fn draw_widget_body<P: Platform>(
                 // Readback backends draw the whole box, partly off the screen
                 // or not (see `fill_rounded_rect_screen`); write-only backends
                 // keep the box cut to the screen.
-                let outer = if <P::LcdB as LcdBackend>::HAS_ALPHA {
+                let outer = if c.has_alpha() {
                     *abs
                 } else {
-                    let Some(outer) = abs.intersection(&screen_rect(&ctx.lcd)) else {
+                    let Some(outer) = abs.intersection(&screen_rect(c)) else {
                         continue;
                     };
                     outer
@@ -1700,15 +1702,15 @@ fn draw_widget_body<P: Platform>(
                     if !bg.is_empty() {
                         let bg_r = r.saturating_sub(inset);
                         if gdir != 0 {
-                            fill_gradient_rounded_rect_screen(&ctx.lcd, bg, bg_r, bg_color, gcol, gdir);
+                            fill_gradient_rounded_rect_screen(c, bg, bg_r, bg_color, gcol, gdir);
                         } else if alpha < 255 {
-                            fill_rounded_rect_blend_screen(&ctx.lcd, bg, bg_r, bg_color, alpha);
+                            fill_rounded_rect_blend_screen(c, bg, bg_r, bg_color, alpha);
                         } else {
-                            fill_rounded_rect_screen(&ctx.lcd, bg, bg_r, bg_color);
+                            fill_rounded_rect_screen(c, bg, bg_r, bg_color);
                         }
                     }
                 }
-                ctx.lcd.stroke_rounded_rect(
+                c.stroke_rounded_rect(
                     outer.x,
                     outer.y,
                     outer.w,
@@ -1721,7 +1723,7 @@ fn draw_widget_body<P: Platform>(
             }
             for i in 0..bw {
                 rounded_rect_screen(
-                    &ctx.lcd,
+                    c,
                     Rect::new(
                         abs.x + i as i16,
                         abs.y + i as i16,
@@ -1737,16 +1739,16 @@ fn draw_widget_body<P: Platform>(
                 if !bg.is_empty() {
                     let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
                     if gdir != 0 {
-                        fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
+                        fill_gradient_rounded_rect_screen(c, bg, inner_r, bg_color, gcol, gdir);
                     } else if alpha < 255 {
-                        fill_rounded_rect_blend_screen(&ctx.lcd, bg, inner_r, bg_color, alpha);
+                        fill_rounded_rect_blend_screen(c, bg, inner_r, bg_color, alpha);
                     } else {
-                        fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+                        fill_rounded_rect_screen(c, bg, inner_r, bg_color);
                     }
                 }
             }
         }
-        ctx.lcd.set_scissor(None);
+        c.set_scissor(None);
     } else {
         let border_rects = [
             Rect::new(abs.x, abs.y, abs.w, b.top as u16),
@@ -1772,7 +1774,7 @@ fn draw_widget_body<P: Platform>(
 
         for br in &border_rects {
             if !br.is_empty() {
-                fill_clipped(&ctx.lcd, br, widget.border_color, clip);
+                fill_clipped(c, br, widget.border_color, clip);
             }
         }
 
@@ -1780,11 +1782,11 @@ fn draw_widget_body<P: Platform>(
             let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
                 if gdir != 0 {
-                    fill_gradient_clipped(&ctx.lcd, &bg, bg_color, gcol, gdir, clip);
+                    fill_gradient_clipped(c, &bg, bg_color, gcol, gdir, clip);
                 } else if alpha < 255 {
-                    blend_clipped(&ctx.lcd, &bg, bg_color, alpha, clip);
+                    blend_clipped(c, &bg, bg_color, alpha, clip);
                 } else {
-                    fill_clipped(&ctx.lcd, &bg, bg_color, clip);
+                    fill_clipped(c, &bg, bg_color, clip);
                 }
             }
         }
@@ -1798,10 +1800,10 @@ fn draw_widget_body<P: Platform>(
     if ext.image_id != 0 && widget.kind != KIND_GRAPH && widget.kind != KIND_IMAGE {
         let bg = inner_rect(abs, &b);
         for cr in clip.iter() {
-            ctx.lcd.set_scissor(Some(*cr));
-            draw_bg_image(ctx, ext.image_id, &bg);
+            c.set_scissor(Some(*cr));
+            draw_bg_image(ctx, c, ext.image_id, &bg);
         }
-        ctx.lcd.set_scissor(None);
+        c.set_scissor(None);
     }
 
     // Label text. Readback backends draw it over whatever is already on
@@ -1814,19 +1816,19 @@ fn draw_widget_body<P: Platform>(
     // the screen only), and no later redraw or restore, both clipped to the
     // box, erased those pixels again.
     if widget.kind == KIND_LABEL {
-        if ctx.lcd.has_alpha() {
+        if c.has_alpha() {
             for cr in clip.iter() {
                 if let Some(r) = cr.intersection(abs) {
-                    ctx.lcd.set_scissor(Some(r));
-                    draw_label_text(ctx, widget, abs, ext, None);
+                    c.set_scissor(Some(r));
+                    draw_label_text(ctx, c, widget, abs, ext, None);
                 }
             }
         } else {
             let bg = resolved_text_bg(&ctx.objs, widget, ext, P::DEFAULT_BG_COLOR);
-            ctx.lcd.set_scissor(Some(*abs));
-            draw_label_text(ctx, widget, abs, ext, Some(bg));
+            c.set_scissor(Some(*abs));
+            draw_label_text(ctx, c, widget, abs, ext, Some(bg));
         }
-        ctx.lcd.set_scissor(None);
+        c.set_scissor(None);
     }
 
     // Value fill (progress / slider), check indicator, input and dropdown
@@ -1841,14 +1843,14 @@ fn draw_widget_body<P: Platform>(
         let inner = inner_rect(abs, &b);
         for cr in clip.iter() {
             let Some(r) = cr.intersection(abs) else { continue };
-            ctx.lcd.set_scissor(Some(r));
+            c.set_scissor(Some(r));
             match widget.kind {
-                KIND_PROGRESS | KIND_SLIDER => draw_value_fill(&ctx.lcd, widget, &inner, ext),
-                KIND_CHECKBOX | KIND_RADIO => draw_check_indicator(&ctx.lcd, widget, &inner, ext),
-                _ => draw_field(ctx, widget, abs, ext),
+                KIND_PROGRESS | KIND_SLIDER => draw_value_fill(c, widget, &inner, ext),
+                KIND_CHECKBOX | KIND_RADIO => draw_check_indicator(c, widget, &inner, ext),
+                _ => draw_field(ctx, c, widget, abs, ext),
             }
         }
-        ctx.lcd.set_scissor(None);
+        c.set_scissor(None);
     }
 
     // Gauge arc. Like the shapes below, its primitives take no clip: confine
@@ -1856,10 +1858,10 @@ fn draw_widget_body<P: Platform>(
     if widget.kind == KIND_GAUGE {
         if let Some(g) = GaugeGeom::new(&inner_rect(abs, &ext.border)) {
             for cr in clip.iter() {
-                ctx.lcd.set_scissor(Some(*cr));
-                draw_gauge(&ctx.lcd, widget, &g, ext);
+                c.set_scissor(Some(*cr));
+                draw_gauge(c, widget, &g, ext);
             }
-            ctx.lcd.set_scissor(None);
+            c.set_scissor(None);
         }
     }
 
@@ -1872,20 +1874,20 @@ fn draw_widget_body<P: Platform>(
         let inner = inner_rect(abs, &b);
         for cr in clip.iter() {
             if let Some(r) = cr.intersection(abs) {
-                ctx.lcd.set_scissor(Some(r));
-                draw_graph(&ctx.lcd, &ctx.objs, widget, &inner, ext);
+                c.set_scissor(Some(r));
+                draw_graph(c, &ctx.objs, widget, &inner, ext);
             }
         }
-        ctx.lcd.set_scissor(None);
+        c.set_scissor(None);
     }
 
     // Image widget — draw image centered in content area
     if widget.kind == KIND_IMAGE {
         for cr in clip.iter() {
-            ctx.lcd.set_scissor(Some(*cr));
-            draw_widget_image(ctx, abs, ext);
+            c.set_scissor(Some(*cr));
+            draw_widget_image(ctx, c, abs, ext);
         }
-        ctx.lcd.set_scissor(None);
+        c.set_scissor(None);
     }
 
     // Shape widgets — fill = bg_color, stroke = border_color (thickness from
@@ -1897,16 +1899,16 @@ fn draw_widget_body<P: Platform>(
     // unrelated content.
     if is_freeform_shape(widget.kind) {
         for cr in clip.iter() {
-            ctx.lcd.set_scissor(Some(*cr));
+            c.set_scissor(Some(*cr));
             match widget.kind {
-                KIND_CIRCLE => draw_circle_shape(&ctx.lcd, widget, abs, ext),
-                KIND_ELLIPSE => draw_ellipse_shape(&ctx.lcd, widget, abs, ext),
-                KIND_POLYGON => draw_polygon_shape(ctx, widget, abs, ext),
-                KIND_LINE => draw_line_shape(&ctx.lcd, widget, abs, ext),
+                KIND_CIRCLE => draw_circle_shape(c, widget, abs, ext),
+                KIND_ELLIPSE => draw_ellipse_shape(c, widget, abs, ext),
+                KIND_POLYGON => draw_polygon_shape(ctx, c, widget, abs, ext),
+                KIND_LINE => draw_line_shape(c, widget, abs, ext),
                 _ => {}
             }
         }
-        ctx.lcd.set_scissor(None);
+        c.set_scissor(None);
     }
 }
 
@@ -1954,7 +1956,7 @@ fn shape_stroke(ext: &WidgetExt) -> u16 {
 
 /// Circle shape: fill with `bg_color` (if set), stroke with `border_color`
 /// drawn as `thickness` concentric rings. Centered in the widget's box.
-fn draw_circle_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+fn draw_circle_shape<B: Canvas>(lcd: &B, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
     if lcd.smooth() {
         // Anti-aliased: inscribed in the centred square so the soft edge
         // stays inside the widget box (and its clip).
@@ -1981,7 +1983,7 @@ fn draw_circle_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rec
 
 /// Ellipse shape: fill with `bg_color` (if set), stroke with `border_color`
 /// drawn as `thickness` concentric outlines. Fills the widget's w×h box.
-fn draw_ellipse_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+fn draw_ellipse_shape<B: Canvas>(lcd: &B, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
     if lcd.has_alpha() {
         draw_smooth_oval_shape(lcd, widget, ext, *abs);
         return;
@@ -2005,7 +2007,7 @@ fn draw_ellipse_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Re
 /// Anti-aliased circle/ellipse shape inscribed in `bx`: fill, then the
 /// stroke ring over it. The fill stops halfway under the ring, so neither
 /// soft edge blends over the other's fringe.
-fn draw_smooth_oval_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, ext: &WidgetExt, bx: Rect) {
+fn draw_smooth_oval_shape<B: Canvas>(lcd: &B, widget: &Widget, ext: &WidgetExt, bx: Rect) {
     let stroke = widget.border_color != 0;
     let t = shape_stroke(ext);
     if widget.background_color != 0 {
@@ -2216,7 +2218,7 @@ pub fn round_parts(widget: &Widget, abs: &Rect, ext: &WidgetExt, mut f: impl FnM
 
 /// Line shape: the widget-box diagonal `(x,y) → (x+w-1, y+h-1)`, drawn in
 /// `border_color` (falling back to `bg_color`) at the border thickness.
-fn draw_line_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+fn draw_line_shape<B: Canvas>(lcd: &B, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
     let color = if widget.border_color != 0 {
         widget.border_color
     } else {
@@ -2264,20 +2266,20 @@ pub fn polygon_shape(
     Some((n, fill, widget.border_color, shape_stroke(ext)))
 }
 
-fn draw_polygon_shape<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+fn draw_polygon_shape<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
     let mut pts = [Offset { x: 0, y: 0 }; lcd::MAX_POLY_POINTS];
     let Some((n, fill, stroke, t)) = polygon_shape(&ctx.objs, widget, abs, ext, &mut pts) else { return };
     let poly = &pts[..n];
     if fill != 0 {
-        ctx.lcd.fill_polygon(poly, fill);
+        c.fill_polygon(poly, fill);
     }
     if stroke != 0 {
-        if fill != 0 && !ctx.lcd.has_alpha() {
+        if fill != 0 && !c.has_alpha() {
             // The fill is aliased here; a soft outline would mix its inner
             // edge with the backdrop instead of the fill.
-            ctx.lcd.draw_polyline_hard(poly, widget.border_color, true, t);
+            c.draw_polyline_hard(poly, widget.border_color, true, t);
         } else {
-            ctx.lcd.draw_polyline(poly, widget.border_color, true, t);
+            c.draw_polyline(poly, widget.border_color, true, t);
         }
     }
 }
@@ -2328,17 +2330,17 @@ fn parse_points(bytes: &[u8], out: &mut [Offset]) -> usize {
 }
 
 /// Draw background image at the inner rect origin.
-fn draw_bg_image<P: Platform>(ctx: &Ctx<P>, image_id: u8, inner: &Rect) {
+fn draw_bg_image<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, image_id: u8, inner: &Rect) {
     if inner.is_empty() {
         return;
     }
     if let Some(img) = ctx.images.find(image_id) {
-        img.draw(&ctx.lcd, &ctx.flash, inner.x, inner.y);
+        img.draw(c, &ctx.flash, inner.x, inner.y);
     }
 }
 
 /// Draw image widget content — image centered in the content area.
-fn draw_widget_image<P: Platform>(ctx: &Ctx<P>, abs: &Rect, ext: &WidgetExt) {
+fn draw_widget_image<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, abs: &Rect, ext: &WidgetExt) {
     if ext.image_id == 0 {
         return;
     }
@@ -2360,21 +2362,22 @@ fn draw_widget_image<P: Platform>(ctx: &Ctx<P>, abs: &Rect, ext: &WidgetExt) {
         };
         // May be negative: a widget partly off the top/left edge (a page
         // sliding out) shows the part of its image that is on screen.
-        img.draw(&ctx.lcd, &ctx.flash, dx, dy);
+        img.draw(c, &ctx.flash, dx, dy);
     }
 }
 
 /// Draw label text in the content area. `bg = None` draws only the glyph
 /// pixels (blended on anti-aliased fonts — readback backends only).
-fn draw_label_text<P: Platform>(
+fn draw_label_text<P: Platform, C: Canvas>(
     ctx: &Ctx<P>,
+    c: &C,
     widget: &Widget,
     abs: &Rect,
     ext: &WidgetExt,
     bg: Option<Color>,
 ) {
     label_lines(ctx, widget, abs, ext, |font, line, x, y| {
-        font.draw_str(&ctx.lcd, &ctx.flash, line, x, y, ext.text_color, bg);
+        font.draw_str(c, &ctx.flash, line, x, y, ext.text_color, bg);
     });
 }
 
@@ -2493,7 +2496,7 @@ pub enum FieldItem<'a> {
 }
 
 /// Draws one [`RoundPart`] as its drawing issues it (any backend).
-fn draw_round_part<B: LcdBackend>(lcd: &LcdImpl<B>, p: RoundPart) {
+fn draw_round_part<B: Canvas>(lcd: &B, p: RoundPart) {
     match p {
         RoundPart::Oval { x, y, w, h, t, color } => lcd.draw_oval(x, y, w, h, t, color),
         RoundPart::Arc { cx, cy, r, ir, start, end, color } => lcd.fill_arc(cx, cy, r, ir, start, end, color),
@@ -2509,12 +2512,12 @@ fn draw_round_part<B: LcdBackend>(lcd: &LcdImpl<B>, p: RoundPart) {
 }
 
 /// Draw input text with cursor, or a dropdown's text and arrow, in the content area.
-fn draw_field<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+fn draw_field<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
     field_contents(ctx, widget, abs, ext, |item| match item {
         FieldItem::Text { font, line, x, y, bg } => {
-            font.draw_str(&ctx.lcd, &ctx.flash, line, x, y, ext.text_color, bg);
+            font.draw_str(c, &ctx.flash, line, x, y, ext.text_color, bg);
         }
-        FieldItem::Part(p) => draw_round_part(&ctx.lcd, p),
+        FieldItem::Part(p) => draw_round_part(c, p),
     });
 }
 
@@ -2755,7 +2758,7 @@ impl GaugeGeom {
 /// - press_color: filled arc color (value portion)
 /// - text_color: needle color
 /// - value: 0-100 gauge position
-fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, g: &GaugeGeom, ext: &WidgetExt) {
+fn draw_gauge<B: Canvas>(lcd: &B, widget: &Widget, g: &GaugeGeom, ext: &WidgetExt) {
     let (cx, cy) = (g.cx, g.cy);
     let val = ext.value.clamp(0, 100) as i32;
     let value_angle = GaugeGeom::angle(val);
@@ -2878,8 +2881,8 @@ fn gauge_changed_rects<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) ->
 const GRAPH_FLAG_LINEAR: u8 = 1 << 0;
 const GRAPH_FLAG_FILL: u8 = 1 << 1;
 
-fn draw_graph<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn draw_graph<B: Canvas>(
+    lcd: &B,
     objs: &ObjPool,
     _widget: &Widget,
     inner: &Rect,
@@ -3026,8 +3029,8 @@ pub fn graph_points(objs: &ObjPool, inner: &Rect, ext: &WidgetExt, mut f: impl F
 /// Fill a 1-pixel-wide vertical column at each x along the line a→b down to
 /// the baseline. Used when GRAPH_FLAG_FILL is set: gives a slim shaded region
 /// under the curve without a separate polygon rasterizer.
-fn fill_under_segment<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn fill_under_segment<B: Canvas>(
+    lcd: &B,
     x0: i16,
     y0: i16,
     x1: i16,
@@ -3111,7 +3114,7 @@ fn draw_scrollbar<P: Platform>(ctx: &Ctx<P>, id: WidgetId, _abs: &Rect) {
 }
 
 /// Draw rect clipped against clip region.
-fn fill_clipped<B: LcdBackend>(lcd: &LcdImpl<B>, rect: &Rect, color: Color, clip: &ClipRegion) {
+fn fill_clipped<B: Canvas>(lcd: &B, rect: &Rect, color: Color, clip: &ClipRegion) {
     for cr in clip.iter() {
         if let Some(visible) = rect.intersection(cr) {
             fill_rect_screen(lcd, visible, color);
@@ -3122,8 +3125,8 @@ fn fill_clipped<B: LcdBackend>(lcd: &LcdImpl<B>, rect: &Rect, color: Color, clip
 /// Draw gradient rect clipped against clip region.
 /// `full_rect` is the logical gradient area; each visible sub-rect is filled
 /// with the correct gradient slice relative to that area.
-fn fill_gradient_clipped<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn fill_gradient_clipped<B: Canvas>(
+    lcd: &B,
     full_rect: &Rect,
     c1: Color,
     c2: Color,
@@ -3139,8 +3142,8 @@ fn fill_gradient_clipped<B: LcdBackend>(
 
 /// Blend rect clipped against clip region. Clip rects are disjoint (region
 /// subtraction yields non-overlapping strips), so no pixel blends twice.
-fn blend_clipped<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn blend_clipped<B: Canvas>(
+    lcd: &B,
     rect: &Rect,
     color: Color,
     alpha: u8,
@@ -3154,14 +3157,14 @@ fn blend_clipped<B: LcdBackend>(
 }
 
 /// Draw rect clipped to screen bounds.
-fn fill_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, color: Color) {
+fn fill_rect_screen<B: Canvas>(lcd: &B, rect: Rect, color: Color) {
     if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.fill_rect(r.x as u16, r.y as u16, r.w, r.h, color);
     }
 }
 
 /// Blend rect clipped to screen bounds.
-fn blend_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, color: Color, alpha: u8) {
+fn blend_rect_screen<B: Canvas>(lcd: &B, rect: Rect, color: Color, alpha: u8) {
     if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.blend_rect(r.x as u16, r.y as u16, r.w, r.h, color, alpha);
     }
@@ -3170,8 +3173,8 @@ fn blend_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, color: Color, 
 /// Fill gradient rect clipped to screen bounds.
 /// `full_rect` is the logical gradient area so the slice is correctly computed
 /// even when `rect` is a clipped sub-region.
-fn fill_gradient_rect_screen<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn fill_gradient_rect_screen<B: Canvas>(
+    lcd: &B,
     rect: Rect,
     full_rect: Rect,
     c1: Color,
@@ -3205,8 +3208,8 @@ fn fill_gradient_rect_screen<B: LcdBackend>(
 // and the renderer may later move those pixels on screen (`shift_moved`).
 
 /// Fill gradient rounded rect, clipped to the screen.
-fn fill_gradient_rounded_rect_screen<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn fill_gradient_rounded_rect_screen<B: Canvas>(
+    lcd: &B,
     rect: Rect,
     radius: u16,
     c1: Color,
@@ -3217,8 +3220,8 @@ fn fill_gradient_rounded_rect_screen<B: LcdBackend>(
 }
 
 /// Draw rounded rect outline, clipped to the screen.
-fn rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16, color: Color) {
-    if B::HAS_ALPHA && radius > 0 {
+fn rounded_rect_screen<B: Canvas>(lcd: &B, rect: Rect, radius: u16, color: Color) {
+    if lcd.has_alpha() && radius > 0 {
         // The same anti-aliased 1 px ring as `draw_rounded_rect`.
         lcd.stroke_rounded_rect(rect.x, rect.y, rect.w, rect.h, radius, 1, color);
     } else if let Some(r) = rect.intersection(&screen_rect(lcd)) {
@@ -3227,13 +3230,13 @@ fn rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16,
 }
 
 /// Fill rounded rect, clipped to the screen.
-fn fill_rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16, color: Color) {
+fn fill_rounded_rect_screen<B: Canvas>(lcd: &B, rect: Rect, radius: u16, color: Color) {
     lcd.fill_rounded_rect_at(rect.x, rect.y, rect.w, rect.h, radius, color, 255);
 }
 
 /// Blend rounded rect, clipped to the screen.
-fn fill_rounded_rect_blend_screen<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn fill_rounded_rect_blend_screen<B: Canvas>(
+    lcd: &B,
     rect: Rect,
     radius: u16,
     color: Color,
@@ -3245,7 +3248,7 @@ fn fill_rounded_rect_blend_screen<B: LcdBackend>(
 /// Erase the area of a widget that is becoming invisible by repainting the
 /// nearest ancestor background.  Handles both solid and gradient ancestors so
 /// a gradient parent is not corrupted by a solid-color erase rectangle.
-fn erase_widget_area<B: LcdBackend>(tree: &ObjPool, lcd: &LcdImpl<B>, id: WidgetId, abs: Rect) {
+fn erase_widget_area<B: Canvas>(tree: &ObjPool, lcd: &B, id: WidgetId, abs: Rect) {
     let mut pid = tree.get(id).parent;
     let max = tree.count();
     let mut depth = 0usize;
@@ -3286,7 +3289,7 @@ pub fn inner_rect(abs: &Rect, border: &Edges) -> Rect {
 }
 
 /// Draw progress bar / slider fill inside the inner rect.
-fn draw_value_fill<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ext: &WidgetExt) {
+fn draw_value_fill<B: Canvas>(lcd: &B, widget: &Widget, inner: &Rect, ext: &WidgetExt) {
     if inner.is_empty() || ext.press_color == 0 {
         return;
     }
@@ -3328,8 +3331,8 @@ fn draw_value_fill<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rec
 }
 
 /// Draw checkbox or radio indicator inside the inner rect.
-fn draw_check_indicator<B: LcdBackend>(
-    lcd: &LcdImpl<B>,
+fn draw_check_indicator<B: Canvas>(
+    lcd: &B,
     widget: &Widget,
     inner: &Rect,
     ext: &WidgetExt,
@@ -3361,7 +3364,7 @@ fn draw_check_indicator<B: LcdBackend>(
     if widget.kind == KIND_CHECKBOX {
         if r > 0 {
             let br = r.min(s / 2);
-            rounded_rect_screen(&lcd, Rect::new(cx, cy, s, s), br, outline_color);
+            rounded_rect_screen(lcd, Rect::new(cx, cy, s, s), br, outline_color);
             if checked {
                 let inset: i16 = (s as i16) / 4;
                 let ir = Rect::new(
@@ -3371,13 +3374,13 @@ fn draw_check_indicator<B: LcdBackend>(
                     s.saturating_sub(inset as u16 * 2),
                 );
                 let ibr = br.saturating_sub(inset as u16);
-                fill_rounded_rect_screen(&lcd, ir, ibr, fill_color);
+                fill_rounded_rect_screen(lcd, ir, ibr, fill_color);
             }
         } else {
-            fill_rect_screen(&lcd, Rect::new(cx, cy, s, 1), outline_color);
-            fill_rect_screen(&lcd, Rect::new(cx, cy + s as i16 - 1, s, 1), outline_color);
-            fill_rect_screen(&lcd, Rect::new(cx, cy, 1, s), outline_color);
-            fill_rect_screen(&lcd, Rect::new(cx + s as i16 - 1, cy, 1, s), outline_color);
+            fill_rect_screen(lcd, Rect::new(cx, cy, s, 1), outline_color);
+            fill_rect_screen(lcd, Rect::new(cx, cy + s as i16 - 1, s, 1), outline_color);
+            fill_rect_screen(lcd, Rect::new(cx, cy, 1, s), outline_color);
+            fill_rect_screen(lcd, Rect::new(cx + s as i16 - 1, cy, 1, s), outline_color);
             if checked {
                 let x0 = cx + (s as i16) / 4;
                 let y0 = cy + (s as i16) / 2;
@@ -3437,6 +3440,7 @@ fn clear_all_dirty<P: Platform>(ctx: &mut Ctx<P>) {
 #[cfg(all(test, feature = "mock"))]
 mod tests {
     use super::*;
+    use crate::lcd::{LcdBackend, LcdImpl};
     use crate::widget::KIND_BASE;
 
     /// Pressed, background-less rounded button ("Ghost") with a full-size
@@ -3725,6 +3729,7 @@ mod tests {
 #[cfg(all(test, feature = "mock"))]
 mod shift_tests {
     use super::*;
+    use crate::lcd::LcdImpl;
     use crate::backlight::BacklightImpl;
     use crate::flash::FlashImpl;
     use crate::font::FontList;

@@ -40,7 +40,7 @@ use crate::fs::{Fs, RES_IMAGE, ResourceEntry};
 #[cfg(feature = "jpeg")]
 use crate::jpeg::{AlignedBuf, BUF_ALIGN, JpegBackend, JpegImpl};
 use alloc::vec;
-use crate::lcd::{LcdBackend, LcdImpl};
+use crate::canvas::Canvas;
 use crate::types::Rect;
 
 const MAGIC: u16 = 0x4649; // "FI"
@@ -225,9 +225,9 @@ impl Image {
     /// Copy part of the decoded pixels: image rect (sx, sy, sw, sh) to the
     /// screen at (dx, dy). The caller keeps the rect inside the image.
     #[cfg(feature = "jpeg")]
-    fn draw_decoded<B: LcdBackend>(
+    fn draw_decoded<B: Canvas>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         dx: u16,
         dy: u16,
         sx: u16,
@@ -276,9 +276,9 @@ impl Image {
     /// Honors the LCD scissor (or, without one, the screen): only the part
     /// of the image inside it is written, raw images read just the visible
     /// rows/columns, and RLE decode stops after the last visible row.
-    pub fn draw<B: LcdBackend, F: FlashBackend>(
+    pub fn draw<B: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         flash: &FlashImpl<F>,
         x: i16,
         y: i16,
@@ -357,7 +357,7 @@ impl Image {
 
     /// Part of the image at (x, y) inside the LCD scissor (or the screen,
     /// without one), in image coordinates; `None` when nothing is visible.
-    fn window<B: LcdBackend>(&self, lcd: &LcdImpl<B>, x: i16, y: i16) -> Option<Window> {
+    fn window<B: Canvas>(&self, lcd: &B, x: i16, y: i16) -> Option<Window> {
         let (w, h) = (self.width as i32, self.height as i32);
         if w == 0 || h == 0 {
             return None;
@@ -377,9 +377,9 @@ impl Image {
     /// Draw a region of the image (sprite sheet, atlas usage).
     /// Only supported in raw and JPEG mode — RLE has no random access. Alpha
     /// images are not supported here yet (full `draw` only).
-    pub fn draw_region<B: LcdBackend, F: FlashBackend>(
+    pub fn draw_region<B: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         flash: &FlashImpl<F>,
         dx: u16,
         dy: u16,
@@ -420,9 +420,9 @@ impl Image {
 
     // --- RLE mode: PackBits RLE, unit = RGB565 (2 bytes) ---
 
-    fn draw_rle<B: LcdBackend, F: FlashBackend>(
+    fn draw_rle<B: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         flash: &FlashImpl<F>,
         sink: &mut Sink,
     ) {
@@ -463,9 +463,9 @@ impl Image {
 
     // --- Alpha variants: 3-byte units (RGB565 + alpha), positioned blend ---
 
-    fn draw_raw_alpha<B: LcdBackend, F: FlashBackend>(
+    fn draw_raw_alpha<B: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         flash: &FlashImpl<F>,
         x: i16,
         y: i16,
@@ -486,9 +486,9 @@ impl Image {
         }
     }
 
-    fn draw_rle_alpha<B: LcdBackend, F: FlashBackend>(
+    fn draw_rle_alpha<B: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         flash: &FlashImpl<F>,
         cur: &mut PixelCursor,
         limit: u32,
@@ -534,9 +534,9 @@ impl Image {
         }
     }
 
-    fn draw_indexed_rle_alpha<B: LcdBackend, F: FlashBackend>(
+    fn draw_indexed_rle_alpha<B: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         flash: &FlashImpl<F>,
         cur: &mut PixelCursor,
         limit: u32,
@@ -621,9 +621,9 @@ impl Image {
 
     // --- Indexed + RLE mode: palette lookup + PackBits RLE, unit = u8 index ---
 
-    fn draw_indexed_rle<B: LcdBackend, F: FlashBackend>(
+    fn draw_indexed_rle<B: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<B>,
+        lcd: &B,
         flash: &FlashImpl<F>,
         sink: &mut Sink,
     ) {
@@ -804,7 +804,7 @@ impl Sink {
     }
 
     #[inline]
-    fn pixel<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>, color: u16) {
+    fn pixel<B: Canvas>(&mut self, lcd: &B, color: u16) {
         let w = &self.win;
         if self.row >= w.y0 && self.col >= w.x0 && self.col < w.x1 {
             lcd.write_pixel(color);
@@ -817,7 +817,7 @@ impl Sink {
     }
 
     /// `n` pixels of `color`, split at row ends and clipped to the window.
-    fn run<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>, color: u16, n: u32) {
+    fn run<B: Canvas>(&mut self, lcd: &B, color: u16, n: u32) {
         let mut n = n;
         while n > 0 {
             let take = n.min(self.width - self.col);
@@ -875,7 +875,7 @@ impl PixelCursor {
     }
 
     /// Blend the pending run.
-    fn flush<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>) {
+    fn flush<B: Canvas>(&mut self, lcd: &B) {
         if self.n != 0 {
             lcd.blend_row(self.run_x, self.y, &self.colors[..self.n], &self.alphas[..self.n]);
             self.n = 0;
@@ -883,7 +883,7 @@ impl PixelCursor {
     }
 
     #[inline]
-    fn emit<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>, color: u16, alpha: u8) {
+    fn emit<B: Canvas>(&mut self, lcd: &B, color: u16, alpha: u8) {
         if self.n == 0 {
             self.run_x = self.x;
         }
@@ -965,6 +965,7 @@ impl FlashReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lcd::{LcdBackend, LcdImpl};
     use crate::types::Rect;
     use core::cell::RefCell;
     use std::vec::Vec;

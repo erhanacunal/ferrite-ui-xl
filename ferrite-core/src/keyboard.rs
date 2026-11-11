@@ -6,7 +6,7 @@
 use crate::font::FontList;
 use crate::widget::WidgetId;
 use crate::flash::{FlashBackend, FlashImpl};
-use crate::lcd::{LcdBackend, LcdImpl};
+use crate::canvas::Canvas;
 
 // --- Layout constants ---
 
@@ -344,9 +344,9 @@ impl Keyboard {
     }
 
     /// Draw the keyboard overlay.
-    pub fn draw<L: LcdBackend, F: FlashBackend>(
+    pub fn draw<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         fonts: &FontList,
         flash: &FlashImpl<F>,
     ) {
@@ -399,9 +399,9 @@ impl Keyboard {
         }
     }
 
-    fn draw_rows<L: LcdBackend, F: FlashBackend>(
+    fn draw_rows<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         font: &crate::font::Font,
         flash: &FlashImpl<F>,
         row0: &[KeyDef],
@@ -417,9 +417,9 @@ impl Keyboard {
 
     /// Draw a single key by its code. Used for press/release highlight
     /// without redrawing the entire keyboard.
-    pub fn draw_key_by_code<L: LcdBackend, F: FlashBackend>(
+    pub fn draw_key_by_code<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         fonts: &FontList,
         flash: &FlashImpl<F>,
         code: u8,
@@ -452,9 +452,9 @@ impl Keyboard {
         }
     }
 
-    fn draw_row<L: LcdBackend, F: FlashBackend>(
+    fn draw_row<L: Canvas, F: FlashBackend>(
         &self,
-        lcd: &LcdImpl<L>,
+        lcd: &L,
         font: &crate::font::Font,
         flash: &FlashImpl<F>,
         row: &[KeyDef],
@@ -473,8 +473,8 @@ impl Keyboard {
 
 /// Draw one key (`code`) in the screen rect (kx, ky, kw, kh).
 #[allow(clippy::too_many_arguments)]
-fn draw_single_key<L: LcdBackend, F: FlashBackend>(
-    lcd: &LcdImpl<L>,
+fn draw_single_key<L: Canvas, F: FlashBackend>(
+    lcd: &L,
     font: &crate::font::Font,
     flash: &FlashImpl<F>,
     code: u8,

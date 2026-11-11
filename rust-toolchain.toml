@@ -1,0 +1,9 @@
+# The compiler the firmware is measured with (docs/plan.md 1c): the same nightly
+# ferrite-ui builds with (rustc 1.98.0-nightly b354133fb). It builds the
+# interpreter ~3% faster on the board than stable 1.99.1 (bench mode 0).
+# Change it on purpose and re-run scripts/perf_baseline.py + scripts/golden.py.
+[toolchain]
+channel = "nightly-2026-06-04"
+targets = ["armv7a-none-eabihf"]
+components = ["llvm-tools", "rustfmt", "clippy"]
+profile = "minimal"

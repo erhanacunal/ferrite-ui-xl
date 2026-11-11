@@ -114,6 +114,7 @@ fn main() {
         fonts: FontList::new(),
         images: ImageList::new(),
         objs: ObjPool::new(),
+        view: ferrite_core::pool::ObjPool::view(),
         fs: None,
         backlight: backlight::new(),
         rtc: rtc::init(),

@@ -156,6 +156,7 @@ impl ObjPool {
         if !self.is_live(id) {
             return;
         }
+        self.send(crate::view::RenderMsg::SetLayer(id, n));
         for s in 0..MAX_LAYERS {
             let slot = self.layers.slots[s];
             let mine = slot.root == id;
@@ -190,6 +191,9 @@ impl ObjPool {
 
     /// `set(layer_alpha, a)` on a layer root: its plane alpha.
     pub fn set_layer_alpha(&mut self, id: WidgetId, a: i32) {
+        if self.layers.slots.iter().any(|s| s.root == id && id.is_some()) {
+            self.send(crate::view::RenderMsg::LayerAlpha(id, a));
+        }
         if let Some(s) = self.layers.slots.iter_mut().find(|s| s.root == id && id.is_some()) {
             s.alpha = a.clamp(0, 255) as u8;
             self.layers.placed = true;
@@ -212,6 +216,7 @@ impl ObjPool {
     /// true = handled, no dirty marking needed.
     pub fn layer_placement_changed(&mut self, id: WidgetId) -> bool {
         if self.is_active_layer_root(id) {
+            self.send(crate::view::RenderMsg::Placed);
             self.layers.placed = true;
             self.render.maybe_dirty = true;
             return true;
@@ -755,6 +760,7 @@ mod tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
+            view: ObjPool::view(),
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),
@@ -1256,6 +1262,7 @@ mod tests {
             fonts: c.fonts,
             images: c.images,
             objs: c.objs,
+            view: ObjPool::view(),
             fs: c.fs,
             backlight: c.backlight,
             rtc: c.rtc,

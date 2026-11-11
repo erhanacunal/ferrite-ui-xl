@@ -27,6 +27,8 @@ pub struct Ctx<P: Platform> {
     pub fonts: FontList,
     pub images: ImageList,
     pub objs: ObjPool,
+    /// The render pool: the renderer's copy of `objs` (`view.rs`).
+    pub view: ObjPool,
     pub fs: Option<Fs>,
     pub backlight: BacklightImpl<P::BacklightB>,
     pub rtc: RtcImpl<P::RtcB>,

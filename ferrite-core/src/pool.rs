@@ -164,6 +164,12 @@ pub(crate) struct RenderState {
     /// What the renderer knows of each widget, by object pointer
     /// (`widget::RenderRec`).
     pub(crate) recs: Vec<crate::widget::RenderRec>,
+    /// VM pool: what the render pool must hear at the next sync, in order
+    /// (`view.rs`). Empty in the render pool.
+    pub(crate) msgs: Vec<crate::view::RenderMsg>,
+    /// VM pool: the tree's shape (links, objects) changed since the last
+    /// sync: the render pool's DFS order is stale.
+    pub(crate) shape_changed: bool,
 }
 
 impl RenderState {
@@ -184,6 +190,8 @@ impl RenderState {
             drawn_keys: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             snapshot: crate::snapshot::Snapshot::new(),
             recs: Vec::new(),
+            msgs: Vec::new(),
+            shape_changed: true,
             geo: Vec::new(),
             geo_stack: Vec::new(),
             geo_valid: false,
@@ -192,7 +200,7 @@ impl RenderState {
 
     /// Forget the tree (every object dropped). `draw_epoch` keeps counting:
     /// the screen still shows what was drawn.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.maybe_dirty = false;
         self.changed_n = 0;
         self.settled_epoch = self.draw_epoch.wrapping_sub(1);
@@ -252,6 +260,10 @@ pub struct ObjPool {
     pub(crate) flex_pending: Vec<WidgetId>,
     /// A layout is running: its own writes queue nothing.
     pub(crate) flex_busy: bool,
+    /// The render pool (`Ctx::view`, `view.rs`): a copy of the VM pool's
+    /// tree, synced before each render. Render-owned state (`render`,
+    /// `layers`) is kept here; the VM pool's `layers` is a mirror.
+    pub(crate) is_view: bool,
 }
 
 impl ObjPool {
@@ -285,7 +297,40 @@ impl ObjPool {
             layers: crate::layer::Layers::new(),
             flex_pending: Vec::new(),
             flex_busy: false,
+            is_view: false,
         }
+    }
+
+    /// An empty render pool (`Ctx::view`): storage grows to the VM pool's
+    /// used part at the first sync.
+    pub fn view() -> Self {
+        let mut p = Self::empty();
+        p.is_view = true;
+        p
+    }
+
+    /// Copy the tree (used arena words, live table entries, allocator
+    /// state, root, overlay) into the render pool `view`.
+    pub(crate) fn copy_tree_into(&self, view: &mut ObjPool) {
+        if view.arena.len() < self.top {
+            let words = (self.top * 2).max(1024).min(self.arena.len());
+            view.arena = try_alloc_slice(words, 0u32).expect("render pool arena");
+        }
+        let hwm = self.hwm as usize;
+        if view.table.len() < hwm {
+            let n = (hwm * 2).max(256).min(self.table.len());
+            view.table = try_alloc_slice(n, FREE_TAG).expect("render pool table");
+        }
+        view.arena[..self.top].copy_from_slice(&self.arena[..self.top]);
+        view.table[..hwm].copy_from_slice(&self.table[..hwm]);
+        view.top = self.top;
+        view.hwm = self.hwm;
+        view.free_head = self.free_head;
+        view.free_tail = self.free_tail;
+        view.garbage = self.garbage;
+        view.live = self.live;
+        view.root = self.root;
+        view.overlay = self.overlay;
     }
 
     /// Resize to `arena_bytes` / `max_objects` (0 = compile-time default),
@@ -351,6 +396,9 @@ impl ObjPool {
         self.dfs_cache.clear();
         self.dfs_valid = false;
         self.render.reset();
+        self.render.msgs.clear();
+        self.render.shape_changed = true;
+        self.send(crate::view::RenderMsg::Clear);
         {
             // The surfaces stay shown until the next render hides them.
             self.layers = crate::layer::Layers::new();
@@ -495,6 +543,7 @@ impl ObjPool {
 
     /// Allocate an object with `words` zeroed payload words.
     pub(crate) fn alloc_obj(&mut self, ty: u8, words: usize) -> Option<ObjPtr> {
+        debug_assert!(!self.is_view, "the render pool allocates nothing");
         if words > MAX_OBJ_WORDS || !self.reserve_top(HDR + words) {
             return None;
         }

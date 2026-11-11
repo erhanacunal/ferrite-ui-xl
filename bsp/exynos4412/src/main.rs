@@ -184,6 +184,7 @@ fn main(_args: BootArgs) -> ! {
         fonts: FontList::new(),
         images: ImageList::new(),
         objs: ObjPool::new(),
+        view: ferrite_core::pool::ObjPool::view(),
         fs: None,
         backlight: BacklightImpl::with_backend(backlight::GpioBacklight),
         rtc: RtcImpl::with_backend(rtc::new()),

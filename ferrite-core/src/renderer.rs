@@ -190,6 +190,7 @@ mod tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
+            view: ObjPool::view(),
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),
@@ -317,6 +318,7 @@ mod tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
+            view: ObjPool::view(),
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),
@@ -363,7 +365,7 @@ mod tests {
         crate::render::render_dirty(&mut ctx);
         assert_eq!(areas_taken(), [[(0, 0, 800, 480)]]);
         assert!(take().is_empty(), "no pass ran");
-        assert!(ctx.objs.rendered(a));
+        assert!(ctx.view.rendered(a), "the render pool keeps the records");
         assert!(!ctx.objs.get(a).is_dirty());
         // a and b overlap after rounding out to 16: one area; c on its own.
         ctx.objs.mark_dirty(a);
@@ -380,7 +382,7 @@ mod tests {
         ctx.objs.mark_dirty(c);
         crate::render::render_dirty(&mut ctx);
         assert_eq!(areas_taken(), [[(496, 288, 16, 32)]]);
-        assert!(!ctx.objs.rendered(c));
+        assert!(!ctx.view.rendered(c));
         // Declined: the passes draw.
         TAKE.with(|t| *t.borrow_mut() = false);
         ctx.objs.mark_dirty(a);

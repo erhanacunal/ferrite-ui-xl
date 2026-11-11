@@ -508,6 +508,8 @@ impl ObjPool {
         let p = self.alloc_obj(T_WIDGET, HDR_WORDS)?;
         *cast_mut::<Widget>(self.payload_mut(p, T_WIDGET)?) = Widget::NEW;
         self.dfs_valid = false;
+        self.render.shape_changed = true;
+        self.send(crate::view::RenderMsg::Born(p));
         // A new widget starts dirty (Widget::NEW).
         self.render.maybe_dirty = true;
         self.note_changed(WidgetId(p));
@@ -826,6 +828,14 @@ impl ObjPool {
     /// widget that is drawn and has no pending rect yet (an animation changes
     /// x, y, w and h each frame: the first change keeps the drawn rect).
     pub fn will_move(&mut self, id: WidgetId) {
+        if !self.is_view {
+            // The VM pool: the render pool decides (`RenderMsg::Moved`).
+            if self.is_live(id) && !self.is_active_layer_root(id) {
+                let abs = self.absolute_rect(id);
+                self.send(crate::view::RenderMsg::Moved(id, abs));
+            }
+            return;
+        }
         if !self.is_live(id) || !self.rendered(id) {
             return;
         }
@@ -872,6 +882,7 @@ impl ObjPool {
     /// Something drew over the screen outside the widget renderer: no
     /// incrementally drawn widget may trust its pixels any more.
     pub fn screen_touched(&mut self) {
+        self.send(crate::view::RenderMsg::Touched);
         self.render.draw_epoch = self.render.draw_epoch.wrapping_add(1);
     }
 
@@ -906,6 +917,7 @@ impl ObjPool {
             self.get_mut(last).next_sibling = child;
         }
         self.dfs_valid = false;
+        self.render.shape_changed = true;
         self.flex_mark(parent);
     }
 
@@ -1116,6 +1128,7 @@ impl ObjPool {
             self.free_obj(id.0, T_WIDGET);
         }
         self.dfs_valid = false;
+        self.render.shape_changed = true;
     }
 
     /// Check `id` (a KIND_BUTTON_GROUP or KIND_RADIO widget) and uncheck every
@@ -1185,7 +1198,7 @@ impl ObjPool {
         }
     }
 
-    fn note_changed(&mut self, id: WidgetId) {
+    pub(crate) fn note_changed(&mut self, id: WidgetId) {
         let n = self.render.changed_n as usize;
         if n < CHANGED_MAX {
             if !self.render.changed[..n].contains(&id) {

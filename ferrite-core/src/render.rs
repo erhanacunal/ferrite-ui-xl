@@ -217,7 +217,24 @@ fn redraw_behind_region<P: Platform>(
 /// Draw the entire widget tree from scratch (initial draw or full redraw).
 /// Iterative DFS using cached order — no recursion, no stack growth.
 pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
+    with_view(ctx, render_all_view);
+}
+
+/// Run `f` on the render pool (`view.rs`): flush pending layouts, hand the
+/// VM pool's tree and messages over, swap the pools so `ctx.objs` is the
+/// render pool during `f`, swap back, mirror the layers.
+pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -> R) -> R {
+    debug_assert!(!ctx.objs.is_view(), "nested render");
     crate::vm::flex_flush(ctx);
+    ctx.objs.sync_view(&mut ctx.view);
+    core::mem::swap(&mut ctx.objs, &mut ctx.view);
+    let r = f(ctx);
+    core::mem::swap(&mut ctx.objs, &mut ctx.view);
+    ctx.objs.mirror_layers(&ctx.view);
+    r
+}
+
+fn render_all_view<P: Platform>(ctx: &mut Ctx<P>) {
     ctx.objs.ensure_dfs();
     ctx.objs.geo_begin();
     let active = {
@@ -305,6 +322,13 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     crate::vm::flex_flush(ctx);
+    if !ctx.objs.needs_sync() && !ctx.view.render.maybe_dirty {
+        return;
+    }
+    with_view(ctx, render_dirty_view);
+}
+
+fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
     if !ctx.objs.render.maybe_dirty {
         return;
     }
@@ -1532,7 +1556,14 @@ pub fn dl_dump<P: Platform>(
     id: Option<WidgetId>,
     out: &mut impl core::fmt::Write,
 ) -> core::fmt::Result {
-    crate::vm::flex_flush(ctx);
+    with_view(ctx, |ctx| dl_dump_view(ctx, id, out))
+}
+
+fn dl_dump_view<P: Platform>(
+    ctx: &mut Ctx<P>,
+    id: Option<WidgetId>,
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
     ctx.objs.ensure_dfs();
     let ctx = &*ctx;
     let line = |out: &mut dyn core::fmt::Write, w: WidgetId| -> core::fmt::Result {
@@ -3934,6 +3965,7 @@ mod shift_tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
+            view: ObjPool::view(),
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),

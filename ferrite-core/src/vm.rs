@@ -4050,6 +4050,7 @@ mod anim_tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
+            view: ObjPool::view(),
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),
@@ -4090,6 +4091,82 @@ mod anim_tests {
         crate::render::collect_dirty_paint(&mut ctx, &mut paint);
         crate::render::render_dirty(&mut ctx);
         assert!(!ctx.objs.get(child).is_dirty());
+    }
+
+    /// Root 800x480 + a 40x30 child at (100, 50), rendered once.
+    fn rendered_pair(ctx: &mut Ctx<MockPlatform>) -> (WidgetId, WidgetId) {
+        let root = one_widget(ctx);
+        ctx.objs.root = root;
+        ctx.objs.get_mut(root).size = crate::types::Size { w: 800, h: 480 };
+        let child = one_widget(ctx);
+        ctx.objs.add_child(root, child);
+        ctx.objs.get_mut(child).location = crate::types::Offset { x: 100, y: 50 };
+        ctx.objs.get_mut(child).size = crate::types::Size { w: 40, h: 30 };
+        ctx.objs.get_mut(child).background_color = 0x1234;
+        crate::render::render_dirty(ctx);
+        (root, child)
+    }
+
+    #[test]
+    fn the_render_pool_gets_the_tree_and_keeps_the_records() {
+        let mut ctx = mock_ctx();
+        let (_, child) = rendered_pair(&mut ctx);
+        // Dirty bits handed over and cleared; records only in the render pool.
+        assert!(!ctx.objs.get(child).is_dirty());
+        assert!(!ctx.objs.render.maybe_dirty);
+        assert!(ctx.view.rendered(child));
+        assert!(!ctx.objs.rendered(child));
+        assert_eq!(ctx.view.get(child).background_color, 0x1234);
+        // Settle (the pass that drew keeps the hint up). Then a change nobody
+        // marked isn't sent; a marked one is.
+        crate::render::render_dirty(&mut ctx);
+        assert!(!ctx.view.render.maybe_dirty);
+        ctx.objs.get_mut(child).background_color = 0x4321;
+        crate::render::render_dirty(&mut ctx);
+        assert_eq!(ctx.view.get(child).background_color, 0x1234);
+        ctx.objs.mark_dirty(child);
+        crate::render::render_dirty(&mut ctx);
+        assert_eq!(ctx.view.get(child).background_color, 0x4321);
+        assert!(!ctx.view.get(child).is_dirty());
+    }
+
+    #[test]
+    fn moves_reach_the_render_pool_as_the_old_on_screen_rect() {
+        let mut ctx = mock_ctx();
+        let (_, child) = rendered_pair(&mut ctx);
+        ctx.objs.will_move(child);
+        ctx.objs.get_mut(child).location.x = 300;
+        ctx.objs.will_move(child);
+        ctx.objs.get_mut(child).location.x = 310;
+        ctx.objs.mark_moved(child);
+        assert!(ctx.view.prev_rect(child).is_empty());
+        ctx.objs.sync_view(&mut ctx.view);
+        // The first move's rect (where it is drawn), not the second's.
+        assert_eq!(ctx.view.prev_rect(child), crate::types::Rect::new(100, 50, 40, 30));
+        assert!(ctx.view.get(child).is_dirty());
+        assert_eq!(ctx.view.get(child).location.x, 310);
+    }
+
+    #[test]
+    fn a_reused_pointer_and_a_clear_reset_the_render_records() {
+        let mut ctx = mock_ctx();
+        let (root, child) = rendered_pair(&mut ctx);
+        ctx.objs.destroy_subtree(child);
+        ctx.objs.mark_dirty(root);
+        crate::render::render_dirty(&mut ctx);
+        // FIFO reuse: allocate until the pointer comes back.
+        let mut again = one_widget(&mut ctx);
+        while again != child {
+            again = one_widget(&mut ctx);
+        }
+        assert!(ctx.view.rendered(child), "not synced yet");
+        ctx.objs.sync_view(&mut ctx.view);
+        assert!(!ctx.view.rendered(child));
+        assert!(ctx.view.rendered(root));
+        ctx.objs.clear();
+        ctx.objs.sync_view(&mut ctx.view);
+        assert!(!ctx.view.rendered(root));
+        assert!(ctx.view.root.is_none());
     }
 
     #[test]

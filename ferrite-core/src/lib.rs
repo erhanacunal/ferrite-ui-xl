@@ -53,6 +53,7 @@ pub mod syscfg;
 pub mod sysinfo;
 pub mod task;
 pub mod types;
+pub mod view;
 pub mod vm;
 pub mod widget;
 

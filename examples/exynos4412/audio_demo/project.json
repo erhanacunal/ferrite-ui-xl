@@ -1,5 +1,5 @@
 {
-    "device": "exynos4412",
+    "device": "exynos4412-xl",
     "screen": [1280, 800],
     "include_dirs": ["../../../../ferrite-ui/lib"],
     "render_mode": "buffered",

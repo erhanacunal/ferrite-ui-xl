@@ -2493,6 +2493,64 @@ mod mem_detail_tests {
 }
 
 #[cfg(all(test, feature = "mock"))]
+mod flex_tests {
+    //! Native `FLEX_LAYOUT` (`vm_flex.rs`) against lib/flex.fl's function:
+    //! the same program (`testdata/flex/flex_test.fl`, compiled both ways by
+    //! `testdata/flex/gen.py`) must leave the same widget tree.
+    use super::*;
+    use crate::pool::ObjPtr;
+
+    type Row = (ObjPtr, ObjPtr, i16, i16, u16, u16, u16, u16, u16);
+
+    /// Widget rows and the VM instructions it took.
+    fn run(code: &[u8]) -> (Vec<Row>, u64) {
+        let mut rt = super::multi_tests::boot(&[(b"main", code.to_vec())]);
+        for _ in 0..3 {
+            rt.step();
+        }
+        assert_eq!(rt.error_code, 0);
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let objs = &rt.ctx.objs;
+        let rows = (0..objs.ptr_count() as ObjPtr)
+            .map(WidgetId)
+            .filter(|&w| objs.is_live(w))
+            .map(|w| {
+                let x = objs.get(w);
+                (
+                    w.0,
+                    x.parent.0,
+                    x.location.x,
+                    x.location.y,
+                    x.size.w,
+                    x.size.h,
+                    x.flags,
+                    x.border_color,
+                    objs.ext(w).text_color,
+                )
+            })
+            .collect();
+        (rows, rt.tasks.main.instructions)
+    }
+
+    #[test]
+    fn native_flex_layout_matches_lib_flex_fl() {
+        let (fl, fl_instr) = run(include_bytes!("../testdata/flex/flex_fl.prg"));
+        let (native, native_instr) = run(include_bytes!("../testdata/flex/flex_native.prg"));
+        std::eprintln!("VM instructions: lib/flex.fl {fl_instr}, native {native_instr}");
+        assert!(native_instr < fl_instr, "native flex runs fewer VM instructions");
+        assert!(fl.len() > 500, "test program built {} widgets", fl.len());
+        // flexLayout ran: children were placed (non-zero positions)...
+        assert!(fl.iter().filter(|r| r.2 != 0 || r.3 != 0).count() > 200);
+        // ...and the untargeted set() after it landed somewhere.
+        assert!(fl.iter().any(|r| r.7 >= 1000));
+        assert_eq!(fl.len(), native.len());
+        for (a, b) in fl.iter().zip(&native) {
+            assert_eq!(a, b, "widget {} (fl vs native)", a.0);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
 mod multi_tests {
     //! Several programs on one tree, through `Runtime::new` + `step` on a
     //! mock filesystem with hand-assembled programs.
@@ -2570,7 +2628,7 @@ mod multi_tests {
 
     /// Filesystem at the default base with these programs; returns a
     /// runtime booted into `main`.
-    fn boot(progs: &[(&[u8], Vec<u8>)]) -> Runtime<MockPlatform> {
+    pub(super) fn boot(progs: &[(&[u8], Vec<u8>)]) -> Runtime<MockPlatform> {
         const BASE: usize = crate::fs::DEFAULT_FS_BASE as usize;
         const DATA: usize = BASE + 0x1000;
         let mut img = alloc::vec![0u8; DATA];

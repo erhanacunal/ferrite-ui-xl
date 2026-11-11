@@ -54,10 +54,11 @@ impl Platform for Exynos4412Platform {
 
     // WM8758 codec on I2S0 + pdma0 (audio.rs). JPEG → software decoder behind
     // `jpeg` later (no HW codec driver yet). Mirrored in
-    // tools/devices/exynos4412.json (caps.*).
+    // ferrite-ui tools/devices/exynos4412-xl.json (caps.*).
     const CAPS: u32 = ferrite_core::platform::CAP_AUDIO
         | ferrite_core::platform::CAP_MULTI_PROGRAM
-        | ferrite_core::platform::CAP_SUPEROPS;
+        | ferrite_core::platform::CAP_SUPEROPS
+        | ferrite_core::platform::CAP_NATIVE_FLEX;
 
     const ANIM_SLOTS: usize = 64;
     // Glyph bitmaps in RAM at font load: text drawing then needs no

@@ -1,0 +1,99 @@
+// flex_test.fl — native FLEX_LAYOUT vs lib/flex.fl (runtime::flex_tests).
+//
+// Compiled twice by gen.py (flexLayout as the .fl function / as the opcode);
+// the test runs both and compares every widget. Containers cover every
+// direction (incl. the undefined 3) x justify x items combination, with
+// random borders, padding, gaps, sizes (overflowing ones too), grow factors,
+// hidden children and nested containers. After each flexLayout() a set()
+// without target() lands on whatever widget flexLayout left targeted, so the
+// VM target is compared as well.
+
+#include "flex.fl"
+
+var seed = 12345;
+
+fn rnd(n) {
+    seed = seed * 1103515245 + 12345;
+    var v = (seed / 256) % n;
+    if (v < 0) {
+        v = -v;
+    }
+    return v;
+}
+
+fn build(mode) {
+    var b: widget = alloc();
+    target(b);
+    parent(0);
+    set(size, 60 + rnd(300), 40 + rnd(200));
+    set(border, rnd(3), rnd(3), rnd(3), rnd(3));
+    set(padding, rnd(6), rnd(6), rnd(6), rnd(6));
+    set(flex, mode);
+    set(flex_gap, rnd(10));
+    var n = rnd(6);
+    var i = 0;
+    while (i < n) {
+        var c: widget = alloc();
+        target(c);
+        parent(b);
+        set(size, 5 + rnd(120), 5 + rnd(80));
+        if (rnd(4) == 0) {
+            set(flex_grow, 1 + rnd(3));
+        }
+        if (rnd(6) == 0) {
+            set(visible, 0);
+        }
+        if (rnd(5) == 0) {
+            set(flex, (1 + rnd(2)) | (rnd(5) * 4) | (rnd(4) * 32));
+            set(flex_gap, rnd(5));
+            var k = 0;
+            var m = 1 + rnd(3);
+            while (k < m) {
+                var g: widget = alloc();
+                target(g);
+                parent(c);
+                set(size, 3 + rnd(40), 3 + rnd(40));
+                if (rnd(3) == 0) {
+                    set(flex_grow, 1 + rnd(2));
+                }
+                if (rnd(7) == 0) {
+                    set(visible, 0);
+                }
+                k++;
+            }
+        }
+        i++;
+    }
+    flexLayout(b);
+    // No target(): lands where flexLayout left the target.
+    set(border_color, 1000 + i);
+    // Again: grown/stretched sizes are overwritten, so it must be stable.
+    if (rnd(3) == 0) {
+        flexLayout(b);
+        set(text_color, 2000 + n);
+    }
+}
+
+fn setup() {
+    var rep = 0;
+    while (rep < 4) {
+        var d = 1;
+        while (d <= 3) {
+            var j = 0;
+            while (j <= 16) {
+                var it = 0;
+                while (it <= 96) {
+                    build(d | j | it);
+                    it += 32;
+                }
+                j += 4;
+            }
+            d++;
+        }
+        rep++;
+    }
+}
+
+fn loop() {
+    delay(1000);
+}

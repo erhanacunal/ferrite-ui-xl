@@ -26,13 +26,17 @@ Varsayım: XL bare-metal + Embassy üzerinde kalır.
   Doğrulandı: core testleri (exynos feature seti) 195 geçti, sim (`tablet`) ve exynos release
   derleniyor, `bench`/`tablet` image'ları ferrite-ui araçlarıyla derleniyor.
   `tablet/assets/` git-ignored ve üretiliyor (`make_assets.py`).
-- [ ] **1b Feature'ları sabitleme:** `wide_obj`, `pool_large`, `wide_code`, `fast_vm`,
-  `superops`, `multi_program`, `render_cache`, `layers`, `perf` her zaman açık olacak,
-  kapalı dalları silinecek (u16 `ObjPtr`, sparse var tablosu, `AA_UNDERLAY`, FPGA/GD32 kodu).
-  Sim `no-readback` modu kalkacak. `CLAUDE.md` XL'e göre sadeleştirilecek.
+- [x] **1b Feature'ları sabitleme:** `wide_obj`, `pool_large`, `wide_code`, `fast_vm`,
+  `superops`, `multi_program`, `render_cache`, `layers`, `perf`, `audio` artık feature değil,
+  kapalı dalları silindi (u16 `ObjPtr`/`Off`, sparse var tablosu, katmansız stub'lar).
+  `epaper`/`sdcard`/`sdboot` modülleriyle birlikte kaldırıldı. `AA_UNDERLAY`/`Underlay`
+  kaldırıldı. Sim her zaman 1280×800 ve readback'li. `CLAUDE.md` başına XL farkları eklendi.
+  - Ertelendi (2a'ya): `HAS_ALPHA=false` yolu (mock backend testleri ona dayanıyor),
+    `send_command`/`send_data` + `OP_FPGA_*`, GD32 statik heap'i (`heap.rs`, ölü kod),
+    CLAUDE.md'nin tamamen yeniden yazılması.
 - [ ] **1c Referans ölçümleri:** `perf` ile `bench`, `tablet`, `scroll`, `paint`, `layers`
   sahnelerinde faz başına cycle değerleri. Sim'de senaryo başına golden frame dump'ları.
-- [ ] **1d Native flex** (aşağıya bakın).
+- [ ] **1d Native flex** (aşağıya bakın). Seviye 1 tamam, seviye 2 bekliyor.
 
 Kabul kriteri: testler geçiyor, sim örnekleri çalışıyor, tablet cihazda açılıyor,
 perf değerleri ferrite-ui ile aynı (±%2).
@@ -47,10 +51,13 @@ Layout **VM çekirdeğinde** kalır, render tarafına taşınmaz. Bu sayede pozi
 boyutlar VM'e ait prop'lar (A sınıfı) olarak kalır ve senkron okumalar beklemeden doğru
 sonuç verir. Layout'un maliyeti raster'a göre küçük, ayrı bir çekirdeğe ihtiyacı yok.
 
-- **Seviye 1, açık çağrı (aynı semantik):** `flexLayout(box)` yerine native builtin
-  (`caps.native_flex`). Derleyici bu cap varsa .fl fonksiyonu yerine opcode üretir.
-  Algoritma yuvarlamaları dahil bire bir taşınır. Test: aynı ağaçlarda .fl ile native
-  sonuçların karşılaştırılması.
+- [x] **Seviye 1, açık çağrı (aynı semantik):** `flexLayout(box)` cihazda
+  `caps.native_flex` varsa `FLEX_LAYOUT` (0xDB) opcode'u olarak derlenir
+  (ferrite-ui `tools`, cihaz profili `exynos4412-xl`; firmware `CAP_NATIVE_FLEX`,
+  `ferrite-core/src/vm_flex.rs`). Okumalar, yazmalar (`w_set`), target ve aritmetik
+  .fl ile bire bir aynı. Test: `runtime::flex_tests`, `testdata/flex/flex_test.fl`
+  programını iki şekilde derleyip (`gen.py`) tüm widget'ları karşılaştırıyor.
+  Bu programda VM komut sayısı 274.850 → 160.631.
 - **Seviye 2, otomatik layout:** layout'u etkileyen prop'lar değiştiğinde container
   "layout dirty" işaretlenir: `size`, `visible`, `flex*`, `border`/`padding`, çocuk
   eklenmesi/çıkarılması/taşınması, büyümeyen çocuğun ana eksen boyutu.

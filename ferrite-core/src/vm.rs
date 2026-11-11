@@ -16,6 +16,9 @@ use crate::proto::{
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VALUE, PROP_VISIBLE,
 };
 use crate::render;
+
+#[path = "vm_flex.rs"]
+mod flex;
 use crate::strpool;
 use crate::pool::{ObjPool, ObjPtr, PTR_NONE};
 use crate::types::{Edges, Offset, Size};
@@ -484,6 +487,8 @@ const OP_TASK_ALIVE: u8 = 0xD7; // pop id → push 1 while starting / running, e
 const OP_TASK_SEND: u8 = 0xD8; // pop b, pop a, pop id → push 1 queued / 0
 const OP_TASK_SET_FG: u8 = 0xD9; // pop id → push 1 if it now gets the global input events
 const OP_TASK_FG: u8 = 0xDA; // push the foreground task's id
+// Native lib/flex.fl flexLayout (CAP_NATIVE_FLEX, `vm_flex.rs`).
+const OP_FLEX_LAYOUT: u8 = 0xDB; // pop box → lay out its children; target = box; push 0
 // Sound opcodes exist only with the `audio` feature; elsewhere they are
 // bad opcodes.
 const OP_SOUND_PLAY: u8 = 0xB9; // pop looping, pop str_id (RES_SOUND name) → push 1 started / 0
@@ -2543,6 +2548,11 @@ impl Vm {
             }
             OP_PROGRAM_ARG => self.push(self.program.arg),
             OP_TASK_SPAWN..=OP_TASK_FG => self.task_op(ctx, op),
+            OP_FLEX_LAYOUT => {
+                let bx = self.pop();
+                self.flex_layout(ctx, bx);
+                self.push(0);
+            }
             OP_PROGRAM_NAME => {
                 let index = self.pop();
                 let mut buf = [0u8; crate::fs::NAME_LEN];

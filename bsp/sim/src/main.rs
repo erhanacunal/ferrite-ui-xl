@@ -42,8 +42,16 @@ use touch::CalParams;
 
 fn main() {
     let (fsimage_path, taps, eeprom_path, audio_out) = parse_args();
+    let dump = platform::Dump::from_args();
 
     systick::init();
+    if let Some(d) = &dump {
+        systick::sim::set_virtual();
+        if let Err(e) = fs::create_dir_all(&d.dir) {
+            eprintln!("--dump {}: {e}", d.dir.display());
+            std::process::exit(1);
+        }
+    }
 
     let flash = match load_flash(fsimage_path.as_deref()) {
         Ok(f) => f,
@@ -76,7 +84,8 @@ fn main() {
         WindowOptions::default(),
     ) {
         Ok(mut w) => {
-            w.set_target_fps(60);
+            // A dump run is not paced (virtual clock).
+            w.set_target_fps(if dump.is_some() { 0 } else { 60 });
             w
         }
         Err(e) => {
@@ -104,7 +113,7 @@ fn main() {
         tasks: ferrite_core::task::TaskTable::new(),
     });
 
-    platform::install_host(window, fb.clone(), mouse.clone(), taps);
+    platform::install_host(window, fb.clone(), mouse.clone(), taps, dump);
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     prof::start_from_args();

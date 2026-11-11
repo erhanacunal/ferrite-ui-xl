@@ -34,8 +34,13 @@ Varsayım: XL bare-metal + Embassy üzerinde kalır.
   - Ertelendi (2a'ya): `HAS_ALPHA=false` yolu (mock backend testleri ona dayanıyor),
     `send_command`/`send_data` + `OP_FPGA_*`, GD32 statik heap'i (`heap.rs`, ölü kod),
     CLAUDE.md'nin tamamen yeniden yazılması.
-- [ ] **1c Referans ölçümleri:** `perf` ile `bench`, `tablet`, `scroll`, `paint`, `layers`
-  sahnelerinde faz başına cycle değerleri. Sim'de senaryo başına golden frame dump'ları.
+- [x] **1c Referans ölçümleri (sim):** sim'de deterministik mod (`--dump DIR --dump-at MS,..
+  [--step-ms N]`: sanal saat, sabit RTC, sadece scripted dokunma, BMP dump).
+  `scripts/golden.py` `golden/scenarios.json`'daki 13 senaryoyu (9 örnek) çalıştırıp frame
+  hash'lerini `golden/hashes.json` ile karşılaştırıyor (`--update` ile kaydeder; farklarda
+  `target/golden/<senaryo>/*_diff.png`).
+- [ ] **1c Referans ölçümleri (cihaz):** `scripts/perf_baseline.py` (kartta XL firmware +
+  WiFi gerekli) örnek başına `ferrite_cli.py perf` çıktısını `perf/baseline/`'a yazar.
 - [ ] **1d Native flex** (aşağıya bakın). Seviye 1 tamam, seviye 2 bekliyor.
 
 Kabul kriteri: testler geçiyor, sim örnekleri çalışıyor, tablet cihazda açılıyor,

@@ -28,11 +28,7 @@ impl SystemRtc {
     }
 
     fn current_unix_secs(&self) -> u64 {
-        let real = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0) as i64;
-        (real + self.offset_secs.get()).max(0) as u64
+        (host_secs() + self.offset_secs.get()).max(0) as u64
     }
 }
 
@@ -43,11 +39,7 @@ impl RtcBackend for SystemRtc {
 
     fn set_time(&self, dt: &DateTime) {
         let target = datetime_to_unix(dt) as i64;
-        let real = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0) as i64;
-        self.offset_secs.set(target - real);
+        self.offset_secs.set(target - host_secs());
     }
 
     fn is_valid(&self) -> bool {
@@ -55,6 +47,18 @@ impl RtcBackend for SystemRtc {
     }
 
     fn clear_vl_flag(&self) {}
+}
+
+/// Host time in Unix seconds; on the virtual clock (`--dump`) a fixed
+/// 2026-01-01 00:00 UTC plus the virtual uptime, so runs are reproducible.
+fn host_secs() -> i64 {
+    if crate::systick::sim::is_virtual() {
+        return 1_767_225_600 + (crate::systick::sim::millis() / 1000) as i64;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64
 }
 
 fn is_leap(y: u32) -> bool {

@@ -8,7 +8,7 @@ ferrite-ui for RAM-rich, multi-core devices (first target: Exynos 4412 tablet). 
 - Removed: `epaper`, `sdcard`, `sdboot` (+ `sdcard.rs`, `fat.rs`, `sdboot.rs`), the write-only anti-aliasing path (`LcdBackend::AA_UNDERLAY`, `Underlay`, `set_underlay`), the sim's `no-readback`/`tablet` features.
 - Compiler, `.fl` library and Designer are NOT in this repo: they stay in ferrite-ui (single source). Examples include `../ferrite-ui/lib`; `sim.bat` uses `%FERRITE_UI%` (default `..errite-ui`). XL-only bytecode is enabled through device caps (`caps.*`).
 - Native flex: `flexLayout(box)` compiles to `FLEX_LAYOUT` (0xDB, `vm_flex.rs`) for devices with `caps.native_flex` (`CAP_NATIVE_FLEX`); XL examples use the `exynos4412-xl` device profile (ferrite-ui `tools/devices`). `runtime::flex_tests` compares it with lib/flex.fl; regenerate its programs with `python ferrite-core/testdata/flex/gen.py` after changing flex.fl.
-- Tests: `cargo test -p ferrite-core --features host,mock`. Firmware: `cd bsp/exynos4412 && cargo build --release` (or `exynos4412.ps1`).
+- Tests: `cargo test -p ferrite-core --features host,mock`. Pixel regression: `python scripts/golden.py` (sim on a virtual clock, `--dump`; `--update` after an intended visual change). Device perf: `python scripts/perf_baseline.py`. Firmware: `cd bsp/exynos4412 && cargo build --release` (or `exynos4412.ps1`).
 
 ---
 

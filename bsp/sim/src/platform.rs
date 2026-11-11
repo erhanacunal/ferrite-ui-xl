@@ -55,6 +55,66 @@ struct Host {
     fb: Framebuffer,
     mouse: MouseState,
     taps: Vec<ScriptedTap>,
+    dump: Option<Dump>,
+}
+
+/// Deterministic run with frame dumps (`--dump DIR --dump-at MS,MS,..
+/// [--step-ms N]`): the clock is virtual (each frame advances it by
+/// `step_ms`, `delay` advances it instead of sleeping, the RTC starts at
+/// 2026-01-01 00:00), the real mouse is ignored (scripted `--tap`/`--swipe`
+/// only) and the window is not paced. At each `--dump-at` time the shown
+/// screen is written to `DIR/frame_MS.bmp`; after the last one the sim exits.
+/// `scripts/golden.py` drives it.
+pub struct Dump {
+    pub dir: std::path::PathBuf,
+    pub at: Vec<u32>,
+    pub step_ms: u32,
+    next: usize,
+}
+
+impl Dump {
+    /// Parse the dump options from the command line; `None` without `--dump`.
+    pub fn from_args() -> Option<Dump> {
+        let args: Vec<String> = std::env::args().collect();
+        let val = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+        let dir = val("--dump")?;
+        let mut at: Vec<u32> = val("--dump-at")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        at.sort_unstable();
+        if at.is_empty() {
+            at.push(0);
+        }
+        let step_ms = val("--step-ms").and_then(|v| v.parse().ok()).unwrap_or(16).max(1);
+        Some(Dump { dir: dir.into(), at, step_ms, next: 0 })
+    }
+}
+
+/// 24-bit bottom-up BMP of an ARGB screen.
+fn write_bmp(path: &std::path::Path, px: &[u32], w: usize, h: usize) -> std::io::Result<()> {
+    let row = (w * 3 + 3) & !3;
+    let size = 54 + row * h;
+    let mut b = Vec::with_capacity(size);
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&(size as u32).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&54u32.to_le_bytes());
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&(w as i32).to_le_bytes());
+    b.extend_from_slice(&(h as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&24u16.to_le_bytes());
+    b.extend_from_slice(&[0u8; 24]);
+    for y in (0..h).rev() {
+        let start = b.len();
+        for &p in &px[y * w..y * w + w] {
+            b.extend_from_slice(&[p as u8, (p >> 8) as u8, (p >> 16) as u8]);
+        }
+        b.resize(start + row, 0);
+    }
+    std::fs::write(path, b)
 }
 
 /// A scripted press: `--tap X,Y,MS` holds (x, y) for `TAP_HOLD_MS`;
@@ -93,8 +153,8 @@ thread_local! {
 
 /// Hand the window, framebuffer and mouse state to the runtime so `frame_end`
 /// can pump them. Call once, before `ferrite_core::run`.
-pub fn install_host(window: Window, fb: Framebuffer, mouse: MouseState, taps: Vec<ScriptedTap>) {
-    HOST.with(|h| *h.borrow_mut() = Some(Host { window, fb, mouse, taps }));
+pub fn install_host(window: Window, fb: Framebuffer, mouse: MouseState, taps: Vec<ScriptedTap>, dump: Option<Dump>) {
+    HOST.with(|h| *h.borrow_mut() = Some(Host { window, fb, mouse, taps, dump }));
 }
 
 impl PlatformRuntime for SimPlatform {
@@ -144,8 +204,9 @@ impl PlatformRuntime for SimPlatform {
                 std::process::exit(0);
             }
 
-            // Sample the mouse for the next frame's input dispatch.
-            let pressed = host.window.get_mouse_down(MouseButton::Left);
+            // Sample the mouse for the next frame's input dispatch (scripted
+            // presses only in a dump run).
+            let pressed = host.window.get_mouse_down(MouseButton::Left) && host.dump.is_none();
             let pos = host.window.get_mouse_pos(MouseMode::Discard);
             let (mx, my) = match pos {
                 Some((x, y)) => (
@@ -167,8 +228,23 @@ impl PlatformRuntime for SimPlatform {
             // for pacing). In buffered mode this is whichever buffer the last
             // end_frame published; in dirty mode it is always buffer 0.
             let window = &mut host.window;
+            let dump = &mut host.dump;
             host.fb.with_shown(|buf| {
                 let _ = window.update_with_buffer(buf, WIDTH as usize, HEIGHT as usize);
+                if let Some(d) = dump.as_mut() {
+                    while d.next < d.at.len() && now >= d.at[d.next] {
+                        let path = d.dir.join(format!("frame_{:06}.bmp", d.at[d.next]));
+                        if let Err(e) = write_bmp(&path, buf, WIDTH as usize, HEIGHT as usize) {
+                            eprintln!("dump {}: {e}", path.display());
+                            std::process::exit(2);
+                        }
+                        d.next += 1;
+                    }
+                    if d.next == d.at.len() {
+                        std::process::exit(0);
+                    }
+                    systick::sim::advance(d.step_ms);
+                }
             });
         });
     }

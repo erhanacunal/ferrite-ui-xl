@@ -1,0 +1,18 @@
+{
+  "_doc": "Sim golden scenarios (scripts/golden.py). Times in virtual ms from boot; tap = [x, y, ms], swipe = [x0, y0, x1, y1, ms, dur]; dump = frames to hash.",
+  "scenarios": {
+    "bench":            { "example": "bench",      "taps": [[1156, 60, 1000], [1156, 60, 3000]], "dump": [900, 2900, 4900] },
+    "tablet_home":      { "example": "tablet",     "swipes": [[1000, 300, 200, 300, 2000, 250]], "dump": [1500, 3500] },
+    "tablet_clock":     { "example": "tablet",     "taps": [[340, 468, 2000]], "dump": [3500, 4500] },
+    "tablet_calc":      { "example": "tablet",     "taps": [[540, 468, 2000]], "dump": [3000] },
+    "tablet_paint":     { "example": "tablet",     "taps": [[740, 468, 2000]], "dump": [3000] },
+    "tablet_monitor":   { "example": "tablet",     "taps": [[940, 468, 2000]], "dump": [3000, 4000] },
+    "scroll":           { "example": "scroll",     "swipes": [[400, 500, 400, 200, 2000, 300], [1000, 500, 1000, 250, 4000, 300]], "dump": [1500, 3000, 5500] },
+    "paint":            { "example": "paint",      "taps": [[160, 748, 2000]], "dump": [1500, 2500, 3500] },
+    "layers":           { "example": "layers",     "taps": [[912, 740, 2000], [1140, 740, 4000]], "dump": [1500, 3000, 5000] },
+    "multitask":        { "example": "multitask",  "taps": [[640, 700, 2000]], "dump": [1500, 3000] },
+    "launcher":         { "example": "launcher",   "taps": [[188, 400, 2000]], "dump": [1500, 3000] },
+    "audio_demo":       { "example": "audio_demo", "taps": [[168, 232, 2000]], "dump": [1500, 2500] },
+    "model3d":          { "example": "model3d",    "taps": [[1152, 60, 2000]], "dump": [1500, 3000] }
+  }
+}

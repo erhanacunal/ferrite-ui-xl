@@ -8,7 +8,7 @@ pub const COLOR_GREEN: Color = 0x07E0;
 pub const COLOR_BLUE: Color = 0x001F;
 
 /// Pixel offset (relative to parent content area)
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Offset {
     pub x: i16,
     pub y: i16,
@@ -22,7 +22,7 @@ pub struct Size {
 }
 
 /// Screen-coordinate rectangle
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Rect {
     pub x: i16,
     pub y: i16,

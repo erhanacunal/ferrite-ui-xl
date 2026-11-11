@@ -78,7 +78,7 @@ impl Span {
 }
 
 /// One recorded call (the `Canvas` method of the same name).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Op {
     SetScissor(Option<Rect>),
     FillRect { x: u16, y: u16, w: u16, h: u16, color: u16 },
@@ -192,6 +192,47 @@ impl List {
         }
         let s = self.put_u16s(colors);
         self.ops.push(Op::Pixels(s));
+    }
+
+    /// The list as text, one call a line (`GET /api/dl?id=`, sim `--dl-dump`):
+    /// the call's fields, then the start of its slice data (`… +N` = N more).
+    pub fn write_text(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        fn some<T: core::fmt::Debug>(out: &mut impl core::fmt::Write, what: &str, d: &[T]) -> core::fmt::Result {
+            const SHOWN: usize = 12;
+            write!(out, " {what}[")?;
+            for (i, v) in d.iter().take(SHOWN).enumerate() {
+                write!(out, "{}{v:?}", if i > 0 { " " } else { "" })?;
+            }
+            if d.len() > SHOWN {
+                write!(out, " … +{}", d.len() - SHOWN)?;
+            }
+            write!(out, "]")
+        }
+        for (i, op) in self.ops.iter().enumerate() {
+            write!(out, "{i:4} {op:?}")?;
+            match *op {
+                Op::Pixels(s) => some(out, "px", &self.u16s[s.range()])?,
+                Op::BlendSpan { alphas, .. } => some(out, "a", &self.u8s[alphas.range()])?,
+                Op::BlendRow { colors, alphas, .. } => {
+                    some(out, "px", &self.u16s[colors.range()])?;
+                    some(out, "a", &self.u8s[alphas.range()])?;
+                }
+                Op::Polyline { points, .. } | Op::FillPolygon { points, .. } => {
+                    let p = &self.pts[points.range()];
+                    write!(out, " pts[")?;
+                    for (i, o) in p.iter().take(12).enumerate() {
+                        write!(out, "{}{},{}", if i > 0 { " " } else { "" }, o.x, o.y)?;
+                    }
+                    if p.len() > 12 {
+                        write!(out, " … +{}", p.len() - 12)?;
+                    }
+                    write!(out, "]")?;
+                }
+                _ => {}
+            }
+            writeln!(out)?;
+        }
+        Ok(())
     }
 
     /// Make the recorded calls on `c`.
@@ -693,6 +734,16 @@ impl Cache {
         e.used = clock;
         count(&HITS);
         Some(&e.list)
+    }
+
+    /// The list for `key`, as is (no use mark, not counted: dumps).
+    pub fn peek(&self, key: u64) -> Option<&List> {
+        self.map.get(&key).map(|e| &e.list)
+    }
+
+    /// Whether `key` was met (dumps; nothing remembered).
+    pub fn was_seen(&self, key: u64) -> bool {
+        self.seen.contains(&key)
     }
 
     /// Whether `key` was met before (and remember it). A miss counts as a

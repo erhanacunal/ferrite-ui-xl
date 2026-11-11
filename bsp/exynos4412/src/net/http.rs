@@ -12,6 +12,7 @@
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
+//! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
@@ -241,6 +242,19 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
             let early = &request[head_end..filled];
             upload(socket, super::Upload::Firmware, length, want, expect, early).await?;
+        }
+        (b"GET", b"/api/dl") => {
+            let id = match query_param(query, b"id") {
+                None => Some(super::DL_ALL),
+                Some(v) => core::str::from_utf8(v).ok().and_then(|v| v.parse::<i32>().ok()).filter(|&v| v >= 0),
+            };
+            match id {
+                None => text(socket, "400 Bad Request", "id=N (a widget id), or no id for all widgets\n").await?,
+                Some(id) => match super::dl_dump(id).await {
+                    Some(t) => text(socket, "200 OK", &t).await?,
+                    None => text(socket, "503 Service Unavailable", "No answer from the UI core\n").await?,
+                },
+            }
         }
         (b"GET", b"/api/screen") => match super::screenshot().await {
             Some(px) => screen_bmp(socket, &px).await?,

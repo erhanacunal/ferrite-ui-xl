@@ -1655,6 +1655,14 @@ fn draw_cached<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
     let key = dl_key(ctx, id, abs);
     let start = lcd.scissor();
     {
+        let mut keys = state.drawn_keys.borrow_mut();
+        // Destroyed widgets' entries: dropped wholesale now and then.
+        if keys.len() >= 1 << 16 {
+            keys.clear();
+        }
+        keys.insert(id, key);
+    }
+    {
         let mut cache = state.dl_cache.borrow_mut();
         if let Some(list) = cache.get(key) {
             if crate::dl::verify() {
@@ -1685,6 +1693,107 @@ fn draw_cached<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
     }
     lcd.set_scissor(list.end_scissor(start));
     state.dl_cache.borrow_mut().insert(key, list);
+}
+
+/// Display-list dump (exynos `GET /api/dl[?id=N]`, sim `--dl-dump`, right
+/// click). Without `id`: one line per widget in DFS order (id, kind, box,
+/// the look key it last drew with and what the cache holds for it: `cached N
+/// ops`, `seen` = drawn directly once, `evicted`; `not drawn` = not drawn
+/// with display lists on; `look changed` = its look now differs (outside
+/// layers only: a layer's widgets are keyed in layer coordinates); and its
+/// last `on_paint` list). With `id`: that line, then the lists themselves
+/// (`List::write_text`).
+pub fn dl_dump<P: Platform>(
+    ctx: &mut Ctx<P>,
+    id: Option<WidgetId>,
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
+    crate::vm::flex_flush(ctx);
+    ctx.objs.ensure_dfs();
+    let ctx = &*ctx;
+    let line = |out: &mut dyn core::fmt::Write, w: WidgetId| -> core::fmt::Result {
+        let abs = ctx.objs.absolute_rect(w);
+        let wd = ctx.objs.get(w);
+        let cache = ctx.objs.render.dl_cache.borrow();
+        write!(
+            out,
+            "{} kind {} {}x{} at {},{}{} ",
+            w.to_vm(),
+            wd.kind,
+            abs.w,
+            abs.h,
+            abs.x,
+            abs.y,
+            if ctx.objs.is_tree_visible(w) { "" } else { " hidden" },
+        )?;
+        match ctx.objs.render.drawn_keys.borrow().get(&w) {
+            None => write!(out, "not drawn")?,
+            Some(&key) => {
+                write!(out, "key {key:016x} ")?;
+                match cache.peek(key) {
+                    Some(l) => write!(out, "cached {} ops {} B", l.ops.len(), l.heap_bytes())?,
+                    None if cache.was_seen(key) => write!(out, "seen")?,
+                    None => write!(out, "evicted")?,
+                }
+                if !in_layer(&ctx.objs, w) && dl_key(ctx, w, &abs) != key {
+                    write!(out, ", look changed")?;
+                }
+            }
+        }
+        if let Some(l) = ctx.objs.render.paints.borrow().get(&w) {
+            write!(out, "; on_paint {} ops", l.ops.len())?;
+        }
+        writeln!(out)
+    };
+    match id {
+        None => {
+            writeln!(
+                out,
+                "display lists {}; id kind box key state",
+                if crate::dl::enabled() { "on" } else { "off" }
+            )?;
+            for i in 0..ctx.objs.dfs_len() {
+                line(out, ctx.objs.dfs_at(i))?;
+            }
+        }
+        Some(w) => {
+            if !(0..ctx.objs.dfs_len()).any(|i| ctx.objs.dfs_at(i) == w) {
+                return writeln!(out, "no widget {}", w.to_vm());
+            }
+            line(out, w)?;
+            let key = ctx.objs.render.drawn_keys.borrow().get(&w).copied();
+            if let Some(l) = key.and_then(|k| ctx.objs.render.dl_cache.borrow().peek(k).map(|l| l.compact())) {
+                writeln!(out, "widget list:")?;
+                l.write_text(out)?;
+            }
+            if let Some(l) = ctx.objs.render.paints.borrow().get(&w) {
+                writeln!(out, "on_paint list:")?;
+                l.write_text(out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `w` is a layer root or inside one (it may draw in layer coordinates).
+fn in_layer(objs: &crate::pool::ObjPool, mut w: WidgetId) -> bool {
+    while w.is_some() {
+        if objs.layer_of(w) != 0 {
+            return true;
+        }
+        w = objs.get(w).parent;
+    }
+    false
+}
+
+/// The topmost visible widget at (`x`, `y`) (sim right click), if any.
+pub fn widget_at<P: Platform>(ctx: &mut Ctx<P>, x: i16, y: i16) -> Option<WidgetId> {
+    crate::vm::flex_flush(ctx);
+    ctx.objs.ensure_dfs();
+    (0..ctx.objs.dfs_len()).rev().map(|i| ctx.objs.dfs_at(i)).find(|&w| {
+        let r = ctx.objs.absolute_rect(w);
+        ctx.objs.is_tree_visible(w) && x >= r.x && y >= r.y && (x as i32) < r.x as i32 + r.w as i32 && (y as i32) < r.y as i32 + r.h as i32
+    })
 }
 
 /// `dl::VERIFY`: record widget `id` again and check the cached list is what

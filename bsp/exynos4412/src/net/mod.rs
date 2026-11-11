@@ -47,7 +47,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config, DhcpConfig, Stack, StackResources};
@@ -819,6 +819,45 @@ pub async fn screenshot() -> Option<Vec<u32>> {
         Timer::after(Duration::from_millis(2)).await;
     }
     SCREEN.lock(|s| s.borrow_mut().take())
+}
+
+/// Display-list dump mailbox (HTTP `GET /api/dl[?id=N]`): CPU3 puts the
+/// widget id (`DL_ALL` = the summary) in [`DL_WANTED`], CPU0 writes
+/// `render::dl_dump` into [`DL_TEXT`] between passes ([`dl_service`]).
+static DL_WANTED: AtomicI32 = AtomicI32::new(DL_NONE);
+const DL_NONE: i32 = i32::MIN;
+pub const DL_ALL: i32 = -1;
+static DL_READY: AtomicBool = AtomicBool::new(false);
+static DL_TEXT: CriticalSectionMutex<RefCell<Option<String>>> = CriticalSectionMutex::new(RefCell::new(None));
+
+/// CPU3: the display-list dump for widget `id` (`DL_ALL` = all widgets, one
+/// line each), or None when CPU0 doesn't answer within 3 s.
+pub async fn dl_dump(id: i32) -> Option<String> {
+    DL_READY.store(false, Ordering::Release);
+    DL_TEXT.lock(|t| *t.borrow_mut() = None);
+    DL_WANTED.store(id, Ordering::Release);
+    let start = Instant::now();
+    while !DL_READY.load(Ordering::Acquire) {
+        if start.elapsed() > Duration::from_secs(3) {
+            DL_WANTED.store(DL_NONE, Ordering::Release);
+            return None;
+        }
+        Timer::after(Duration::from_millis(2)).await;
+    }
+    DL_TEXT.lock(|t| t.borrow_mut().take())
+}
+
+/// CPU0, once per pass (`frame_end`): answers a display-list dump request.
+pub fn dl_service(ctx: &mut ferrite_core::ctx::Ctx<crate::platform::Exynos4412Platform>) {
+    let id = DL_WANTED.swap(DL_NONE, Ordering::AcqRel);
+    if id == DL_NONE {
+        return;
+    }
+    let mut s = String::new();
+    let which = (id != DL_ALL).then(|| ferrite_core::widget::WidgetId::from_vm(id));
+    let _ = ferrite_core::render::dl_dump(ctx, which, &mut s);
+    DL_TEXT.lock(|t| *t.borrow_mut() = Some(s));
+    DL_READY.store(true, Ordering::Release);
 }
 
 /// CPU0, once per main-loop pass (`frame_end`): cheap unless the network

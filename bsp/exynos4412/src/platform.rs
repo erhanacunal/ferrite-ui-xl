@@ -239,6 +239,7 @@ impl PlatformRuntime for Exynos4412Platform {
         // An FS image uploaded over HTTP, a restart request (net/).
         #[cfg(feature = "wifi")]
         crate::net::service();
+        crate::net::dl_service(ctx);
         // FIMD window 1 test picture (HTTP `POST /api/overlay`).
         #[cfg(feature = "wifi")]
         crate::overlay_test::service();

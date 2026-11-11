@@ -56,6 +56,9 @@ struct Host {
     mouse: MouseState,
     taps: Vec<ScriptedTap>,
     dump: Option<Dump>,
+    /// Right button held in the last pass (a right click prints the display
+    /// lists of the widget under the cursor).
+    right: bool,
 }
 
 /// Deterministic run with frame dumps (`--dump DIR --dump-at MS,MS,..
@@ -64,12 +67,14 @@ struct Host {
 /// 2026-01-01 00:00), the real mouse is ignored (scripted `--tap`/`--swipe`
 /// only) and the window is not paced. At each `--dump-at` time the shown
 /// screen is written to `DIR/frame_MS.bmp`; after the last one the sim exits.
-/// `scripts/golden.py` drives it.
+/// With `--dl-dump` also `DIR/dl_MS.txt`: every widget's display lists
+/// (`render::dl_dump`). `scripts/golden.py` drives it.
 pub struct Dump {
     pub dir: std::path::PathBuf,
     pub at: Vec<u32>,
     pub step_ms: u32,
     next: usize,
+    dl: bool,
 }
 
 impl Dump {
@@ -88,7 +93,8 @@ impl Dump {
             at.push(0);
         }
         let step_ms = val("--step-ms").and_then(|v| v.parse().ok()).unwrap_or(16).max(1);
-        Some(Dump { dir: dir.into(), at, step_ms, next: 0 })
+        let dl = args.iter().any(|a| a == "--dl-dump");
+        Some(Dump { dir: dir.into(), at, step_ms, next: 0, dl })
     }
 }
 
@@ -154,7 +160,7 @@ thread_local! {
 /// Hand the window, framebuffer and mouse state to the runtime so `frame_end`
 /// can pump them. Call once, before `ferrite_core::run`.
 pub fn install_host(window: Window, fb: Framebuffer, mouse: MouseState, taps: Vec<ScriptedTap>, dump: Option<Dump>) {
-    HOST.with(|h| *h.borrow_mut() = Some(Host { window, fb, mouse, taps, dump }));
+    HOST.with(|h| *h.borrow_mut() = Some(Host { window, fb, mouse, taps, dump, right: false }));
 }
 
 impl PlatformRuntime for SimPlatform {
@@ -191,7 +197,7 @@ impl PlatformRuntime for SimPlatform {
         }
     }
 
-    fn frame_end(_ctx: &mut Ctx<Self>) {
+    fn frame_end(ctx: &mut Ctx<Self>) {
         PASSES.fetch_add(1, Ordering::Relaxed);
         HOST.with(|h| {
             let mut guard = h.borrow_mut();
@@ -216,6 +222,21 @@ impl PlatformRuntime for SimPlatform {
                 None => (0, 0),
             };
             let now = systick::millis();
+            // Right click (interactive runs): the display lists of the widget under the cursor.
+            let right = host.window.get_mouse_down(MouseButton::Right) && host.dump.is_none();
+            if right && !host.right && pos.is_some() {
+                print_widget_lists(ctx, mx as i16, my as i16);
+            }
+            host.right = right;
+            // `--dl-dump`: the lists behind the frames about to be dumped.
+            if let Some(d) = host.dump.as_ref().filter(|d| d.dl) {
+                for &at in d.at[d.next..].iter().take_while(|&&at| now >= at) {
+                    let path = d.dir.join(format!("dl_{at:06}.txt"));
+                    if let Err(e) = std::fs::write(&path, all_lists(ctx)) {
+                        eprintln!("dump {}: {e}", path.display());
+                    }
+                }
+            }
             match host.taps.iter().find(|t| now >= t.at_ms && now < t.at_ms + t.dur_ms) {
                 Some(t) => {
                     let (x, y) = t.at(now - t.at_ms);
@@ -267,6 +288,32 @@ fn sim_battery(id: u8) -> i32 {
         (0x09, None) => 2,
         _ => -1,
     }
+}
+
+/// Right click: the display lists of the topmost widget at (`x`, `y`), on stderr.
+fn print_widget_lists(ctx: &mut Ctx<SimPlatform>, x: i16, y: i16) {
+    let mut s = String::new();
+    match ferrite_core::render::widget_at(ctx, x, y) {
+        Some(id) => {
+            let _ = ferrite_core::render::dl_dump(ctx, Some(id), &mut s);
+        }
+        None => s.push_str("no widget there\n"),
+    }
+    eprint!("sim: widget at {x},{y}: {s}");
+}
+
+/// `--dl-dump`: the summary, then each widget's lists.
+fn all_lists(ctx: &mut Ctx<SimPlatform>) -> String {
+    use ferrite_core::render::dl_dump;
+    let mut s = String::new();
+    let _ = dl_dump(ctx, None, &mut s);
+    ctx.objs.ensure_dfs();
+    let ids: Vec<_> = (0..ctx.objs.dfs_len()).map(|i| ctx.objs.dfs_at(i)).collect();
+    for id in ids {
+        s.push('\n');
+        let _ = dl_dump(ctx, Some(id), &mut s);
+    }
+    s
 }
 
 /// Display-list cache counters (stderr; with `FERRITE_SIM_DL`).

@@ -4106,7 +4106,7 @@ mod shift_tests {
         move_to(&mut a, panel, 28, 30);
         render_dirty(&mut a);
         assert!(a.lcd.backend().moved.get() > 0);
-    }
+    }
 
     /// Every kind of widget in a 128×128 scene: labels (ROM font, single and
     /// multi-line), progress/slider/checkbox/radio, input, dropdown, gauge,

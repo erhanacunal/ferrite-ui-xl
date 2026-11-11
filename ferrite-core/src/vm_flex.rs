@@ -277,6 +277,7 @@ impl ObjPool {
 
     /// Property `prop` of `id` was written: queue the containers whose
     /// layout it changes.
+    #[inline(never)]
     pub(crate) fn flex_note(&mut self, id: WidgetId, prop: u8) {
         if self.flex_busy || id.is_none() {
             return;
@@ -320,11 +321,19 @@ impl ObjPool {
 }
 
 /// Lay out the pending auto containers, outermost first (a container's
-/// layout sizes its nested ones). Cheap when nothing is pending.
+/// layout sizes its nested ones). Cheap when nothing is pending: only that
+/// check is inlined (into `Vm::step` among others; the layout itself inlined
+/// there cost the VM 2.8% on the board).
+#[inline]
 pub(crate) fn flush<P: Platform>(ctx: &mut Ctx<P>) {
-    if ctx.objs.flex_pending.is_empty() {
-        return;
+    if !ctx.objs.flex_pending.is_empty() {
+        flush_pending(ctx);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn flush_pending<P: Platform>(ctx: &mut Ctx<P>) {
     let mut list = core::mem::take(&mut ctx.objs.flex_pending);
     list.sort_by_key(|&w| ctx.objs.depth(w));
     for w in list {

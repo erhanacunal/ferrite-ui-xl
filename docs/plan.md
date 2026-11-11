@@ -40,7 +40,7 @@ Varsayım: XL bare-metal + Embassy üzerinde kalır.
   hash'lerini `golden/hashes.json` ile karşılaştırıyor (`--update` ile kaydeder; farklarda
   `target/golden/<senaryo>/*_diff.png`).
 - [~] **1c Referans ölçümleri (cihaz, 2026-11-11):** `scripts/perf_baseline.py --fw X.bin` örneği FLASH.BIN olarak kaydedip firmware'i uart_boot `/boot` ile RAM'den çalıştırır (kayıtlı firmware değişmez; uart_boot'a HTTP bağlantısı autoboot'u iptal eder, bekleme ona dayanmaz). `perf/ferrite-ui/` (ferrite-ui 895a98c firmware + kendi örnekleri), `perf/baseline/` (XL), `perf/dl/` (XL + `/api/dl?on=1`); özet `python scripts/perf_compare.py`.
-  - **Açık: VM %5.4 yavaş.** bench mod 0, bayt bayt aynı bytecode: 10.77 → 10.19 Minstr/s (5 pencerede sabit). Derleme ayarları aynı; sebep firmware kodu (vm.rs değişiklikleri / yerleşim). Kabul (±%2) bunu çözünce.
+  - **VM farkı çözüldü (bisect):** %3.5'i derleyici: ferrite-ui'de rustup dizin override'ı nightly 1.98 (2026-06-03), XL stable 1.99.1 ile derleniyor. Kalan %2.8 `1fb7233` (FLEX_AUTO): `flex::flush`/`flex_note` `Vm::step`'e satır içi açılıyordu; artık yalnız "bekleyen var mı" kontrolü inline. bench mod 0 (Minstr/s): ferrite-ui 10.77; XL nightly 10.74 → düzeltmeyle 10.81; XL stable 10.19 → 10.47. Açık karar: XL'de toolchain sabitlemek.
   - Diğer örnekler ±%3 içinde; çoğu render GPU compositor'dan geçtiği için `draw_widget` neredeyse hiç çağrılmıyor. DL yalnız tablette ölçülebildi: widget çizimi 7.4 → 9.6 ms/s (+%30), en uzun geçiş 8.9 → 11.6 ms.
 - [x] **1d Native flex** (aşağıya bakın). Seviye 1 ve 2 tamam.
 

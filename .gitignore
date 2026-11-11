@@ -7,3 +7,6 @@ __pycache__/
 *.hex
 *.dbg
 test_size.*
+# Secrets (WiFi passphrase, chip firmware): never committed, in any folder
+private/
+wifi.cfg

@@ -40,7 +40,7 @@
 
 use crate::pool::ObjPool;
 use crate::types::{Offset, Rect};
-use crate::widget::{FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, FLAG_RENDERED, WidgetId};
+use crate::widget::{FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, WidgetId};
 
 /// Layers a program can name (`PROP_LAYER` 1..=MAX_LAYERS).
 pub const MAX_LAYERS: usize = 4;
@@ -169,7 +169,7 @@ impl ObjPool {
                     // The screen shows its surface there (the root may have
                     // moved since): put back as the root's previous place.
                     self.set_prev_rect(root, 0, slot.shown);
-                    self.get_mut(root).flags |= FLAG_RENDERED;
+                    self.set_rendered(root, true);
                 }
                 if slot.active {
                     self.layer_drop_flags(root);
@@ -303,7 +303,7 @@ impl ObjPool {
         let mut out = Rect::new(0, 0, 0, 0);
         for i in ri..end {
             let id = self.dfs_at(i);
-            if self.get(id).flags & FLAG_RENDERED == 0 {
+            if !self.rendered(id) {
                 continue;
             }
             let prev = self.prev_rect(id, 0);
@@ -319,8 +319,8 @@ impl ObjPool {
         for i in lo..hi {
             let id = self.dfs_at(i);
             self.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
-            let w = self.get_mut(id);
-            w.flags = (w.flags | FLAG_DIRTY_AB) & !FLAG_RENDERED;
+            self.get_mut(id).flags |= FLAG_DIRTY_AB;
+            self.set_rendered(id, false);
             self.forget_drawn(id);
         }
     }

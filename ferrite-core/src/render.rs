@@ -9,7 +9,7 @@ use crate::platform::Platform;
 use crate::renderer::WidgetRenderer;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
-    FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
+    FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, FLAG_PRESSED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
     KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
 };
@@ -212,7 +212,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
             redraw_behind(ctx, i, abs);
         }
         draw_widget(ctx, id, &abs, &full);
-        ctx.objs.get_mut(id).flags |= FLAG_RENDERED | FLAG_PAINTED;
+        ctx.objs.set_drawn_now(id);
         if ctx.objs.get(id).flags & FLAG_HAS_ON_PAINT != 0 {
             paint.push(id);
         }
@@ -431,7 +431,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
             continue;
         }
         draw_widget(ctx, id, &abs, &full);
-        ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
+        ctx.objs.set_rendered(id, true);
         record_drawn(ctx, id, &abs);
         i += 1;
     }
@@ -590,7 +590,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
             continue;
         }
         if !ctx.objs.vis_at(di) {
-            if ctx.objs.get(id).flags & FLAG_RENDERED != 0 {
+            if ctx.objs.rendered(id) {
                 let abs = ctx.objs.abs_at(di);
                 if !abs.is_empty() {
                     // Restore what is behind it (ancestors and earlier
@@ -604,7 +604,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
                     restore_behind(ctx, di, abs);
                     restores.push(di, abs);
                 }
-                ctx.objs.get_mut(id).flags &= !FLAG_RENDERED;
+                ctx.objs.set_rendered(id, false);
             }
         }
     }
@@ -755,7 +755,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
                 // first. (The root itself still restores: it may just have
                 // lost its text.)
                 if si != di && paints_nothing(&ctx.objs, sid) && contains(&abs, &sabs) {
-                    ctx.objs.get_mut(sid).flags |= FLAG_RENDERED | FLAG_PAINTED;
+                    ctx.objs.set_drawn_now(sid);
                     continue;
                 }
                 // Translucent widgets and transparent labels must not blend
@@ -771,7 +771,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
                     redraw_behind_region(ctx, si, &clip, &sabs);
                 }
                 draw_widget(ctx, sid, &sabs, &clip);
-                ctx.objs.get_mut(sid).flags |= FLAG_RENDERED | FLAG_PAINTED;
+                ctx.objs.set_drawn_now(sid);
             }
             if gauge {
                 // All of its visible part now shows the current value.
@@ -850,7 +850,7 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
                 // Where the screen shows its surface (the root may have moved
                 // since) is put back as the root's previous place.
                 ctx.objs.set_prev_rect(slot.root, 0, slot.shown);
-                ctx.objs.get_mut(slot.root).flags |= FLAG_RENDERED;
+                ctx.objs.set_rendered(slot.root, true);
             }
             slot.active = false;
             slot.composed = false;
@@ -1087,7 +1087,7 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
         if !w.is_dirty() || !mine(&ctx.objs, di) {
             continue;
         }
-        if ctx.objs.vis_at(di) || w.flags & FLAG_RENDERED != 0 {
+        if ctx.objs.vis_at(di) || ctx.objs.rendered(id) {
             areas.add(ctx.objs.abs_at(di), &screen);
         }
         areas.add(buf_prev_rect(&ctx.objs, id, 0), &screen);
@@ -1113,12 +1113,7 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
         // Where a moved widget was drawn: repainted.
         ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
         let vis = ctx.objs.vis_at(di);
-        let w = ctx.objs.get_mut(id);
-        if vis {
-            w.flags |= FLAG_RENDERED;
-        } else {
-            w.flags &= !FLAG_RENDERED;
-        }
+        ctx.objs.set_rendered(id, vis);
     }
     // What gauges recorded of their last drawing is stale: the areas were
     // drawn another way.
@@ -1169,7 +1164,7 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
     for di in 0..n {
         let id = ctx.objs.dfs_at(di);
         let w = ctx.objs.get(id);
-        if !w.is_dirty() || w.flags & FLAG_RENDERED == 0 || !ctx.objs.vis_at(di) {
+        if !w.is_dirty() || !ctx.objs.rendered(id) || !ctx.objs.vis_at(di) {
             continue;
         }
         let old = ctx.objs.prev_rect(id, 0);
@@ -1290,7 +1285,7 @@ fn plan_moves(tree: &ObjPool, old: &Rect, new: &Rect, radius: u16, front: usize,
     for j in front..tree.dfs_len() {
         let jid = tree.dfs_at(j);
         // Drawn now or before (a hidden one still shows until pass 1).
-        if !tree.vis_at(j) && tree.get(jid).flags & FLAG_RENDERED == 0 {
+        if !tree.vis_at(j) && !tree.rendered(jid) {
             continue;
         }
         for r in [tree.abs_at(j), tree.prev_rect(jid, 0)] {
@@ -1396,10 +1391,10 @@ impl Restores {
 }
 
 /// A visible widget before DFS position `idx` was drawn in this pass
-/// (`FLAG_PAINTED`) and touches `rect`.
+/// (`ObjPool::painted`) and touches `rect`.
 fn painted_before(tree: &ObjPool, idx: usize, rect: &Rect) -> bool {
     (0..idx).any(|k| {
-        tree.vis_at(k) && tree.get(tree.dfs_at(k)).flags & FLAG_PAINTED != 0 && tree.abs_at(k).intersects(rect)
+        tree.vis_at(k) && tree.painted(tree.dfs_at(k)) && tree.abs_at(k).intersects(rect)
     })
 }
 
@@ -1422,11 +1417,11 @@ fn paints_nothing(tree: &ObjPool, id: WidgetId) -> bool {
         && effective_bg(tree, w, &ext) == 0
 }
 
-/// Clear the per-pass `FLAG_PAINTED` marks.
+/// Clear the per-pass painted marks.
 fn clear_painted(tree: &mut ObjPool) {
     for i in 0..tree.dfs_len() {
         let id = tree.dfs_at(i);
-        tree.get_mut(id).flags &= !FLAG_PAINTED;
+        tree.set_painted(id, false);
     }
 }
 
@@ -1449,7 +1444,7 @@ fn behind_is_fresh(tree: &ObjPool, lo: usize, idx: usize, rect: &Rect, fresh: bo
         if !abs.intersects(rect) {
             continue;
         }
-        if tree.get(id).flags & FLAG_PAINTED == 0 {
+        if !tree.painted(id) {
             return false;
         }
         if covers_opaquely(tree, id, &abs, rect) {
@@ -1836,7 +1831,7 @@ fn dl_key<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
     h.u16(ctx.lcd.height());
     h.u8(ctx.lcd.has_alpha() as u8 | (ctx.lcd.smooth() as u8) << 1);
     // Widget (bookkeeping flags left out).
-    const BOOKKEEPING: u16 = FLAG_DIRTY_AB | FLAG_RENDERED | FLAG_PAINTED;
+    const BOOKKEEPING: u16 = FLAG_DIRTY_AB;
     h.rect(*abs);
     h.u8(w.kind);
     h.u16(w.flags & !BOOKKEEPING);
@@ -3098,7 +3093,7 @@ fn gauge_key<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> u32 {
     let words = [
         pair(abs.x as u16, abs.y as u16),
         pair(abs.w, abs.h),
-        pair(w.kind as u16, w.flags & !(FLAG_DIRTY_AB | FLAG_RENDERED | FLAG_PAINTED)),
+        pair(w.kind as u16, w.flags & !FLAG_DIRTY_AB),
         pair(w.background_color, w.border_color),
         pair(effective_bg(objs, w, &e), backdrop(objs, w, P::DEFAULT_BG_COLOR)),
         pair(e.text_color, e.press_color),
@@ -3122,7 +3117,7 @@ fn gauge_key<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> u32 {
 /// value is unchanged.
 fn gauge_changed_rects<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> Option<([Rect; 2], usize)> {
     let w = objs.get(id);
-    if w.flags & FLAG_RENDERED == 0 || !P::Renderer::partial_redraw(objs, id) {
+    if !objs.rendered(id) || !P::Renderer::partial_redraw(objs, id) {
         return None;
     }
     let old = objs.drawn_value(id, gauge_key::<P>(objs, id, abs))?.clamp(0, 100) as i32;

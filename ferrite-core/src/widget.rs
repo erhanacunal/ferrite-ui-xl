@@ -21,11 +21,8 @@ pub const FLAG_DIRTY_B: u16 = 1 << 8;
 /// Combined mask: dirty in both buffers. Used by `ObjPool::mark_dirty`.
 pub const FLAG_DIRTY_AB: u16 = FLAG_DIRTY_A | FLAG_DIRTY_B;
 
-/// Set when the widget has been drawn at least once since its last erase.
-/// Used by `render_dirty`'s erase pass to skip widgets that were never
-/// rendered — prevents "phantom erase" of animated-but-invisible widgets
-/// (e.g. a progress bar on a hidden tab that keeps marking itself dirty).
-pub const FLAG_RENDERED: u16 = 1 << 9;
+// Bit 9 (was FLAG_RENDERED) and bit 15 (was FLAG_PAINTED): unused. What the
+// renderer knows of a widget lives in `RenderRec`, not in the tree.
 
 /// Set on the placeholder that `get` / `get_mut` return for an id that names
 /// no live widget (destroyed, or another object type). Treated as
@@ -41,10 +38,6 @@ pub const FLAG_HAS_ON_CLICK: u16 = 1 << 12;
 pub const FLAG_HAS_ON_TAP: u16 = 1 << 13;
 /// Widget has at least one compile-time on_paint registration.
 pub const FLAG_HAS_ON_PAINT: u16 = 1 << 14;
-/// Render-pass scratch: the widget was painted earlier in the current render
-/// pass. Set and cleared by the render functions only — always clear outside
-/// a pass.
-pub const FLAG_PAINTED: u16 = 1 << 15;
 
 // --- Widget Kind ---
 
@@ -131,15 +124,11 @@ const SEC_BOX: u8 = 1 << 0;
 const SEC_TEXT: u8 = 1 << 1;
 const SEC_STYLE: u8 = 1 << 2;
 const SEC_EXTRA: u8 = 1 << 3;
-const SEC_PREV: u8 = 1 << 4;
-const SEC_DRAWN: u8 = 1 << 5;
-const SEC_WORDS: [usize; 6] = [
+const SEC_WORDS: [usize; 4] = [
     size_of::<SecBox>() / 4,
     size_of::<SecText>() / 4,
     size_of::<SecStyle>() / 4,
     size_of::<SecExtra>() / 4,
-    size_of::<SecPrev>() / 4,
-    size_of::<SecDrawn>() / 4,
 ];
 
 /// Header words of every widget object.
@@ -275,32 +264,48 @@ struct SecExtra {
     _pad: [u8; 3],
 }
 
-#[repr(C, align(4))]
-#[derive(Clone, Copy, PartialEq)]
-struct SecPrev {
-    a: Rect,
-    b: Rect,
-}
-
-/// What an incrementally redrawn widget (gauge) last put on screen: a key
-/// of everything that shapes its pixels except the value, the value, and the
-/// draw epoch. Renderer-private, not part of `WidgetExt`.
-#[repr(C, align(4))]
-#[derive(Clone, Copy, PartialEq)]
-struct SecDrawn {
-    key: u32,
-    epoch: u32,
-    value: i32,
-}
-
 const _: () = assert!(
-    size_of::<SecDrawn>() == 12 &&
     size_of::<SecBox>() == 8
         && size_of::<SecText>() == 4 + 2 * size_of::<ObjPtr>()
         && size_of::<SecStyle>() == 8
         && size_of::<SecExtra>() == 8
-        && size_of::<SecPrev>() == 16
 );
+
+/// What the renderer knows of a widget, outside the tree (`RenderState::recs`,
+/// by object pointer; reset when the pointer names a new widget). Keeping it
+/// out of the widget blocks lets the tree be copied to a render core whole
+/// (plan step 3).
+#[derive(Clone, Copy)]
+pub(crate) struct RenderRec {
+    /// `REC_RENDERED` (drawn since its last erase: the erase pass skips
+    /// widgets never drawn, e.g. a progress bar on a hidden tab that keeps
+    /// marking itself dirty) | `REC_PAINTED` (drawn earlier in the current
+    /// render pass; clear outside a pass).
+    flags: u8,
+    /// Rect at which the widget was last drawn to buffers A and B. The
+    /// renderer restores what is behind a pending A rect (a moved or hidden
+    /// widget) before drawing it at its new rect.
+    prev: [Rect; 2],
+    /// What an incrementally redrawn widget (gauge) last put on screen: a key
+    /// of everything that shapes its pixels except the value (0 = none), the
+    /// draw epoch, the value.
+    drawn_key: u32,
+    drawn_epoch: u32,
+    drawn_value: i32,
+}
+
+const REC_RENDERED: u8 = 1 << 0;
+const REC_PAINTED: u8 = 1 << 1;
+
+impl RenderRec {
+    pub(crate) const EMPTY: Self = Self {
+        flags: 0,
+        prev: [Rect::new(0, 0, 0, 0); 2],
+        drawn_key: 0,
+        drawn_epoch: 0,
+        drawn_value: 0,
+    };
+}
 
 impl Section for SecBox {
     const BIT: u8 = SEC_BOX;
@@ -399,26 +404,6 @@ impl Section for SecExtra {
     }
 }
 
-impl Section for SecDrawn {
-    const BIT: u8 = SEC_DRAWN;
-    const DEFAULT: Self = Self { key: 0, epoch: 0, value: 0 };
-    fn read(_: &WidgetExt) -> Self {
-        Self::DEFAULT
-    }
-    fn write(&self, _: &mut WidgetExt) {}
-}
-
-impl Section for SecPrev {
-    const BIT: u8 = SEC_PREV;
-    const DEFAULT: Self = Self { a: Rect::new(0, 0, 0, 0), b: Rect::new(0, 0, 0, 0) };
-    fn read(e: &WidgetExt) -> Self {
-        Self { a: e.prev_rect_a, b: e.prev_rect_b }
-    }
-    fn write(&self, e: &mut WidgetExt) {
-        e.prev_rect_a = self.a;
-        e.prev_rect_b = self.b;
-    }
-}
 
 /// Word offset of section `bit` inside a widget payload with mask `mask`.
 fn sec_offset(mask: u8, bit: u8) -> usize {
@@ -504,14 +489,6 @@ pub struct WidgetExt {
     // Background opacity, 255 = opaque. Only honored on
     // LcdBackend::HAS_ALPHA devices; others draw the background solid.
     pub alpha: u8,
-
-    // Rect at which the widget was last drawn to buffers A and B.
-    // The renderer compares each against the current absolute_rect and, when
-    // they differ, redraws the widgets behind `prev_rect_X` clipped to that
-    // area before drawing the widget at its new rect. Per-buffer tracking
-    // avoids an ever-growing union under continuous motion.
-    pub prev_rect_a: Rect,
-    pub prev_rect_b: Rect,
 }
 
 impl WidgetExt {
@@ -535,8 +512,6 @@ impl WidgetExt {
         gradient_color: 0,
         gradient_dir: 0,
         alpha: 255,
-        prev_rect_a: Rect::new(0, 0, 0, 0),
-        prev_rect_b: Rect::new(0, 0, 0, 0),
     };
 }
 
@@ -552,6 +527,10 @@ impl ObjPool {
         // A new widget starts dirty (Widget::NEW).
         self.render.maybe_dirty = true;
         self.note_changed(WidgetId(p));
+        // The pointer may have named a widget before.
+        if let Some(r) = self.render.recs.get_mut(p as usize) {
+            *r = RenderRec::EMPTY;
+        }
         Some(WidgetId(p))
     }
 
@@ -686,9 +665,6 @@ impl ObjPool {
         if let Some(s) = self.sec::<SecExtra>(id) {
             s.write(&mut e);
         }
-        if let Some(s) = self.sec::<SecPrev>(id) {
-            s.write(&mut e);
-        }
         e
     }
 
@@ -705,7 +681,6 @@ impl ObjPool {
         ok &= self.put_sec(id, SecText::read(e));
         ok &= self.put_sec(id, SecStyle::read(e));
         ok &= self.put_sec(id, SecExtra::read(e));
-        ok &= self.put_sec(id, SecPrev::read(e));
         ok
     }
 
@@ -791,27 +766,74 @@ impl ObjPool {
         self.sec::<SecExtra>(id).map_or(0, |s| s.group_id)
     }
 
-    /// Rect at which `id` was last drawn to buffer `buf` (0=A, 1=B).
-    pub fn prev_rect(&self, id: WidgetId, buf: u8) -> Rect {
-        match self.sec::<SecPrev>(id) {
-            Some(s) if buf == 0 => s.a,
-            Some(s) => s.b,
-            None => Rect::new(0, 0, 0, 0),
+    /// What the renderer knows of `id` (`RenderRec::EMPTY` if nothing).
+    #[inline]
+    fn rec(&self, id: WidgetId) -> &RenderRec {
+        self.render.recs.get(id.0 as usize).unwrap_or(&RenderRec::EMPTY)
+    }
+
+    /// Its record, added on demand (None for an id that names no widget).
+    fn rec_mut(&mut self, id: WidgetId) -> Option<&mut RenderRec> {
+        if !self.is_live(id) {
+            return None;
+        }
+        let i = id.0 as usize;
+        let recs = &mut self.render.recs;
+        if i >= recs.len() {
+            recs.resize(i + 1, RenderRec::EMPTY);
+        }
+        Some(&mut recs[i])
+    }
+
+    /// Drawn since its last erase.
+    #[inline]
+    pub fn rendered(&self, id: WidgetId) -> bool {
+        self.rec(id).flags & REC_RENDERED != 0
+    }
+
+    pub(crate) fn set_rendered(&mut self, id: WidgetId, on: bool) {
+        if !on && !self.rendered(id) {
+            return;
+        }
+        if let Some(r) = self.rec_mut(id) {
+            r.flags = if on { r.flags | REC_RENDERED } else { r.flags & !REC_RENDERED };
         }
     }
 
-    /// Store the drawn rect for buffer `buf`. Adds the section on demand; an
-    /// empty rect on a widget without one is not stored.
-    pub fn set_prev_rect(&mut self, id: WidgetId, buf: u8, rect: Rect) {
-        if rect.is_empty() && self.sec::<SecPrev>(id).is_none() {
+    /// Drawn earlier in the current render pass.
+    #[inline]
+    pub(crate) fn painted(&self, id: WidgetId) -> bool {
+        self.rec(id).flags & REC_PAINTED != 0
+    }
+
+    pub(crate) fn set_painted(&mut self, id: WidgetId, on: bool) {
+        if !on && !self.painted(id) {
             return;
         }
-        if let Some(s) = self.ensure_sec::<SecPrev>(id) {
-            if buf == 0 {
-                s.a = rect;
-            } else {
-                s.b = rect;
-            }
+        if let Some(r) = self.rec_mut(id) {
+            r.flags = if on { r.flags | REC_PAINTED } else { r.flags & !REC_PAINTED };
+        }
+    }
+
+    /// Drawn now (rendered, and painted in this pass).
+    pub(crate) fn set_drawn_now(&mut self, id: WidgetId) {
+        if let Some(r) = self.rec_mut(id) {
+            r.flags |= REC_RENDERED | REC_PAINTED;
+        }
+    }
+
+    /// Rect at which `id` was last drawn to buffer `buf` (0=A, 1=B).
+    pub fn prev_rect(&self, id: WidgetId, buf: u8) -> Rect {
+        self.rec(id).prev[(buf != 0) as usize]
+    }
+
+    /// Store the drawn rect for buffer `buf`.
+    pub fn set_prev_rect(&mut self, id: WidgetId, buf: u8, rect: Rect) {
+        if rect.is_empty() && self.prev_rect(id, buf).is_empty() {
+            return;
+        }
+        if let Some(r) = self.rec_mut(id) {
+            r.prev[(buf != 0) as usize] = rect;
         }
     }
 
@@ -821,7 +843,7 @@ impl ObjPool {
     /// widget that is drawn and has no pending rect yet (an animation changes
     /// x, y, w and h each frame: the first change keeps the drawn rect).
     pub fn will_move(&mut self, id: WidgetId) {
-        if !self.is_live(id) || self.get(id).flags & FLAG_RENDERED == 0 {
+        if !self.is_live(id) || !self.rendered(id) {
             return;
         }
         // An active layer's root only moves its surface.
@@ -839,22 +861,28 @@ impl ObjPool {
     /// drawing: same appearance `key` (never 0) and drawn in the current
     /// epoch. None means redraw it whole.
     pub(crate) fn drawn_value(&self, id: WidgetId, key: u32) -> Option<WValue> {
-        let s = self.sec::<SecDrawn>(id)?;
-        (s.key == key && s.epoch == self.render.draw_epoch).then_some(s.value as WValue)
+        let r = self.rec(id);
+        (r.drawn_key != 0 && r.drawn_key == key && r.drawn_epoch == self.render.draw_epoch)
+            .then_some(r.drawn_value as WValue)
     }
 
     /// Record that `id` is now fully drawn with appearance `key` and `value`.
     pub(crate) fn set_drawn(&mut self, id: WidgetId, key: u32, value: WValue) {
         let epoch = self.render.draw_epoch;
-        if let Some(s) = self.ensure_sec::<SecDrawn>(id) {
-            *s = SecDrawn { key, epoch, value: value as i32 };
+        if let Some(r) = self.rec_mut(id) {
+            r.drawn_key = key;
+            r.drawn_epoch = epoch;
+            r.drawn_value = value as i32;
         }
     }
 
     /// Forget what `id` last drew (its pixels were partly redrawn).
     pub(crate) fn forget_drawn(&mut self, id: WidgetId) {
-        if let Some(s) = self.sec_mut::<SecDrawn>(id) {
-            s.key = 0;
+        if self.rec(id).drawn_key == 0 {
+            return;
+        }
+        if let Some(r) = self.rec_mut(id) {
+            r.drawn_key = 0;
         }
     }
 

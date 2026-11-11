@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn composing_renderer_gets_grid_aligned_merged_areas() {
-        use crate::widget::{FLAG_RENDERED, FLAG_VISIBLE};
+        use crate::widget::FLAG_VISIBLE;
         let mut ctx = compose_ctx();
         let root = ctx.objs.alloc_widget().unwrap();
         ctx.objs.root = root;
@@ -363,7 +363,7 @@ mod tests {
         crate::render::render_dirty(&mut ctx);
         assert_eq!(areas_taken(), [[(0, 0, 800, 480)]]);
         assert!(take().is_empty(), "no pass ran");
-        assert!(ctx.objs.get(a).flags & FLAG_RENDERED != 0);
+        assert!(ctx.objs.rendered(a));
         assert!(!ctx.objs.get(a).is_dirty());
         // a and b overlap after rounding out to 16: one area; c on its own.
         ctx.objs.mark_dirty(a);
@@ -380,7 +380,7 @@ mod tests {
         ctx.objs.mark_dirty(c);
         crate::render::render_dirty(&mut ctx);
         assert_eq!(areas_taken(), [[(496, 288, 16, 32)]]);
-        assert!(ctx.objs.get(c).flags & FLAG_RENDERED == 0);
+        assert!(!ctx.objs.rendered(c));
         // Declined: the passes draw.
         TAKE.with(|t| *t.borrow_mut() = false);
         ctx.objs.mark_dirty(a);

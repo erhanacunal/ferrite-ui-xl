@@ -164,9 +164,16 @@ Seçenekler:
   listeleri rasterize eder. Compositor'un da listelerden beslenmesi gerekir (GPU liste op'larını
   tessellate eder ya da liste sprite'a çizilir). VM çekirdeği yürüyüşü ödemeye devam eder.
 
-Öneri: A. Kopya ucuz, compositor/katman yolları olduğu gibi taşınır, VM çekirdeğinde render işi kalmaz. Display
+**Seçilen: A** (kullanıcı, 2026-11-11). Kopya ucuz, compositor/katman yolları olduğu gibi taşınır, VM çekirdeğinde render işi kalmaz. Display
 list'ler render çekirdeğinin içinde (CPU pass'leri, `on_paint` listeleri) kalır. `on_paint` VM çekirdeğinde
 kaydedilip liste olarak gönderilir (2d).
+
+| | İş | Doğrulama |
+|---|---|---|
+| 3a | Render'a ait widget durumu ağaçtan çıkar: `FLAG_RENDERED`, `FLAG_PAINTED`, `SEC_PREV`, `SEC_DRAWN` → `RenderState` içinde işaretçiye göre dizili tablo (`RenderRec`). Dirty bitleri ağaçta kalır (VM → render mesajı) | Tek çekirdek, testler + golden iki modda aynı |
+| 3b | Tek çekirdekte iki havuz: VM havuzu + render havuzu. Render fazında senkron: arena'nın kullanılan kısmı + işaretçi tablosu kopyalanır, VM'in dirty/changed bilgisi devredilip VM'de temizlenir; `will_move` render tarafında (kopyadan önce eski mutlak rect'ler). Render yalnız kendi havuzunu okur | Golden aynı; kopya maliyeti (perf) |
+| 3c | Render havuzu + render fazı ayrı çekirdekte (exynos CPU2; LCD/G2D/GPU sahipliği ve kesmeleri oraya). VM çekirdeği frame sonunda kopyayı bırakır, beklemez | Kartta perf A/B, golden (sim tek çekirdek kalır) |
+| 3d | VM'in ekrana doğrudan çizimi (`on_paint` dışı `fillRect`…) ve `on_paint` listeleri render çekirdeğine liste olarak; C okumaları (`snapshot.rs`) seqlock'lu snapshot'tan | `paint` örneği, `--stale` |
 
 ### Riskler
 

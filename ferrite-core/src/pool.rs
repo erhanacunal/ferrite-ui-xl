@@ -161,6 +161,9 @@ pub(crate) struct RenderState {
     pub(crate) drawn_keys: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, u64>>,
     /// Render-owned values as of the last render pass (`snapshot.rs`).
     pub(crate) snapshot: crate::snapshot::Snapshot,
+    /// What the renderer knows of each widget, by object pointer
+    /// (`widget::RenderRec`).
+    pub(crate) recs: Vec<crate::widget::RenderRec>,
 }
 
 impl RenderState {
@@ -180,6 +183,7 @@ impl RenderState {
             paints: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             drawn_keys: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             snapshot: crate::snapshot::Snapshot::new(),
+            recs: Vec::new(),
             geo: Vec::new(),
             geo_stack: Vec::new(),
             geo_valid: false,
@@ -201,6 +205,7 @@ impl RenderState {
         self.paints.get_mut().clear();
         self.drawn_keys.get_mut().clear();
         self.snapshot.clear();
+        self.recs.clear();
     }
 }
 

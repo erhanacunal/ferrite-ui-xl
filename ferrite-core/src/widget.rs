@@ -11,15 +11,14 @@ use core::mem::{align_of, size_of};
 pub const FLAG_VISIBLE: u16 = 1 << 0;
 pub const FLAG_ENABLED: u16 = 1 << 1;
 pub const FLAG_CLICKABLE: u16 = 1 << 2;
-pub const FLAG_DIRTY_A: u16 = 1 << 3;
+/// Needs redrawing (set by `mark_dirty`/`mark_moved`/`alloc_widget`, the
+/// VM -> render messages; cleared by the renderer).
+pub const FLAG_DIRTY: u16 = 1 << 3;
 pub const FLAG_PRESSED: u16 = 1 << 4;
 pub const FLAG_CHECKED: u16 = 1 << 5;
 pub const FLAG_FOCUSED: u16 = 1 << 6;
 pub const FLAG_CLIP_CHILDREN: u16 = 1 << 7;
-pub const FLAG_DIRTY_B: u16 = 1 << 8;
-
-/// Combined mask: dirty in both buffers. Used by `ObjPool::mark_dirty`.
-pub const FLAG_DIRTY_AB: u16 = FLAG_DIRTY_A | FLAG_DIRTY_B;
+// Bit 8 (was FLAG_DIRTY_B, buffered mode's second buffer): unused.
 
 // Bit 9 (was FLAG_RENDERED) and bit 15 (was FLAG_PAINTED): unused. What the
 // renderer knows of a widget lives in `RenderRec`, not in the tree.
@@ -181,7 +180,7 @@ impl Widget {
     };
 
     const NEW: Self = Self {
-        flags: FLAG_VISIBLE | FLAG_ENABLED | FLAG_DIRTY_AB,
+        flags: FLAG_VISIBLE | FLAG_ENABLED | FLAG_DIRTY,
         ..Self::DEAD
     };
 
@@ -189,26 +188,12 @@ impl Widget {
         self.flags & FLAG_VISIBLE != 0
     }
 
-    /// Check if dirty in buffer A (used by dirty render mode).
     pub fn is_dirty(&self) -> bool {
-        self.flags & FLAG_DIRTY_A != 0
+        self.flags & FLAG_DIRTY != 0
     }
 
-    /// Check if dirty in a specific buffer (0=A, 1=B).
-    pub fn is_dirty_buf(&self, buf: u8) -> bool {
-        let mask = if buf == 0 { FLAG_DIRTY_A } else { FLAG_DIRTY_B };
-        self.flags & mask != 0
-    }
-
-    /// Clear dirty flag for buffer A only (dirty render mode).
     pub fn clear_dirty(&mut self) {
-        self.flags &= !FLAG_DIRTY_A;
-    }
-
-    /// Clear dirty flag for a specific buffer (0=A, 1=B).
-    pub fn clear_dirty_buf(&mut self, buf: u8) {
-        let mask = if buf == 0 { FLAG_DIRTY_A } else { FLAG_DIRTY_B };
-        self.flags &= !mask;
+        self.flags &= !FLAG_DIRTY;
     }
 }
 
@@ -282,10 +267,9 @@ pub(crate) struct RenderRec {
     /// marking itself dirty) | `REC_PAINTED` (drawn earlier in the current
     /// render pass; clear outside a pass).
     flags: u8,
-    /// Rect at which the widget was last drawn to buffers A and B. The
-    /// renderer restores what is behind a pending A rect (a moved or hidden
-    /// widget) before drawing it at its new rect.
-    prev: [Rect; 2],
+    /// Where the widget was on screen before a move or hide not yet rendered:
+    /// the renderer restores what is behind it (empty = none pending).
+    prev: Rect,
     /// What an incrementally redrawn widget (gauge) last put on screen: a key
     /// of everything that shapes its pixels except the value (0 = none), the
     /// draw epoch, the value.
@@ -300,7 +284,7 @@ const REC_PAINTED: u8 = 1 << 1;
 impl RenderRec {
     pub(crate) const EMPTY: Self = Self {
         flags: 0,
-        prev: [Rect::new(0, 0, 0, 0); 2],
+        prev: Rect::new(0, 0, 0, 0),
         drawn_key: 0,
         drawn_epoch: 0,
         drawn_value: 0,
@@ -822,18 +806,17 @@ impl ObjPool {
         }
     }
 
-    /// Rect at which `id` was last drawn to buffer `buf` (0=A, 1=B).
-    pub fn prev_rect(&self, id: WidgetId, buf: u8) -> Rect {
-        self.rec(id).prev[(buf != 0) as usize]
+    /// Where `id` was on screen before a pending move or hide (empty = none).
+    pub fn prev_rect(&self, id: WidgetId) -> Rect {
+        self.rec(id).prev
     }
 
-    /// Store the drawn rect for buffer `buf`.
-    pub fn set_prev_rect(&mut self, id: WidgetId, buf: u8, rect: Rect) {
-        if rect.is_empty() && self.prev_rect(id, buf).is_empty() {
+    pub fn set_prev_rect(&mut self, id: WidgetId, rect: Rect) {
+        if rect.is_empty() && self.prev_rect(id).is_empty() {
             return;
         }
         if let Some(r) = self.rec_mut(id) {
-            r.prev[(buf != 0) as usize] = rect;
+            r.prev = rect;
         }
     }
 
@@ -850,11 +833,11 @@ impl ObjPool {
         if self.is_active_layer_root(id) {
             return;
         }
-        if !self.prev_rect(id, 0).is_empty() {
+        if !self.prev_rect(id).is_empty() {
             return;
         }
         let abs = self.absolute_rect(id);
-        self.set_prev_rect(id, 0, abs);
+        self.set_prev_rect(id, abs);
     }
 
     /// The value `id` was last fully drawn with, if its pixels are still that
@@ -1194,7 +1177,7 @@ impl ObjPool {
 
     fn dirty_subtree(&mut self, id: WidgetId) {
         self.render.maybe_dirty = true;
-        self.get_mut(id).flags |= FLAG_DIRTY_AB;
+        self.get_mut(id).flags |= FLAG_DIRTY;
         let mut child = self.get(id).first_child;
         while child.is_some() {
             self.dirty_subtree(child);

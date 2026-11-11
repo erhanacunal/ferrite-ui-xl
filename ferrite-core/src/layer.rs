@@ -40,7 +40,7 @@
 
 use crate::pool::ObjPool;
 use crate::types::{Offset, Rect};
-use crate::widget::{FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, WidgetId};
+use crate::widget::{FLAG_DIRTY, FLAG_HAS_ON_PAINT, WidgetId};
 
 /// Layers a program can name (`PROP_LAYER` 1..=MAX_LAYERS).
 pub const MAX_LAYERS: usize = 4;
@@ -168,7 +168,7 @@ impl ObjPool {
                 if slot.composed && !slot.shown.is_empty() && self.is_live(root) {
                     // The screen shows its surface there (the root may have
                     // moved since): put back as the root's previous place.
-                    self.set_prev_rect(root, 0, slot.shown);
+                    self.set_prev_rect(root, slot.shown);
                     self.set_rendered(root, true);
                 }
                 if slot.active {
@@ -306,7 +306,7 @@ impl ObjPool {
             if !self.rendered(id) {
                 continue;
             }
-            let prev = self.prev_rect(id, 0);
+            let prev = self.prev_rect(id);
             let r = if prev.is_empty() { self.abs_at(i) } else { prev };
             out = if out.is_empty() { r } else { bounds(&out, &r) };
         }
@@ -318,8 +318,8 @@ impl ObjPool {
     pub(crate) fn layer_redraw_all(&mut self, lo: usize, hi: usize) {
         for i in lo..hi {
             let id = self.dfs_at(i);
-            self.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
-            self.get_mut(id).flags |= FLAG_DIRTY_AB;
+            self.set_prev_rect(id, Rect::new(0, 0, 0, 0));
+            self.get_mut(id).flags |= FLAG_DIRTY;
             self.set_rendered(id, false);
             self.forget_drawn(id);
         }
@@ -329,7 +329,7 @@ impl ObjPool {
     pub(crate) fn layer_has_dirty(&self, lo: usize, hi: usize, with_prev: bool) -> bool {
         (lo..hi).any(|i| {
             let id = self.dfs_at(i);
-            self.get(id).is_dirty() && (!with_prev || !self.prev_rect(id, 0).is_empty())
+            self.get(id).is_dirty() && (!with_prev || !self.prev_rect(id).is_empty())
         })
     }
 

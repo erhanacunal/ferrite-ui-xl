@@ -27,7 +27,7 @@ use crate::ctx::Ctx;
 use crate::pool::{ObjPool, T_ARRAY, T_FREE, T_STRING, T_WIDGET};
 use crate::syscfg::SysCfg;
 use crate::types::{COLOR_RED, Size};
-use crate::vm::{CodeAddr, FunctionKind, ProgramRef, RenderMode, Vm, VmState};
+use crate::vm::{CodeAddr, FunctionKind, ProgramRef, Vm, VmState};
 use crate::{font, fs, heap, keyboard, protocol, render, widget};
 
 use crate::protocol::{Protocol, RxEvent};
@@ -77,8 +77,6 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     const BG_COLOR: u16;
     /// Foreground (text/border) color for the error screen (RGB565).
     const FG_COLOR: u16;
-    /// Render mode forced regardless of the image header (epaper = EPaper).
-    const FORCED_RENDER_MODE: Option<RenderMode> = None;
 
     /// Maximum VM instructions to execute per main-loop iteration.
     ///
@@ -169,20 +167,6 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     /// input for the next frame); on-device BSPs leave it a no-op.
     fn frame_end(ctx: &mut Ctx<Self>) {
         let _ = ctx;
-    }
-
-    /// Present a buffered frame after the framework has rasterized it into the
-    /// back buffer. Default: finish synchronously on the calling thread —
-    /// `end_frame` does the vsync wait + buffer flip, then `flush_dirty`.
-    ///
-    /// A BSP with a dedicated render thread overrides this to hand the freshly
-    /// drawn back buffer off and return immediately, so the UI thread does not
-    /// block on the panel's vertical blanking. Only the *present* is deferred:
-    /// rasterization stays on the calling thread, so the widget tree remains
-    /// single-threaded and needs no lock.
-    fn present_buffered(ctx: &mut Ctx<Self>) {
-        ctx.lcd.end_frame();
-        ctx.lcd.flush_dirty();
     }
 
     /// Free-running 32-bit cycle counter for the `perf` profiler (0 = none).
@@ -279,11 +263,6 @@ impl Tasks {
 
     pub fn main_ref(&self) -> &Vm {
         &self.main
-    }
-
-    /// The main program's render mode holds for every task.
-    pub fn buffered(&self) -> bool {
-        self.main.render_mode == RenderMode::Buffered
     }
 
     /// VM of running task `id`.
@@ -449,7 +428,6 @@ impl<P: PlatformRuntime> Runtime<P> {
         // --- VM ---
         let mut vm = Box::new(Vm::new());
         vm.syscall_fn = Some(P::syscall);
-        vm.forced_render_mode = P::FORCED_RENDER_MODE;
 
         // --- Size the runtime pools from the image's RES_SYSCFG (if any) ---
         if error_code == 0 {
@@ -1378,40 +1356,18 @@ fn build_fault_dialog<P: PlatformRuntime>(
 // ============================================================================
 
 fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: &mut P::Input) {
-    match tasks.main.render_mode {
-        RenderMode::Buffered => {
-            if render::buffered_has_dirty(ctx) {
-                ctx.lcd.begin_frame();
-                let paint = render::render_buffered_content(ctx);
-                // on_paint into this back buffer, before the overlay + swap.
-                run_paint(ctx, tasks, &paint);
-                input.draw_overlay(ctx, true);
-                // Rasterization is done (UI thread). Hand off the present
-                // (vsync wait + buffer flip) — synchronous by default, or
-                // deferred to a render thread by BSPs that override this.
-                P::present_buffered(ctx);
-                snapshot_fill(ctx, tasks);
-            }
-        }
-        RenderMode::Dirty => {
-            if !P::render_due() {
-                return;
-            }
-            let mut paint = render::PaintList::new();
-            render::collect_dirty_paint(ctx, &mut paint);
-            // The board renderer may keep on_paint drawing in captures it draws itself.
-            let paint = render::capture_paint(ctx, &paint, |ctx, one| run_paint(ctx, tasks, one));
-            render::render_dirty(ctx);
-            run_paint(ctx, tasks, &paint);
-            input.draw_overlay(ctx, false);
-            ctx.lcd.flush_dirty();
-            snapshot_fill(ctx, tasks);
-        }
-        RenderMode::EPaper => {
-            // EPD updates are driven exclusively by OP_W_RENDER inside the
-            // program; the per-frame loop does nothing here.
-        }
+    if !P::render_due() {
+        return;
     }
+    let mut paint = render::PaintList::new();
+    render::collect_dirty_paint(ctx, &mut paint);
+    // The board renderer may keep on_paint drawing in captures it draws itself.
+    let paint = render::capture_paint(ctx, &paint, |ctx, one| run_paint(ctx, tasks, one));
+    render::render_dirty(ctx);
+    run_paint(ctx, tasks, &paint);
+    input.draw_overlay(ctx, false);
+    ctx.lcd.flush_dirty();
+    snapshot_fill(ctx, tasks);
 }
 
 /// After a render pass (`snapshot::TRACK`/`STALE`): record the values the
@@ -1903,10 +1859,8 @@ impl FullInput {
         // Keyboard intercept.
         if self.kb.visible && y >= self.kb.top() {
             self.kb.handle_press(x, y);
-            if !tasks.buffered() {
-                self.kb
-                    .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, self.kb.pressed_key, true);
-            }
+            self.kb
+                .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, self.kb.pressed_key, true);
             return;
         }
 
@@ -1976,9 +1930,7 @@ impl FullInput {
 
             if press_shows(&ctx.objs, hit) {
                 ctx.objs.mark_dirty(hit);
-                if !tasks.buffered() {
-                    render::render_dirty(ctx);
-                }
+                render::render_dirty(ctx);
             }
         }
 
@@ -1993,9 +1945,7 @@ impl FullInput {
         // Scrollbar drag.
         if self.scroll_active && self.scroll_id.is_some() {
             scrollbar_set_position(ctx, self.scroll_id, y);
-            if !tasks.buffered() {
-                render::render_dirty(ctx);
-            }
+            render::render_dirty(ctx);
         }
 
         // Slider drag (the pressed slider).
@@ -2010,9 +1960,7 @@ impl FullInput {
                     ext.value = new_val as WValue;
                 });
                 ctx.objs.mark_dirty(id);
-                if !tasks.buffered() {
-                    render::render_dirty(ctx);
-                }
+                render::render_dirty(ctx);
                 if ctx.objs.get(id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     // One argument — see the slider press path.
                     tasks.widget_event(&ctx.objs, id, FunctionKind::OnClick, &[id.0 as i32]);
@@ -2052,7 +2000,7 @@ impl FullInput {
             if let Some(action) = self.kb.handle_release(x, y) {
                 self.handle_key_action(ctx, tasks, action);
             }
-            if !tasks.buffered() && !self.kb.dirty && self.kb.visible {
+            if !self.kb.dirty && self.kb.visible {
                 self.kb
                     .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
             }
@@ -2121,9 +2069,7 @@ impl FullInput {
             ctx.objs.mark_dirty(clicked_id);
         }
 
-        if !tasks.buffered() {
-            render::render_dirty(ctx);
-        }
+        render::render_dirty(ctx);
 
         // OnSwipe — mutually exclusive with on_click.
         if is_swipe {

@@ -9,7 +9,7 @@ use crate::platform::Platform;
 use crate::renderer::WidgetRenderer;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
-    FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, FLAG_PRESSED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
+    FLAG_DIRTY, FLAG_HAS_ON_PAINT, FLAG_PRESSED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
     KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
 };
@@ -19,31 +19,6 @@ use crate::widget::{
 #[inline]
 pub fn screen_rect<B: Canvas>(lcd: &B) -> Rect {
     Rect::new(0, 0, lcd.width(), lcd.height())
-}
-
-// --- Buffered render (double-buffered partial redraw) ---
-
-/// Check if the back buffer has any dirty widgets.
-pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
-    crate::vm::flex_flush(ctx);
-    if !ctx.objs.render.maybe_dirty {
-        return false;
-    }
-    let buf = ctx.lcd.back_buf();
-    ctx.objs.ensure_dfs();
-    let mut other = false;
-    for i in 0..ctx.objs.dfs_len() {
-        let w = ctx.objs.get(ctx.objs.dfs_at(i));
-        if w.is_dirty_buf(buf) {
-            return true;
-        }
-        other |= w.flags & FLAG_DIRTY_AB != 0;
-    }
-    // Nothing dirty in either buffer: idle passes can skip the scan.
-    if !other {
-        ctx.objs.render.maybe_dirty = false;
-    }
-    false
 }
 
 /// Widgets whose `on_paint` must run right after the render pass that drew
@@ -81,8 +56,7 @@ impl PaintList {
     }
 }
 
-/// Dirty-mode counterpart of the list `render_buffered_content` returns: the
-/// dirty on_paint widgets, collected *before* `render_dirty` clears the flags.
+/// The dirty on_paint widgets, collected *before* `render_dirty` clears the flags.
 pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
     crate::vm::flex_flush(ctx);
     if !ctx.objs.render.maybe_dirty {
@@ -135,130 +109,6 @@ pub fn capture_paint<P: Platform>(
         <P::Renderer as WidgetRenderer<P>>::capture_end(ctx, id);
     }
     rest
-}
-
-/// Draw dirty widgets to the current back buffer. For each dirty widget, if
-/// its previously-drawn rect in this buffer differs from the current rect,
-/// the widgets behind it are redrawn clipped to the stale rect first — so
-/// moving widgets don't leave a trail. Per-buffer `prev_rect` tracking keeps
-/// the erase area bounded even under continuous motion.
-/// Caller must bracket with lcd.begin_frame() / lcd.end_frame(), and run
-/// `on_paint` for the returned widgets in between (`Vm::run_paint`): their
-/// custom drawing belongs to this back buffer, on top of the background just
-/// drawn — painting after the swap would reach only one of the two buffers.
-pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
-    crate::vm::flex_flush(ctx);
-    let mut paint = PaintList::new();
-    let buf = ctx.lcd.back_buf();
-    // Layers are a dirty-mode feature.
-    if ctx.lcd.layers_allocated() != 0 {
-        layers_off(ctx);
-    }
-    ctx.objs.ensure_dfs();
-    ctx.objs.geo_begin();
-    // The two buffers hold different frames: no incremental redraws.
-    ctx.objs.screen_touched();
-    // Whole-screen clip for the unclipped Pass-2 draws (built once).
-    let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
-
-    // Pass 1: for each dirty widget whose rect in THIS buffer is stale,
-    // redraw everything behind it clipped to the stale rect.
-    for i in 0..ctx.objs.dfs_len() {
-        let id = ctx.objs.dfs_at(i);
-        let w = ctx.objs.get(id);
-        if !w.is_dirty_buf(buf) {
-            continue;
-        }
-        let stale = buf_prev_rect(&ctx.objs, id, buf);
-        if stale.is_empty() {
-            continue;
-        }
-        let current = if w.is_visible() {
-            ctx.objs.abs_at(i)
-        } else {
-            Rect::new(0, 0, 0, 0)
-        };
-        if stale == current {
-            continue;
-        } // rect unchanged — no trail to clean
-        redraw_behind(ctx, i, stale);
-    }
-
-    // Pass 2: draw dirty visible widgets at their current rect
-    clear_painted(&mut ctx.objs);
-    let mut next = 0;
-    while next < ctx.objs.dfs_len() {
-        let i = next;
-        next += 1;
-        let id = ctx.objs.dfs_at(i);
-        let w = ctx.objs.get(id);
-        if !w.is_dirty_buf(buf) || !ctx.objs.vis_at(i) {
-            continue;
-        }
-
-        let abs = ctx.objs.abs_at(i);
-
-        // Children of scroll containers: outside or partly visible — skip the subtree.
-        if scroll_hidden(&ctx.objs, i, &abs) {
-            next = ctx.objs.sub_end_at(i);
-            continue;
-        }
-
-        // Translucent widgets and transparent labels must not blend over
-        // their own previous output in this buffer — restore what is behind
-        // them first, unless this pass already repainted all of it.
-        if ctx.lcd.has_alpha() && shows_behind_on::<P>(&ctx.objs, id) && !behind_is_fresh(&ctx.objs, 0, i, &abs, false)
-        {
-            redraw_behind(ctx, i, abs);
-        }
-        draw_widget(ctx, id, &abs, &full);
-        ctx.objs.set_drawn_now(id);
-        if ctx.objs.get(id).flags & FLAG_HAS_ON_PAINT != 0 {
-            paint.push(id);
-        }
-    }
-
-    // Draw scrollbars on top
-    for i in 0..ctx.objs.dfs_len() {
-        let id = ctx.objs.dfs_at(i);
-        if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0
-            && ctx.objs.get(id).is_dirty_buf(buf)
-            && ctx.objs.vis_at(i)
-        {
-            let abs = ctx.objs.abs_at(i);
-            draw_scrollbar(ctx, id, &abs);
-        }
-    }
-
-    clear_painted(&mut ctx.objs);
-
-    // Record this buffer's state and clear its dirty flag for each widget.
-    for i in 0..ctx.objs.dfs_len() {
-        let id = ctx.objs.dfs_at(i);
-        if ctx.objs.get(id).is_dirty_buf(buf) {
-            let drawn_rect = if ctx.objs.vis_at(i) {
-                ctx.objs.abs_at(i)
-            } else {
-                Rect::new(0, 0, 0, 0)
-            };
-            set_buf_prev_rect(&mut ctx.objs, id, buf, drawn_rect);
-        }
-        ctx.objs.get_mut(id).clear_dirty_buf(buf);
-    }
-    ctx.objs.geo_end();
-    paint
-}
-
-/// Read this widget's prev_rect for the given buffer index (0=A, 1=B).
-fn buf_prev_rect(tree: &ObjPool, id: WidgetId, buf: u8) -> Rect {
-    tree.prev_rect(id, buf)
-}
-
-/// Store this widget's drawn rect for the given buffer. Adds the widget's
-/// prev-rect section on demand; an empty rect with nothing stored yet is
-/// skipped (nothing to track).
-fn set_buf_prev_rect(tree: &mut ObjPool, id: WidgetId, buf: u8, rect: Rect) {
-    tree.set_prev_rect(id, buf, rect);
 }
 
 /// Whether DFS entry `i` (at `abs`) is left out as a scroll container's child: not wholly
@@ -505,7 +355,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
                 let root = slot.root;
                 // The root alone: its subtree is not the screen's. (Pass 2
                 // redraws the see-through widgets in front of it too.)
-                ctx.objs.get_mut(root).flags |= crate::widget::FLAG_DIRTY_A;
+                ctx.objs.get_mut(root).flags |= crate::widget::FLAG_DIRTY;
             }
         }
     }
@@ -621,7 +471,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         if !ctx.objs.in_scope(di) {
             continue;
         }
-        let stale = buf_prev_rect(&ctx.objs, id, 0);
+        let stale = ctx.objs.prev_rect(id);
         if stale.is_empty() {
             continue;
         }
@@ -636,7 +486,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
             Rect::new(0, 0, 0, 0)
         };
         // Recorded by `will_move`: used once.
-        ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
+        ctx.objs.set_prev_rect(id, Rect::new(0, 0, 0, 0));
         if stale == current {
             continue;
         }
@@ -849,7 +699,7 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
             if slot.composed && live && !slot.shown.is_empty() {
                 // Where the screen shows its surface (the root may have moved
                 // since) is put back as the root's previous place.
-                ctx.objs.set_prev_rect(slot.root, 0, slot.shown);
+                ctx.objs.set_prev_rect(slot.root, slot.shown);
                 ctx.objs.set_rendered(slot.root, true);
             }
             slot.active = false;
@@ -974,27 +824,6 @@ fn place_layers<P: Platform>(ctx: &mut Ctx<P>) {
     }
 }
 
-/// Hands every active layer back to the tree and frees the surfaces
-/// (buffered mode, which doesn't use layers).
-fn layers_off<P: Platform>(ctx: &mut Ctx<P>) {
-    for s in 0..crate::layer::MAX_LAYERS {
-        let slot = ctx.objs.layers.slots[s];
-        if slot.active {
-            let slot = &mut ctx.objs.layers.slots[s];
-            slot.active = false;
-            slot.composed = false;
-            slot.shown = Rect::new(0, 0, 0, 0);
-            slot.recompose = false;
-            slot.w = 0;
-            slot.h = 0;
-            let root = slot.root;
-            ctx.objs.mark_dirty(root);
-        }
-    }
-    ctx.objs.layers.composed = 0;
-    ctx.lcd.layers_off();
-}
-
 /// Most areas one `WidgetRenderer::compose` call gets: more are merged.
 pub const COMPOSE_AREAS: usize = 8;
 /// `WidgetRenderer::compose` areas start and end on multiples of this (or
@@ -1090,7 +919,7 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
         if ctx.objs.vis_at(di) || ctx.objs.rendered(id) {
             areas.add(ctx.objs.abs_at(di), &screen);
         }
-        areas.add(buf_prev_rect(&ctx.objs, id, 0), &screen);
+        areas.add(ctx.objs.prev_rect(id), &screen);
     }
     if layered {
         for slot in ctx.objs.layers.slots.iter().filter(|s| s.active) {
@@ -1111,7 +940,7 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
             continue;
         }
         // Where a moved widget was drawn: repainted.
-        ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
+        ctx.objs.set_prev_rect(id, Rect::new(0, 0, 0, 0));
         let vis = ctx.objs.vis_at(di);
         ctx.objs.set_rendered(id, vis);
     }
@@ -1167,7 +996,7 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
         if !w.is_dirty() || !ctx.objs.rendered(id) || !ctx.objs.vis_at(di) {
             continue;
         }
-        let old = ctx.objs.prev_rect(id, 0);
+        let old = ctx.objs.prev_rect(id);
         let new = ctx.objs.abs_at(di);
         if old.is_empty() || old == new || old.w != new.w || old.h != new.h {
             continue;
@@ -1184,7 +1013,7 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
         let sub_end = ctx.objs.sub_end_at(di);
         // A descendant that moved on its own (pending prev rect) would be
         // carried along at its old place: redraw instead.
-        if (di + 1..sub_end).any(|j| !ctx.objs.prev_rect(ctx.objs.dfs_at(j), 0).is_empty()) {
+        if (di + 1..sub_end).any(|j| !ctx.objs.prev_rect(ctx.objs.dfs_at(j)).is_empty()) {
             continue;
         }
         // A small box is cheaper to redraw than to move (a move costs a
@@ -1230,7 +1059,7 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
             }
         }
         // Pass 1b must not restore the old box again.
-        ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
+        ctx.objs.set_prev_rect(id, Rect::new(0, 0, 0, 0));
         restores.push(di, old);
         for m in &moves {
             ctx.objs.render.shifted.push((di, dest(m)));
@@ -1288,7 +1117,7 @@ fn plan_moves(tree: &ObjPool, old: &Rect, new: &Rect, radius: u16, front: usize,
         if !tree.vis_at(j) && !tree.rendered(jid) {
             continue;
         }
-        for r in [tree.abs_at(j), tree.prev_rect(jid, 0)] {
+        for r in [tree.abs_at(j), tree.prev_rect(jid)] {
             if r.intersects(&span) {
                 exact &= src.subtract(&r);
                 exact &= dst.subtract(&r);
@@ -1831,7 +1660,7 @@ fn dl_key<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
     h.u16(ctx.lcd.height());
     h.u8(ctx.lcd.has_alpha() as u8 | (ctx.lcd.smooth() as u8) << 1);
     // Widget (bookkeeping flags left out).
-    const BOOKKEEPING: u16 = FLAG_DIRTY_AB;
+    const BOOKKEEPING: u16 = FLAG_DIRTY;
     h.rect(*abs);
     h.u8(w.kind);
     h.u16(w.flags & !BOOKKEEPING);
@@ -3093,7 +2922,7 @@ fn gauge_key<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> u32 {
     let words = [
         pair(abs.x as u16, abs.y as u16),
         pair(abs.w, abs.h),
-        pair(w.kind as u16, w.flags & !FLAG_DIRTY_AB),
+        pair(w.kind as u16, w.flags & !FLAG_DIRTY),
         pair(w.background_color, w.border_color),
         pair(effective_bg(objs, w, &e), backdrop(objs, w, P::DEFAULT_BG_COLOR)),
         pair(e.text_color, e.press_color),

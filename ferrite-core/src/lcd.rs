@@ -301,7 +301,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         self.layers_alloc.get()
     }
 
-    /// Hide and free every layer (error screens, buffered mode).
+    /// Hide and free every layer (error screens).
     pub fn layers_off(&self) {
         for n in 0..crate::layer::MAX_LAYERS {
             self.layer_free(n);

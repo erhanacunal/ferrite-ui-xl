@@ -2,7 +2,7 @@
     "device": "exynos4412-xl",
     "screen": [1280, 800],
     "include_dirs": ["../../../../ferrite-ui/lib"],
-    "render_mode": "buffered",
+    "render_mode": "dirty",
     "sounds": [
         {"name": "tone", "source": "assets/tone.wav"}
     ],

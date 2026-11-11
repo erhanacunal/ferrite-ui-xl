@@ -247,18 +247,6 @@ impl FunctionKind {
     }
 }
 
-/// Render mode — determines how the main loop renders widgets.
-#[derive(Clone, Copy, PartialEq)]
-#[repr(u8)]
-pub enum RenderMode {
-    /// Partial update: only dirty widgets redrawn (default).
-    Dirty = 0,
-    /// Double-buffered full redraw every frame (flicker-free).
-    Buffered = 1,
-    /// E-paper partial update: renders dirty rects into a framebuffer, then flushes to EPD.
-    EPaper = 2,
-}
-
 /// Function entry from the image header.
 #[derive(Clone, Copy)]
 pub struct FuncEntry {
@@ -840,11 +828,6 @@ pub struct Vm {
     global_count: u8,
     // Jump/call operands are u32 (image header IMAGE_FLAG_WIDE_ADDR).
     wide_addr: bool,
-    // Render mode from image header
-    pub render_mode: RenderMode,
-    // Platform policy override: when set, replaces the header's render mode after
-    // load (e-paper panels force `EPaper`). `None` honors the image header.
-    pub forced_render_mode: Option<RenderMode>,
     // Portrait screen from the image header (IMAGE_FLAG_PORTRAIT).
     pub portrait: bool,
     // `(widgets, extensions)` the program allocates, from a v4 image header
@@ -924,9 +907,7 @@ impl Vm {
             frame_size: 0,
             global_count: 0,
             wide_addr: false,
-            render_mode: RenderMode::Dirty,
             portrait: false,
-            forced_render_mode: None,
             in_paint: false,
             page_base: 0,
             page_len: 0,
@@ -1035,7 +1016,7 @@ impl Vm {
     /// place, so loading needs no second copy of the program. On failure the
     /// buffer comes back unchanged.
     pub fn load_ram_owned(&mut self, mut image: Vec<u8>) -> Result<(), Vec<u8>> {
-        if let Some((funcs, opcode_start, gc, rm, hint, wide, portrait)) = parse_image_header(&image) {
+        if let Some((funcs, opcode_start, gc, hint, wide, portrait)) = parse_image_header(&image) {
             if !code_addressable(wide, image.len() - opcode_start) {
                 return Err(image);
             }
@@ -1047,7 +1028,6 @@ impl Vm {
             self.global_count = gc;
             self.frame_base = gc;
             self.frame_size = 0;
-            self.render_mode = self.forced_render_mode.unwrap_or(rm);
             self.portrait = portrait;
             self.tree_hint = hint;
             Ok(())
@@ -1083,7 +1063,7 @@ impl Vm {
         hdr_buf.resize(hdr_len, 0);
         flash.read(base, &mut hdr_buf);
 
-        if let Some((funcs, opcode_start, gc, rm, hint, wide, portrait)) = parse_image_header(&hdr_buf) {
+        if let Some((funcs, opcode_start, gc, hint, wide, portrait)) = parse_image_header(&hdr_buf) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             if !code_addressable(wide, opcode_len) {
@@ -1103,7 +1083,6 @@ impl Vm {
             self.global_count = gc;
             self.frame_base = gc;
             self.frame_size = 0;
-            self.render_mode = self.forced_render_mode.unwrap_or(rm);
             self.portrait = portrait;
             self.tree_hint = hint;
             true
@@ -1776,7 +1755,6 @@ impl Vm {
         self.cb_head = 0;
         self.cb_tail = 0;
         self.critical = false;
-        self.render_mode = RenderMode::Dirty;
         self.portrait = false;
         self.open_files = [None, None];
         self.next_program = None;
@@ -2052,37 +2030,17 @@ impl Vm {
                     ctx.objs.mark_dirty(self.target);
                 }
             }
-            OP_W_RENDER => match self.render_mode {
-                // render() from inside on_paint: the frame being painted is
-                // presented by run_paint's caller — don't nest a frame.
-                RenderMode::Buffered | RenderMode::Dirty if self.in_paint => {}
-                RenderMode::Buffered => {
-                    if render::buffered_has_dirty(ctx) {
-                        ctx.lcd.begin_frame();
-                        // Reborrow self as immutable while ctx stays mut —
-                        // render reads array data via Vm::array_slice.
-                        let paint = render::render_buffered_content(ctx);
-                        self.run_paint(ctx, &paint);
-                        ctx.lcd.end_frame();
-                    }
-                }
-                RenderMode::Dirty => {
+            OP_W_RENDER => {
+                // render() from inside on_paint: the render that runs it is
+                // already going on.
+                if !self.in_paint {
                     let mut paint = render::PaintList::new();
                     render::collect_dirty_paint(ctx, &mut paint);
                     let paint = render::capture_paint(ctx, &paint, |ctx, one| self.run_paint(ctx, one));
                     render::render_dirty(ctx);
                     self.run_paint(ctx, &paint);
                 }
-                RenderMode::EPaper => {
-                    // Ghost-erase: drive all pixels to white so previous dark
-                    // content doesn't bleed through the next render. No-op on
-                    // framebuffer panels; e-paper backends override the hook.
-                    ctx.lcd.pre_full_redraw();
-                    // Full redraw — guarantees all rows are tainted for flush.
-                    render::render_all(ctx);
-                    ctx.lcd.flush_dirty();
-                }
-            },
+            }
             OP_ARR_LOAD => {
                 let (arr_id, idx) = self.pop2();
                 self.arr_load(ctx, arr_id, idx);
@@ -2470,16 +2428,11 @@ impl Vm {
             }
             OP_BEGIN_FRAME => {
                 ctx.objs.screen_touched();
-                // Buffered and EPaper modes manage their own frame lifecycle
-                if self.render_mode == RenderMode::Dirty {
-                    ctx.lcd.begin_frame();
-                }
+                ctx.lcd.begin_frame();
             }
             OP_END_FRAME => {
                 ctx.objs.screen_touched();
-                if self.render_mode == RenderMode::Dirty {
-                    ctx.lcd.end_frame();
-                }
+                ctx.lcd.end_frame();
             }
             OP_SEND_USART => {
                 let arr_id = self.pop() as ObjPtr;
@@ -3055,7 +3008,6 @@ impl Vm {
             return None;
         }
         vm.syscall_fn = self.syscall_fn;
-        vm.forced_render_mode = self.forced_render_mode;
         Some(vm)
     }
 
@@ -3888,7 +3840,7 @@ impl Vm {
 
 // === Image header parser ===
 
-/// Parse VM image header. Returns (function table, opcode start, global_count, render_mode,
+/// Parse VM image header. Returns (function table, opcode start, global_count,
 /// (widget_count, ext_count) — `None` before v4, wide_addr, portrait). widget_count/ext_count are 0 for v1-v3 images.
 ///
 /// Format v1/v2:
@@ -3899,13 +3851,13 @@ impl Vm {
 ///   + [...]
 /// Format v4 (adds widget/ext counts):
 ///   v3 header + widget_count(u8) + ext_count(u8) + [...]
-///   flags bit 0: render_mode (0=dirty, 1=buffered)
+///   flags bit 0: render_mode (0=dirty, 1=buffered; ignored: XL renders dirty only)
 ///   flags bit 2: wide_addr (jump/call targets are u32)
 ///   flags bit 3: portrait (screen rotated 90°)
 #[allow(clippy::type_complexity)]
 fn parse_image_header(
     data: &[u8],
-) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, Option<(u8, u8)>, bool, bool)> {
+) -> Option<(Vec<FuncEntry>, usize, u8, Option<(u8, u8)>, bool, bool)> {
     if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
@@ -3936,11 +3888,6 @@ fn parse_image_header(
         u16::from_le_bytes([data[5], data[6]])
     } else {
         0
-    };
-    let render_mode = if flags & 0x01 != 0 {
-        RenderMode::Buffered
-    } else {
-        RenderMode::Dirty
     };
     let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
     let portrait = flags & IMAGE_FLAG_PORTRAIT != 0;
@@ -3976,7 +3923,6 @@ fn parse_image_header(
         functions,
         opcode_start,
         global_count,
-        render_mode,
         tree_hint,
         wide,
         portrait,
@@ -4144,16 +4090,6 @@ mod anim_tests {
         crate::render::collect_dirty_paint(&mut ctx, &mut paint);
         crate::render::render_dirty(&mut ctx);
         assert!(!ctx.objs.get(child).is_dirty());
-        // Buffered: the other buffer's bit keeps the hint up.
-        ctx.objs.mark_dirty(child);
-        ctx.objs.get_mut(root).clear_dirty_buf(0);
-        ctx.objs.get_mut(child).clear_dirty_buf(0);
-        assert!(!crate::render::buffered_has_dirty(&mut ctx));
-        assert!(ctx.objs.render.maybe_dirty, "B bits still set");
-        ctx.objs.get_mut(root).clear_dirty_buf(1);
-        ctx.objs.get_mut(child).clear_dirty_buf(1);
-        assert!(!crate::render::buffered_has_dirty(&mut ctx));
-        assert!(!ctx.objs.render.maybe_dirty);
     }
 
     #[test]

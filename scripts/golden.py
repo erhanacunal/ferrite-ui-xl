@@ -3,7 +3,8 @@
     python scripts/golden.py            # check against golden/hashes.json
     python scripts/golden.py --update   # record the current frames as golden
     python scripts/golden.py --only tablet_clock,scroll
-    python scripts/golden.py --dl       # same check, widgets drawn through display lists
+    python scripts/golden.py --dl       # same check, widgets drawn through cached display lists
+                                        # (every cache hit re-recorded and compared: FERRITE_SIM_DL_VERIFY)
 
 Each scenario in golden/scenarios.json builds its example with ferrite-ui's
 compiler (FERRITE_UI, default ../ferrite-ui), runs the release sim on its
@@ -66,6 +67,9 @@ def run(name, sc, img, env=None):
     r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=env)
     if r.returncode != 0:
         raise RuntimeError(f"sim exited {r.returncode}: {r.stderr.strip()[-300:]}")
+    for line in r.stderr.splitlines():
+        if line.startswith("sim: dl "):
+            print(f"     {name}: {line[5:]}")
     frames = {}
     for t in sc["dump"]:
         f = out / f"frame_{t:06d}.bmp"
@@ -95,7 +99,8 @@ def main():
     ap.add_argument("--update", action="store_true", help="record the current frames as golden")
     ap.add_argument("--only", help="comma-separated scenario names")
     ap.add_argument("--dl", action="store_true",
-                    help="draw widgets through display lists (FERRITE_SIM_DL=1); must match the same golden frames")
+                    help="draw widgets through cached display lists, verifying every hit (FERRITE_SIM_DL=1, "
+                         "FERRITE_SIM_DL_VERIFY=1); must match the same golden frames")
     a = ap.parse_args()
 
     scenarios = json.loads(SCENARIOS.read_text(encoding="utf-8"))["scenarios"]
@@ -115,7 +120,7 @@ def main():
             print(f"SKIP {name}: {err}")
             skipped.append(name)
             continue
-        frames = run(name, sc, img, dict(os.environ, FERRITE_SIM_DL="1") if a.dl else None)
+        frames = run(name, sc, img, dict(os.environ, FERRITE_SIM_DL="1", FERRITE_SIM_DL_VERIFY="1") if a.dl else None)
         if a.update:
             golden[name] = frames
             gdir = OUT / f"{name}.golden"

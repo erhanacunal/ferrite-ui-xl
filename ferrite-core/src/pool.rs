@@ -148,6 +148,8 @@ pub(crate) struct RenderState {
     pub(crate) geo_valid: bool,
     /// Display-list recorder for widget drawing (`dl.rs`, `render::draw_body`).
     pub(crate) dl: crate::dl::Recorder,
+    /// Recorded lists by look (`render::dl_key`); emptied with the tree.
+    pub(crate) dl_cache: core::cell::RefCell<crate::dl::Cache>,
 }
 
 impl RenderState {
@@ -161,6 +163,7 @@ impl RenderState {
             shifted: Vec::new(),
             shift_keep: Vec::new(),
             dl: crate::dl::Recorder::new(),
+            dl_cache: core::cell::RefCell::new(crate::dl::Cache::new()),
             geo: Vec::new(),
             geo_stack: Vec::new(),
             geo_valid: false,
@@ -177,6 +180,8 @@ impl RenderState {
         {
             self.geo_valid = false;
         }
+        // Images, fonts and strings are reloaded with the tree.
+        self.dl_cache.get_mut().clear();
     }
 }
 

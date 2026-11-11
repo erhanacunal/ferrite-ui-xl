@@ -241,6 +241,7 @@ impl PlatformRuntime for SimPlatform {
                         d.next += 1;
                     }
                     if d.next == d.at.len() {
+                        print_dl_stats();
                         std::process::exit(0);
                     }
                     systick::sim::advance(d.step_ms);
@@ -265,5 +266,21 @@ fn sim_battery(id: u8) -> i32 {
         (0x09, Some((_, c))) => *c,
         (0x09, None) => 2,
         _ => -1,
+    }
+}
+
+/// Display-list cache counters (stderr; with `FERRITE_SIM_DL`).
+fn print_dl_stats() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use ferrite_core::dl;
+    if dl::enabled() {
+        eprintln!(
+            "sim: dl hits {} direct {} stored {} evicted {} bytes {}",
+            dl::HITS.load(Relaxed),
+            dl::DIRECT.load(Relaxed),
+            dl::STORES.load(Relaxed),
+            dl::EVICTS.load(Relaxed),
+            dl::BYTES.load(Relaxed)
+        );
     }
 }

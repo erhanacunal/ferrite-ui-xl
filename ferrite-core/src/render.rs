@@ -1636,14 +1636,165 @@ pub fn draw_default<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &
 
 /// The built-in drawing on the screen: directly, or (`dl::ENABLED`) recorded
 /// into the pool's display list and replayed (`dl.rs`; same calls, same pixels).
+///
+/// With display lists: a look met before (`dl_key`) is recorded once against
+/// the whole screen and kept; from then on it is replayed into each clip
+/// rect (`List::replay_clipped`). A look met for the first time is drawn
+/// directly (one drawn once, like an animation's frames, costs no recording).
 fn draw_body<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
-    let rec = &ctx.objs.render.dl;
-    if crate::dl::enabled() && rec.begin(&ctx.lcd) {
-        draw_widget_body(ctx, rec, id, abs, clip);
-        rec.end_replay(&ctx.lcd);
+    if crate::dl::enabled() {
+        draw_cached(ctx, id, abs, clip);
     } else {
         draw_widget_body(ctx, &ctx.lcd, id, abs, clip);
     }
+}
+
+fn draw_cached<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
+    let lcd = &ctx.lcd;
+    let state = &ctx.objs.render;
+    let key = dl_key(ctx, id, abs);
+    let start = lcd.scissor();
+    {
+        let mut cache = state.dl_cache.borrow_mut();
+        if let Some(list) = cache.get(key) {
+            if crate::dl::verify() {
+                dl_verify(ctx, id, abs, list);
+            }
+            for cr in clip.iter() {
+                list.replay_clipped(lcd, *cr, start);
+            }
+            lcd.set_scissor(list.end_scissor(start));
+            return;
+        }
+        if !cache.seen(key) {
+            drop(cache);
+            draw_widget_body(ctx, lcd, id, abs, clip);
+            return;
+        }
+    }
+    let rec = &state.dl;
+    if !rec.begin(lcd) {
+        draw_widget_body(ctx, lcd, id, abs, clip);
+        return;
+    }
+    draw_widget_body(ctx, rec, id, abs, &ClipRegion::from_rect(screen_rect(lcd)));
+    rec.end();
+    let list = rec.list().compact();
+    for cr in clip.iter() {
+        list.replay_clipped(lcd, *cr, start);
+    }
+    lcd.set_scissor(list.end_scissor(start));
+    state.dl_cache.borrow_mut().insert(key, list);
+}
+
+/// `dl::VERIFY`: record widget `id` again and check the cached list is what
+/// it draws now (else the key misses something the drawing reads).
+fn dl_verify<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, cached: &crate::dl::List) {
+    let rec = &ctx.objs.render.dl;
+    if !rec.begin(&ctx.lcd) {
+        return;
+    }
+    draw_widget_body(ctx, rec, id, abs, &ClipRegion::from_rect(screen_rect(&ctx.lcd)));
+    rec.end();
+    let fresh = rec.list();
+    if *fresh != *cached {
+        let w = ctx.objs.get(id);
+        panic!(
+            "dl: stale display list for widget {} (kind {}, {}x{} at {},{}): {} cached ops, {} drawn now",
+            id.to_vm(),
+            w.kind,
+            abs.w,
+            abs.h,
+            abs.x,
+            abs.y,
+            cached.ops.len(),
+            fresh.ops.len()
+        );
+    }
+}
+
+/// The look of widget `id` at `abs`: a hash of everything `draw_widget_body`
+/// reads (widget and its extras, the box, the canvas, inherited
+/// backgrounds, text, font, image, graph data, the input cursor). Two
+/// widgets with the same key draw the same calls.
+fn dl_key<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
+    let objs = &ctx.objs;
+    let w = objs.get(id);
+    let e = objs.ext(id);
+    let mut h = crate::dl::Hasher::new();
+    // Canvas.
+    h.u16(ctx.lcd.width());
+    h.u16(ctx.lcd.height());
+    h.u8(ctx.lcd.has_alpha() as u8 | (ctx.lcd.smooth() as u8) << 1);
+    // Widget (bookkeeping flags left out).
+    const BOOKKEEPING: u16 = FLAG_DIRTY_AB | FLAG_RENDERED | FLAG_PAINTED;
+    h.rect(*abs);
+    h.u8(w.kind);
+    h.u16(w.flags & !BOOKKEEPING);
+    h.u16(w.background_color);
+    h.u16(w.border_color);
+    h.i32(w.value);
+    // Extras (the last-drawn rects aside).
+    for v in [e.group_id, e.flex, e.flex_gap, e.flex_grow, e.font_id, e.text_align, e.image_id, e.max_length, e.gradient_dir, e.alpha] {
+        h.u8(v);
+    }
+    for edges in [e.border, e.padding] {
+        h.u8(edges.top);
+        h.u8(edges.right);
+        h.u8(edges.bottom);
+        h.u8(edges.left);
+    }
+    h.u16(e.text_color);
+    h.u16(e.border_radius);
+    h.u16(e.press_color);
+    h.u16(e.gradient_color);
+    h.i32(e.value);
+    // What it inherits.
+    h.u16(effective_bg(objs, w, &e));
+    h.u16(resolved_text_bg(objs, w, &e, P::DEFAULT_BG_COLOR));
+    // Text (labels, inputs, dropdowns, polygon points), by content.
+    if e.text_id != crate::pool::PTR_NONE {
+        let t = objs.str_get(e.text_id);
+        h.u32(t.len() as u32);
+        h.bytes(t);
+    } else {
+        h.u32(u32::MAX);
+    }
+    // Font, image: which one is loaded under the id.
+    match ctx.fonts.resolve(e.font_id) {
+        Some(f) => {
+            h.u8(f.font_id);
+            h.u32(f as *const crate::font::Font as usize as u32);
+        }
+        None => h.u32(0),
+    }
+    if e.image_id != 0 {
+        match ctx.images.find(e.image_id) {
+            Some(img) => {
+                h.u32(img.data_addr());
+                h.u16(img.width);
+                h.u16(img.height);
+                h.u32(img as *const crate::image::Image as usize as u32);
+            }
+            None => h.u32(0),
+        }
+    }
+    // Graph samples.
+    if w.kind == KIND_GRAPH {
+        match objs.arr(e.value as crate::pool::ObjPtr) {
+            Some(a) => {
+                h.u32(a.len() as u32);
+                for &v in a {
+                    h.i32(v);
+                }
+            }
+            None => h.u32(u32::MAX),
+        }
+    }
+    if w.kind == KIND_INPUT || w.kind == KIND_DROPDOWN {
+        h.u8(ctx.cursor_visible as u8);
+    }
+    h.finish()
 }
 
 fn draw_widget_body<P: Platform, C: Canvas>(
@@ -3763,6 +3914,8 @@ mod shift_tests {
         px: RefCell<Vec<u16>>,
         /// Pixels moved so far.
         moved: Cell<usize>,
+        /// Open pixel stream: window x, y, w, h and pixels written.
+        win: Cell<(u16, u16, u16, u16, u32)>,
     }
 
     impl<const MOVE: bool> LcdBackend for Fb<MOVE> {
@@ -3790,8 +3943,19 @@ mod shift_tests {
         fn blend_pixel(&self, x: u16, y: u16, c: u16, a: u8) {
             self.blend_rect(x, y, 1, 1, c, a);
         }
-        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
-        fn write_pixel(&self, _: u16) {}
+        fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
+            self.win.set((x, y, w, h, 0));
+        }
+        fn write_pixel(&self, c: u16) {
+            let (x, y, w, h, n) = self.win.get();
+            if w > 0 && n < w as u32 * h as u32 {
+                let (px, py) = (x as usize + (n % w as u32) as usize, y as usize + (n / w as u32) as usize);
+                if px < S && py < S {
+                    self.px.borrow_mut()[py * S + px] = c;
+                }
+                self.win.set((x, y, w, h, n + 1));
+            }
+        }
         fn send_command(&self, _: u16) {}
         fn send_data(&self, _: u16) {}
         fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
@@ -3828,7 +3992,11 @@ mod shift_tests {
 
     fn ctx<const MOVE: bool>() -> Ctx<Plat<MOVE>> {
         Ctx {
-            lcd: LcdImpl::with_backend(Fb { px: RefCell::new(vec![0; S * S]), moved: Cell::new(0) }),
+            lcd: LcdImpl::with_backend(Fb {
+                px: RefCell::new(vec![0; S * S]),
+                moved: Cell::new(0),
+                win: Cell::new((0, 0, 0, 0, 0)),
+            }),
             flash: FlashImpl::with_backend(MockFlash),
             fonts: FontList::new(),
             images: ImageList::new(),
@@ -4087,7 +4255,10 @@ mod shift_tests {
         for y in 0..S {
             for lx in 30..70 {
                 let (a, b) = (whole[y * S + 40 + lx], cut[y * S + lx - 30]);
-                assert!(a == b, "box column {lx}, row {y}: {a:04x} vs {b:04x}");
+                if a != b {
+                    let row = |v: &Vec<u16>, x0: usize| (x0..x0 + 12).map(|x| format!("{:04x}", v[y * S + x])).collect::<Vec<_>>().join(" ");
+                    panic!("box column {lx}, row {y}: {a:04x} vs {b:04x}\nwhole {}\ncut   {}", row(&whole, 40 + 26), row(&cut, 0));
+                }
             }
         }
     }
@@ -4173,6 +4344,12 @@ mod shift_tests {
         });
         add(KIND_CIRCLE, Rect::new(106, 34, 20, 20), 0xF81F, &|o, id| { o.update_ext(id, |e| e.border = Edges { top: 2, right: 2, bottom: 2, left: 2 }); });
         add(KIND_ELLIPSE, Rect::new(100, 106, 26, 14), 0x07E0, &|_, _| {});
+        add(KIND_BASE, Rect::new(30, 116, 34, 12), 0x001F, &|o, id| {
+            o.update_ext(id, |e| {
+                e.gradient_color = 0xF800;
+                e.gradient_dir = 1;
+            });
+        });
         add(KIND_LINE, Rect::new(64, 106, 30, 20), 0, &|o, id| { o.update_ext(id, |e| e.border = Edges { top: 3, right: 3, bottom: 3, left: 3 }); });
         add(KIND_POLYGON, Rect::new(106, 64, 20, 30), 0xFD20, &|o, id| {
             text(o, id, b"0,0 19,10 4,29");
@@ -4185,7 +4362,9 @@ mod shift_tests {
     fn draw_tree(ctx: &Ctx<Plat<false>>, clip: &ClipRegion, record: bool) {
         fn walk(ctx: &Ctx<Plat<false>>, id: WidgetId, clip: &ClipRegion, record: bool) {
             let abs = ctx.objs.absolute_rect(id);
-            if record {
+            if CACHED.with(|c| c.get()) {
+                draw_cached(ctx, id, &abs, clip);
+            } else if record {
                 let rec = crate::dl::Recorder::new();
                 assert!(rec.begin(&ctx.lcd));
                 draw_widget_body(ctx, &rec, id, &abs, clip);
@@ -4201,6 +4380,79 @@ mod shift_tests {
             }
         }
         walk(ctx, ctx.objs.root, clip, record);
+    }
+
+    std::thread_local! {
+        /// `draw_tree` goes through the display-list cache (`draw_cached`).
+        static CACHED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Clipped replays of cached lists (recorded against the whole screen)
+    /// draw what direct drawing clipped to the same region does, pixel
+    /// streams (the gradient) included; every hit is checked against a fresh
+    /// recording (`dl::VERIFY`).
+    #[test]
+    fn cached_display_lists_replay_into_any_clip() {
+        crate::dl::VERIFY.store(true, core::sync::atomic::Ordering::Relaxed);
+        let mut part = ClipRegion::from_rect(Rect::new(0, 0, S as u16, S as u16));
+        part.subtract(&Rect::new(30, 20, 50, 70));
+        part.subtract(&Rect::new(36, 110, 10, 10));
+        for clip in [ClipRegion::from_rect(Rect::new(0, 0, S as u16, S as u16)), part] {
+            let mut direct = ctx::<false>();
+            scene(&mut direct);
+            all_kinds(&mut direct);
+            draw_tree(&direct, &clip, false);
+
+            let mut cached = ctx::<false>();
+            scene(&mut cached);
+            all_kinds(&mut cached);
+            CACHED.with(|c| c.set(true));
+            // First sighting: direct; second: recorded; third: replayed.
+            for _ in 0..3 {
+                cached.lcd.backend().px.borrow_mut().fill(0);
+                draw_tree(&cached, &clip, false);
+            }
+            CACHED.with(|c| c.set(false));
+            assert!(cached.objs.render.dl_cache.borrow().len() > 20, "few lists cached");
+
+            let (a, b) = (direct.lcd.backend().px.borrow(), cached.lcd.backend().px.borrow());
+            let diff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+            assert_eq!(diff, 0, "{diff} pixels differ");
+            assert!(direct.lcd.scissor() == cached.lcd.scissor());
+        }
+    }
+
+    /// A recorded pixel stream replayed into a clip rect lands each pixel
+    /// where the window put it, and nothing outside the clip.
+    #[test]
+    fn clipped_replay_cuts_pixel_streams() {
+        use crate::canvas::Canvas;
+        let c = ctx::<false>();
+        let rec = crate::dl::Recorder::new();
+        assert!(rec.begin(&c.lcd));
+        let win = Rect::new(10, 20, 8, 6);
+        rec.begin_pixels(10, 20, 8, 6);
+        let px: Vec<u16> = (1..=40).collect();
+        rec.write_pixels(&px[..13]);
+        rec.write_pixel(px[13]);
+        rec.write_pixels(&px[14..]);
+        rec.write_run(0xBEEF, 8);
+        rec.end();
+        let clip = Rect::new(12, 21, 3, 4);
+        rec.list().replay_clipped(&c.lcd, clip, None);
+        let fb = c.lcd.backend().px.borrow();
+        for y in 0..S as i16 {
+            for x in 0..S as i16 {
+                let inside = clip.contains(x as u16, y as u16);
+                let want = if inside {
+                    let n = ((y - win.y) as usize) * win.w as usize + (x - win.x) as usize;
+                    if n < 40 { (n + 1) as u16 } else { 0xBEEF }
+                } else {
+                    0
+                };
+                assert_eq!(fb[y as usize * S + x as usize], want, "pixel {x},{y}");
+            }
+        }
     }
 
     #[test]

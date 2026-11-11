@@ -8,7 +8,7 @@ pub const COLOR_GREEN: Color = 0x07E0;
 pub const COLOR_BLUE: Color = 0x001F;
 
 /// Pixel offset (relative to parent content area)
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Offset {
     pub x: i16,
     pub y: i16,

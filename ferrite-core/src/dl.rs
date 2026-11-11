@@ -13,30 +13,57 @@
 //! `scissor`…) from the canvas it is about to replay onto (`Recorder::begin`)
 //! and from the scissor changes recorded so far.
 //!
-//! For now (2b) the renderer records each widget and replays it at once
-//! when `ENABLED` is on (`render::draw_widget`); the per-widget cache comes
-//! next (2c). Lists hold absolute screen coordinates.
+//! With `ENABLED` on, the renderer keeps the lists in a `Cache` keyed by a
+//! hash of everything a widget's drawing reads (`render::dl_key`): a widget
+//! whose look was seen before is recorded once, against the whole screen,
+//! and then replayed into each clip rect (`List::replay_clipped`). Lists
+//! hold absolute screen coordinates, so the box is part of the key.
 
 use core::cell::{Cell, RefCell};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use crate::canvas::{Canvas, Pen};
 use crate::types::{Offset, Rect};
 
-/// Record widget drawing and replay it (instead of drawing directly).
+/// Draw widgets through cached display lists (instead of drawing directly).
 /// Off by default; the sim turns it on with `FERRITE_SIM_DL=1`, exynos with
 /// `POST /api/dl?on=1`.
 pub static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// On a cache hit, record the widget again and panic if the cached list
+/// differs: the key missed something the drawing reads (sim
+/// `FERRITE_SIM_DL_VERIFY=1`, tests).
+pub static VERIFY: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+#[inline]
+pub fn verify() -> bool {
+    VERIFY.load(Ordering::Relaxed)
+}
+
+/// Counters since boot (free-running; take differences): replays from the
+/// cache, direct draws (a look not seen before), lists recorded, lists
+/// evicted; and the bytes held now.
+pub static HITS: AtomicU32 = AtomicU32::new(0);
+pub static DIRECT: AtomicU32 = AtomicU32::new(0);
+pub static STORES: AtomicU32 = AtomicU32::new(0);
+pub static EVICTS: AtomicU32 = AtomicU32::new(0);
+pub static BYTES: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+fn count(c: &AtomicU32) {
+    c.fetch_add(1, Ordering::Relaxed);
+}
+
 /// A slice of one of the list's arenas.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span {
     start: u32,
     len: u32,
@@ -50,7 +77,7 @@ impl Span {
 }
 
 /// One recorded call (the `Canvas` method of the same name).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Op {
     SetScissor(Option<Rect>),
     FillRect { x: u16, y: u16, w: u16, h: u16, color: u16 },
@@ -92,7 +119,7 @@ pub enum Op {
 }
 
 /// Recorded calls and their slice data.
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 pub struct List {
     pub ops: Vec<Op>,
     u8s: Vec<u8>,
@@ -111,6 +138,20 @@ impl List {
         self.u8s.clear();
         self.u16s.clear();
         self.pts.clear();
+    }
+
+    /// A copy holding just what it uses (the recorder's buffers grow).
+    pub fn compact(&self) -> List {
+        List { ops: self.ops.clone(), u8s: self.u8s.clone(), u16s: self.u16s.clone(), pts: self.pts.clone() }
+    }
+
+    /// The scissor the drawing left set, given the one it started with.
+    pub fn end_scissor(&self, start: Option<Rect>) -> Option<Rect> {
+        self.ops
+            .iter()
+            .rev()
+            .find_map(|op| if let Op::SetScissor(r) = op { Some(*r) } else { None })
+            .unwrap_or(start)
     }
 
     /// Heap bytes held (capacity).
@@ -153,20 +194,80 @@ impl List {
 
     /// Make the recorded calls on `c`.
     pub fn replay<C: Canvas>(&self, c: &C) {
+        self.play(c, None, None);
+    }
+
+    /// Make the recorded calls on `c` as if drawn with the scissor always
+    /// inside `clip`: every scissor the list sets is cut to it (the list
+    /// starts with `start`, `None` = `clip` itself), and what ignores the
+    /// scissor (pixel streams, gradient fills) is cut here. A list recorded
+    /// against the whole screen and replayed into each rect of a clip region
+    /// draws what the drawing would have drawn clipped to that region.
+    /// Leaves the scissor at `clip`'s cut of the last one set.
+    pub fn replay_clipped<C: Canvas>(&self, c: &C, clip: Rect, start: Option<Rect>) {
+        self.play(c, Some(clip), start);
+    }
+
+    fn play<C: Canvas>(&self, c: &C, clip: Option<Rect>, start: Option<Rect>) {
+        let cut = |s: Option<Rect>| -> Option<Rect> {
+            let k = clip?;
+            Some(match s {
+                Some(r) => r.intersection(&k).unwrap_or(Rect::new(k.x, k.y, 0, 0)),
+                None => k,
+            })
+        };
+        // The scissor in force (clipped replay only).
+        let mut cur = cut(start);
+        if clip.is_some() {
+            c.set_scissor(cur);
+        }
+        let mut stream = Stream::default();
         let mut pen: Option<C::Pen<'_>> = None;
         for op in &self.ops {
             match *op {
-                Op::SetScissor(r) => c.set_scissor(r),
+                Op::SetScissor(r) => {
+                    if clip.is_some() {
+                        cur = cut(r);
+                        c.set_scissor(cur);
+                    } else {
+                        c.set_scissor(r)
+                    }
+                }
                 Op::FillRect { x, y, w, h, color } => c.fill_rect(x, y, w, h, color),
                 Op::BlendRect { x, y, w, h, color, alpha } => c.blend_rect(x, y, w, h, color, alpha),
-                Op::GradientRect { x, y, w, h, c1, c2, dir, x_off, y_off, full_w, full_h } => {
-                    c.fill_gradient_rect(x, y, w, h, c1, c2, dir, x_off, y_off, full_w, full_h)
-                }
+                Op::GradientRect { x, y, w, h, c1, c2, dir, x_off, y_off, full_w, full_h } => match cur {
+                    // Streamed: cut it, keeping its place in the gradient.
+                    Some(k) => {
+                        if let Some(v) = Rect::new(x as i16, y as i16, w, h).intersection(&k) {
+                            let (dx, dy) = ((v.x as i32 - x as i32) as u16, (v.y as i32 - y as i32) as u16);
+                            c.fill_gradient_rect(
+                                v.x as u16, v.y as u16, v.w, v.h, c1, c2, dir, x_off + dx, y_off + dy, full_w, full_h,
+                            )
+                        }
+                    }
+                    None => c.fill_gradient_rect(x, y, w, h, c1, c2, dir, x_off, y_off, full_w, full_h),
+                },
                 Op::DrawRect { x, y, w, h, color } => c.draw_rect(x, y, w, h, color),
                 Op::DrawPixel { x, y, color } => c.draw_pixel(x, y, color),
-                Op::BeginPixels { x, y, w, h } => c.begin_pixels(x, y, w, h),
-                Op::Pixels(s) => c.write_pixels(&self.u16s[s.range()]),
-                Op::Run { color, n } => c.write_run(color, n),
+                Op::BeginPixels { x, y, w, h } => match cur {
+                    Some(k) => stream = Stream::open(c, Rect::new(x as i16, y as i16, w, h), k),
+                    None => c.begin_pixels(x, y, w, h),
+                },
+                Op::Pixels(s) => {
+                    let px = &self.u16s[s.range()];
+                    if cur.is_some() {
+                        stream.feed(px.len(), |i, n| c.write_pixels(&px[i..i + n]));
+                    } else {
+                        c.write_pixels(px)
+                    }
+                }
+                Op::Run { color, n } => {
+                    if cur.is_some() {
+                        stream.feed(n, |_, k| c.write_run(color, k));
+                    } else {
+                        c.write_run(color, n)
+                    }
+                }
                 Op::BlendSpan { x, y, color, alphas } => c.blend_span(x, y, color, &self.u8s[alphas.range()]),
                 Op::BlendRow { x, y, colors, alphas } => {
                     c.blend_row(x, y, &self.u16s[colors.range()], &self.u8s[alphas.range()])
@@ -223,6 +324,52 @@ impl List {
     }
 }
 
+/// A pixel stream cut to the scissor: the window's pixels arrive row-major,
+/// the part inside `vis` goes on (as the stream of a window that is `vis`).
+#[derive(Default)]
+struct Stream {
+    /// Window width, and the visible part relative to the window
+    /// (x0, y0, x1, y1); empty when nothing shows.
+    w: u32,
+    vis: (u32, u32, u32, u32),
+    /// Pixels of the window received.
+    pos: u32,
+}
+
+impl Stream {
+    fn open<C: Canvas>(c: &C, win: Rect, scissor: Rect) -> Stream {
+        let mut s = Stream { w: win.w as u32, vis: (0, 0, 0, 0), pos: 0 };
+        if let Some(v) = win.intersection(&scissor) {
+            c.begin_pixels(v.x as u16, v.y as u16, v.w, v.h);
+            let (x0, y0) = ((v.x - win.x) as u32, (v.y - win.y) as u32);
+            s.vis = (x0, y0, x0 + v.w as u32, y0 + v.h as u32);
+        }
+        s
+    }
+
+    /// `n` more pixels: `emit(i, k)` passes on pixels `i..i + k` of them.
+    fn feed(&mut self, n: usize, mut emit: impl FnMut(usize, usize)) {
+        if self.w == 0 {
+            return;
+        }
+        let (x0, y0, x1, y1) = self.vis;
+        let mut i = 0usize;
+        while i < n {
+            let (col, row) = (self.pos % self.w, self.pos / self.w);
+            let k = ((self.w - col) as usize).min(n - i);
+            if row >= y0 && row < y1 {
+                let a = col.max(x0);
+                let b = (col + k as u32).min(x1);
+                if b > a {
+                    emit(i + (a - col) as usize, (b - a) as usize);
+                }
+            }
+            self.pos += k as u32;
+            i += k;
+        }
+    }
+}
+
 /// What a canvas says about itself (the recorder repeats the target's).
 #[derive(Clone, Copy, Default)]
 struct Info {
@@ -273,6 +420,11 @@ impl Recorder {
         });
         self.scissor.set(target.scissor());
         true
+    }
+
+    /// End the recording (the list stays until the next `begin`).
+    pub fn end(&self) {
+        self.busy.set(false);
     }
 
     /// End the recording and replay it onto `target`.
@@ -442,5 +594,142 @@ impl Canvas for Recorder {
     }
     fn stroke_rounded_rect(&self, x: i16, y: i16, w: u16, h: u16, r: u16, t: u16, color: u16) {
         self.push(Op::StrokeRoundedRect { x, y, w, h, r, t, color });
+    }
+}
+
+/// FNV-1a over what a widget's drawing reads (`render::dl_key`).
+pub struct Hasher(u64);
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hasher {
+    pub const fn new() -> Self {
+        Hasher(0xcbf2_9ce4_8422_2325)
+    }
+    #[inline]
+    pub fn bytes(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0 ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    #[inline]
+    pub fn u8(&mut self, v: u8) {
+        self.bytes(&[v]);
+    }
+    #[inline]
+    pub fn u16(&mut self, v: u16) {
+        self.bytes(&v.to_le_bytes());
+    }
+    #[inline]
+    pub fn u32(&mut self, v: u32) {
+        self.bytes(&v.to_le_bytes());
+    }
+    #[inline]
+    pub fn i32(&mut self, v: i32) {
+        self.bytes(&v.to_le_bytes());
+    }
+    pub fn rect(&mut self, r: Rect) {
+        self.i32(r.x as i32);
+        self.i32(r.y as i32);
+        self.u16(r.w);
+        self.u16(r.h);
+    }
+    pub fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Bytes the cache may hold, and the largest list it keeps.
+pub const CACHE_BYTES: usize = 32 << 20;
+pub const ENTRY_BYTES: usize = 4 << 20;
+/// Lists kept at most; looks remembered as seen (forgotten when full).
+pub const CACHE_ENTRIES: usize = 4096;
+pub const SEEN_MAX: usize = 8192;
+
+struct Entry {
+    list: List,
+    bytes: usize,
+    used: u32,
+}
+
+/// Display lists by look (`render::dl_key`). A look is recorded on its
+/// second sighting (`seen`): one drawn once (an animation's frames) costs
+/// no recording. Least recently used lists go first past the caps.
+#[derive(Default)]
+pub struct Cache {
+    map: BTreeMap<u64, Entry>,
+    seen: BTreeSet<u64>,
+    bytes: usize,
+    clock: u32,
+}
+
+impl Cache {
+    pub const fn new() -> Self {
+        Cache { map: BTreeMap::new(), seen: BTreeSet::new(), bytes: 0, clock: 0 }
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.seen.clear();
+        self.bytes = 0;
+        BYTES.store(0, Ordering::Relaxed);
+    }
+
+    /// The list for `key`, marked used.
+    pub fn get(&mut self, key: u64) -> Option<&List> {
+        self.clock = self.clock.wrapping_add(1);
+        let clock = self.clock;
+        let e = self.map.get_mut(&key)?;
+        e.used = clock;
+        count(&HITS);
+        Some(&e.list)
+    }
+
+    /// Whether `key` was met before (and remember it). A miss counts as a
+    /// direct draw.
+    pub fn seen(&mut self, key: u64) -> bool {
+        if self.seen.contains(&key) {
+            return true;
+        }
+        if self.seen.len() >= SEEN_MAX {
+            self.seen.clear();
+        }
+        self.seen.insert(key);
+        count(&DIRECT);
+        false
+    }
+
+    /// Keep `list` for `key`, evicting the least recently used past the caps.
+    pub fn insert(&mut self, key: u64, list: List) {
+        let bytes = list.heap_bytes() + core::mem::size_of::<Entry>() + 32;
+        if bytes > ENTRY_BYTES {
+            return;
+        }
+        while !self.map.is_empty() && (self.bytes + bytes > CACHE_BYTES || self.map.len() >= CACHE_ENTRIES) {
+            let old = *self.map.iter().min_by_key(|(_, e)| e.used).unwrap().0;
+            if let Some(e) = self.map.remove(&old) {
+                self.bytes -= e.bytes;
+            }
+            count(&EVICTS);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(e) = self.map.insert(key, Entry { list, bytes, used: self.clock }) {
+            self.bytes -= e.bytes;
+        }
+        self.bytes += bytes;
+        count(&STORES);
+        BYTES.store(self.bytes as u32, Ordering::Relaxed);
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }

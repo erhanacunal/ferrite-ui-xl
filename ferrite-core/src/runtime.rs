@@ -1390,6 +1390,7 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: 
                 // (vsync wait + buffer flip) — synchronous by default, or
                 // deferred to a render thread by BSPs that override this.
                 P::present_buffered(ctx);
+                snapshot_fill(ctx, tasks);
             }
         }
         RenderMode::Dirty => {
@@ -1404,12 +1405,36 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: 
             run_paint(ctx, tasks, &paint);
             input.draw_overlay(ctx, false);
             ctx.lcd.flush_dirty();
+            snapshot_fill(ctx, tasks);
         }
         RenderMode::EPaper => {
             // EPD updates are driven exclusively by OP_W_RENDER inside the
             // program; the per-frame loop does nothing here.
         }
     }
+}
+
+/// After a render pass (`snapshot::TRACK`/`STALE`): record the values the
+/// render core will own in step 3, as this render left them: every prop under
+/// a running tween, and every scroll container's `scroll_y` (`snapshot.rs`).
+fn snapshot_fill<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks) {
+    if !crate::snapshot::tracking() {
+        if !ctx.objs.render.snapshot.is_empty() {
+            ctx.objs.render.snapshot.clear();
+        }
+        return;
+    }
+    let mut snap = core::mem::take(&mut ctx.objs.render.snapshot);
+    snap.clear();
+    each_task(ctx, tasks, |ctx, vm| vm.snapshot_anims(ctx, &mut snap));
+    ctx.objs.ensure_dfs();
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        if ctx.objs.get(id).flags & widget::FLAG_CLIP_CHILDREN != 0 {
+            snap.put(id, crate::proto::PROP_SCROLL_Y, Vm::get_scalar_prop_on(ctx, id, crate::proto::PROP_SCROLL_Y));
+        }
+    }
+    ctx.objs.render.snapshot = snap;
 }
 
 // ============================================================================

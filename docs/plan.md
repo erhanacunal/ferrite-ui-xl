@@ -143,6 +143,31 @@ pub struct DisplayList { cmds: Vec<DrawCmd>, arena: Vec<u8> }
 buradan yapılır, böylece "1 frame eski" semantiği sim'de önceden denenebilir.
 İlk iş: property animation ve `scroll_y` sahipliğini netleştirip C listesini kesinleştirmek.
 
+- [x] **Hazırlık** (2026-11-11): `ferrite-core/src/snapshot.rs`. C sınıfı prop id'ye göre değil, (widget, prop) çiftine göre her render pass'te belirlenir: çalışan bir tween'in prop'u ve her kaydırma kabının `scroll_y`'si (`layer_alpha` okuması VM'deki slot değerini verir, A'dır). `runtime::snapshot_fill` render fazının sonunda bunları `render.snapshot`'a yazar (`Vm::snapshot_anims` + DFS'te `FLAG_CLIP_CHILDREN`); `OP_W_GET` `Snapshot::read`'den geçer (boş snapshot = tek `is_empty` kontrolü): C okumalarını sayar (`snapshot::READS`), `snapshot::STALE` açıkken snapshot'tan cevaplar (`STALE_DIFF` = canlıdan farklı cevaplar). Sim: sayım hep açık (dump sonunda stderr), `FERRITE_SIM_STALE_READS=1` / `golden.py --stale`; exynos `POST /api/snapshot?track=&stale=`, `/api/status` `snapshot`. Test `reads_of_animated_props_come_from_the_render_snapshot_when_stale` (mutasyonla doğrulandı).
+  - Sonuç: hiçbir golden senaryosu C değeri okumuyor (sayaç 0), `--stale` ile 13/13 aynı; örnek `.fl`'lerde `get(scroll_y)` ya da animasyonlu prop okuması yok (kendi durumlarını tutuyorlar). 1 frame eski okuma mevcut uygulamaları bozmaz. Kartta bench 11.4 Minstr/s (değişmedi).
+
+## Adım 3 (taslak): Render ayrı çekirdekte
+
+Bulgular (2026-11-11):
+- Tablet ana ekranında ağaç küçük: nesne arena'sı ~20 KB (106 widget, 145 işaretçi).
+- GPU compositor (varsayılan) ekranın çoğunu `draw_widget`'tan geçirmeden çizer; display list'ler yalnız
+  CPU pass'lerinde (katmanlar, compositor'un reddettiği alanlar) oluşur (2e dump'ı: tablette yalnız pager'ın
+  listesi vardı).
+
+Seçenekler:
+- **A, ağaç kopyası:** VM çekirdeği her frame sonunda arena'nın kullanılan kısmını + işaretçi tablosunun canlı
+  kısmını render çekirdeğine kopyalar (~20 KB, onlarca µs). Render çekirdeği bugünkü `render_dirty` /
+  `compose` / katman kodunu kopya üzerinde çalıştırır; compositor, katmanlar, capture'lar birlikte taşınır.
+  İş: render'ın ağaca yazdıkları (dirty temizleme, `FLAG_RENDERED`, `SEC_PREV`, `SEC_DRAWN`, katman durumu,
+  `render.*`) render'a ait yan tablolara ayrılır; dirty/moved/changed bilgisi VM'den olay olarak gelir.
+- **B, liste:** render yürüyüşü (DFS, occluder, clip, restore) VM çekirdeğinde kalır, render çekirdeği yalnız
+  listeleri rasterize eder. Compositor'un da listelerden beslenmesi gerekir (GPU liste op'larını
+  tessellate eder ya da liste sprite'a çizilir). VM çekirdeği yürüyüşü ödemeye devam eder.
+
+Öneri: A. Kopya ucuz, compositor/katman yolları olduğu gibi taşınır, VM çekirdeğinde render işi kalmaz. Display
+list'ler render çekirdeğinin içinde (CPU pass'leri, `on_paint` listeleri) kalır. `on_paint` VM çekirdeğinde
+kaydedilip liste olarak gönderilir (2d).
+
 ### Riskler
 
 - 2a büyük ama mekanik (~150 çağrı noktası). `font`/`image` akışları en zor kısım.

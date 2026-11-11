@@ -68,7 +68,7 @@ def run(name, sc, img, env=None):
     if r.returncode != 0:
         raise RuntimeError(f"sim exited {r.returncode}: {r.stderr.strip()[-300:]}")
     for line in r.stderr.splitlines():
-        if line.startswith("sim: dl "):
+        if line.startswith("sim: dl ") or (line.startswith("sim: snapshot ") and not line.startswith("sim: snapshot reads 0 ")):
             print(f"     {name}: {line[5:]}")
     frames = {}
     for t in sc["dump"]:
@@ -101,6 +101,10 @@ def main():
     ap.add_argument("--dl", action="store_true",
                     help="draw widgets through cached display lists, verifying every hit (FERRITE_SIM_DL=1, "
                          "FERRITE_SIM_DL_VERIFY=1); must match the same golden frames")
+    ap.add_argument("--stale", action="store_true",
+                    help="answer reads of render-owned values (animated props, scroll offsets) from the last "
+                         "render's snapshot, as the render core will (FERRITE_SIM_STALE_READS=1); frames that "
+                         "differ show programs depending on reading them live")
     a = ap.parse_args()
 
     scenarios = json.loads(SCENARIOS.read_text(encoding="utf-8"))["scenarios"]
@@ -120,7 +124,12 @@ def main():
             print(f"SKIP {name}: {err}")
             skipped.append(name)
             continue
-        frames = run(name, sc, img, dict(os.environ, FERRITE_SIM_DL="1", FERRITE_SIM_DL_VERIFY="1") if a.dl else None)
+        env = dict(os.environ)
+        if a.dl:
+            env.update(FERRITE_SIM_DL="1", FERRITE_SIM_DL_VERIFY="1")
+        if a.stale:
+            env.update(FERRITE_SIM_STALE_READS="1")
+        frames = run(name, sc, img, env)
         if a.update:
             golden[name] = frames
             gdir = OUT / f"{name}.golden"

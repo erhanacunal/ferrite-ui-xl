@@ -159,6 +159,8 @@ pub(crate) struct RenderState {
     /// The look key each widget last drew with (dumps: a widget in a layer is
     /// keyed in layer coordinates, which a dump can't recompute).
     pub(crate) drawn_keys: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, u64>>,
+    /// Render-owned values as of the last render pass (`snapshot.rs`).
+    pub(crate) snapshot: crate::snapshot::Snapshot,
 }
 
 impl RenderState {
@@ -177,6 +179,7 @@ impl RenderState {
             painting: core::cell::Cell::new(false),
             paints: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             drawn_keys: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
+            snapshot: crate::snapshot::Snapshot::new(),
             geo: Vec::new(),
             geo_stack: Vec::new(),
             geo_valid: false,
@@ -197,6 +200,7 @@ impl RenderState {
         self.dl_cache.get_mut().clear();
         self.paints.get_mut().clear();
         self.drawn_keys.get_mut().clear();
+        self.snapshot.clear();
     }
 }
 

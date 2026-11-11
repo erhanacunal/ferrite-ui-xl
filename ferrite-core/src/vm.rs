@@ -2258,6 +2258,10 @@ impl Vm {
                 }
                 if self.target.is_some() {
                     let v = self.get_scalar_prop(ctx, prop_id);
+                    // A render-owned value (an animated prop, a scroll offset):
+                    // counted, and answered from the last render's snapshot when
+                    // `snapshot::STALE` models the render core (`snapshot.rs`).
+                    let v = ctx.objs.render.snapshot.read(self.target, prop_id, v);
                     self.push(v);
                 } else {
                     self.push(0);
@@ -3436,7 +3440,7 @@ impl Vm {
     /// `get_scalar_prop` lifted to a target-parameterized associated function
     /// so the animation engine can sample any widget without disturbing the
     /// VM's current `self.target`.
-    fn get_scalar_prop_on<P: Platform>(ctx: &Ctx<P>, target: WidgetId, prop_id: u8) -> i32 {
+    pub(crate) fn get_scalar_prop_on<P: Platform>(ctx: &Ctx<P>, target: WidgetId, prop_id: u8) -> i32 {
         let w = ctx.objs.get(target);
         // One extension lookup for all ext props; no extension reads as the defaults.
         let e = &ctx.objs.ext(target);
@@ -3617,6 +3621,14 @@ impl Vm {
     /// (yoyo); one-shot tweens deactivate and fire their `on_end` callback.
     /// Called every main-loop iteration regardless of `self.state`.
     #[inline(never)]
+    /// Record every prop under a running tween, as it is now, in `snap`
+    /// (render-owned in step 3: `snapshot.rs`, `runtime::snapshot_fill`).
+    pub(crate) fn snapshot_anims<P: Platform>(&self, ctx: &Ctx<P>, snap: &mut crate::snapshot::Snapshot) {
+        for a in self.anims.iter().filter(|a| a.active) {
+            snap.put(a.target, a.prop_id, Self::get_scalar_prop_on(ctx, a.target, a.prop_id));
+        }
+    }
+
     pub fn tick_animations<P: Platform>(&mut self, ctx: &mut Ctx<P>, now: u32) {
         let mut any_done = false;
         let n = self.anims.len();
@@ -4214,6 +4226,48 @@ mod anim_tests {
         vm.tick_animations(&mut ctx, 1100);
         assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_LOC_X), 100);
         assert!(vm.anims.is_empty(), "completed one-shot tween must be retired");
+    }
+
+    /// `W_GET` of an animated prop: the live value, counted as a render-owned
+    /// read; with `snapshot::STALE`, the value the last render's snapshot holds.
+    #[test]
+    fn reads_of_animated_props_come_from_the_render_snapshot_when_stale() {
+        use crate::snapshot::{READS, STALE, STALE_DIFF, Snapshot};
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut ctx = mock_ctx();
+        let id = one_widget(&mut ctx);
+        let other = one_widget(&mut ctx);
+        assert!(id.0 < 256 && other.0 < 256);
+        Vm::set_scalar_prop_on(&mut ctx, id, PROP_LOC_X, 0);
+        Vm::set_scalar_prop_on(&mut ctx, other, PROP_LOC_X, 7);
+        let mut tweens = Vm::new();
+        tweens.start_anim(&ctx, id, PROP_LOC_X, 100, 100, 0, 0, 1000);
+        tweens.tick_animations(&mut ctx, 1050);
+        // The render pass: the snapshot holds 50.
+        let mut snap = Snapshot::new();
+        tweens.snapshot_anims(&ctx, &mut snap);
+        assert_eq!(snap.get(id, PROP_LOC_X), Some(50));
+        ctx.objs.render.snapshot = snap;
+        tweens.tick_animations(&mut ctx, 1075);
+        // g0 = id.loc_x, g1 = other.loc_x
+        let code = [
+            OP_W_TARGET, id.0 as u8, OP_W_GET, PROP_LOC_X, OP_STORE, 0,
+            OP_W_TARGET, other.0 as u8, OP_W_GET, PROP_LOC_X, OP_STORE, 1, OP_HALT,
+        ];
+        let run = |ctx: &mut Ctx<MockPlatform>| {
+            let mut vm = cb_vm(&code);
+            vm.tick(ctx, 100);
+            (vm.var_get(0), vm.var_get(1))
+        };
+        let reads = READS.load(Relaxed);
+        assert_eq!(run(&mut ctx), (75, 7), "live by default");
+        assert_eq!(READS.load(Relaxed) - reads, 1, "one render-owned read");
+        STALE.store(true, Relaxed);
+        let diff = STALE_DIFF.load(Relaxed);
+        let got = run(&mut ctx);
+        STALE.store(false, Relaxed);
+        assert_eq!(got, (50, 7), "the last render's value; plain props stay live");
+        assert_eq!(STALE_DIFF.load(Relaxed) - diff, 1);
     }
 
     #[test]

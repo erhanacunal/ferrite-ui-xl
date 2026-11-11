@@ -12,6 +12,7 @@
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
+//! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
@@ -366,6 +367,24 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 _ => text(socket, "400 Bad Request", "percent=0..100
 ").await?,
+            }
+        }
+        (b"POST", b"/api/snapshot") => {
+            // Render-owned reads (`ferrite_core::snapshot`): count them (`track`), answer
+            // them from the last render's snapshot (`stale`).
+            use core::sync::atomic::Ordering;
+            use ferrite_core::snapshot;
+            let mut ok = false;
+            for (key, flag) in [(&b"track"[..], &snapshot::TRACK), (&b"stale"[..], &snapshot::STALE)] {
+                if let Some(v @ (b"0" | b"1")) = query_param(query, key) {
+                    flag.store(v == b"1", Ordering::Relaxed);
+                    ok = true;
+                }
+            }
+            if ok {
+                text(socket, "200 OK", "snapshot set\n").await?;
+            } else {
+                text(socket, "400 Bad Request", "track=0|1 and/or stale=0|1\n").await?;
             }
         }
         (b"POST", b"/api/dl") => {
@@ -826,6 +845,18 @@ fn status_json() -> String {
         );
     }
     let _ = write!(s, ",\"cpu_mhz\":{}", crate::cpuclock::mhz());
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        use ferrite_core::snapshot;
+        let _ = write!(
+            s,
+            ",\"snapshot\":{{\"track\":{},\"stale\":{},\"reads\":{},\"stale_differing\":{}}}",
+            snapshot::TRACK.load(Relaxed),
+            snapshot::stale(),
+            snapshot::READS.load(Relaxed),
+            snapshot::STALE_DIFF.load(Relaxed)
+        );
+    }
     {
         // Display lists (`/api/dl`): counters since boot, bytes held now.
         use core::sync::atomic::Ordering::Relaxed;

@@ -51,6 +51,12 @@ fn main() {
     if std::env::var_os("FERRITE_SIM_DL").is_some() {
         ferrite_core::dl::ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
     }
+    // Render-owned reads (`snapshot.rs`) are always counted here (printed at the end of a
+    // dump run); `FERRITE_SIM_STALE_READS=1` answers them from the last render's snapshot.
+    ferrite_core::snapshot::TRACK.store(true, core::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("FERRITE_SIM_STALE_READS").is_some() {
+        ferrite_core::snapshot::STALE.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
 
     systick::init();
     if let Some(d) = &dump {

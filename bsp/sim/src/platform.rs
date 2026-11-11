@@ -263,6 +263,7 @@ impl PlatformRuntime for SimPlatform {
                     }
                     if d.next == d.at.len() {
                         print_dl_stats();
+                        print_snapshot_stats();
                         std::process::exit(0);
                     }
                     systick::sim::advance(d.step_ms);
@@ -314,6 +315,18 @@ fn all_lists(ctx: &mut Ctx<SimPlatform>) -> String {
         let _ = dl_dump(ctx, Some(id), &mut s);
     }
     s
+}
+
+/// Render-owned reads (`snapshot.rs`, stderr).
+fn print_snapshot_stats() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use ferrite_core::snapshot;
+    eprintln!(
+        "sim: snapshot reads {} stale-differing {}{}",
+        snapshot::READS.load(Relaxed),
+        snapshot::STALE_DIFF.load(Relaxed),
+        if snapshot::stale() { " (stale reads on)" } else { "" }
+    );
 }
 
 /// Display-list cache counters (stderr; with `FERRITE_SIM_DL`).

@@ -26,13 +26,6 @@ pub trait LcdBackend {
     /// (`caps.alpha` / `caps.image_alpha`).
     const HAS_ALPHA: bool = false;
 
-    /// Anti-alias circles, rings, arcs, rounded rects and lines without
-    /// readback: edge pixels are mixed against the colour the renderer says
-    /// lies underneath (`LcdImpl::set_underlay`) and written opaque. For
-    /// write-only panels (Nextion). Integer-only — ellipses and polygon fills
-    /// stay aliased. Irrelevant when `HAS_ALPHA` is set.
-    const AA_UNDERLAY: bool = false;
-
     fn begin_frame(&mut self);
     fn end_frame(&mut self);
     fn back_buf(&self) -> u8;
@@ -198,9 +191,6 @@ pub struct LcdImpl<B: LcdBackend> {
     /// geometry-drawing shape primitives, which take no clip of their own.
     /// `None` (the normal case) is a single branch with no other cost.
     scissor: Cell<Option<Rect>>,
-    /// What lies under the shape being drawn, for `AA_UNDERLAY` backends;
-    /// `None` = unknown, draw aliased.
-    underlay: Cell<Option<Underlay>>,
     /// Portrait mode (image header flag): the framework draws on a
     /// `HEIGHT`x`WIDTH` logical screen, mapped onto the panel rotated 90°
     /// (logical top = the panel's right edge): `(x, y)` -> `(WIDTH-1-y, x)`.
@@ -228,24 +218,6 @@ struct RotStream {
     left: u16,
     /// Current row lies on screen (rows past the bottom are discarded).
     vis: bool,
-}
-
-/// Colours known to lie under a shape, for anti-aliasing without readback
-/// (`LcdBackend::AA_UNDERLAY`): `outer` behind its outer edge, `inner` in a
-/// ring's hole (e.g. a border drawn over its widget's fill), `sweep` past an
-/// arc's ends (e.g. a gauge value arc over its track).
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Underlay {
-    pub outer: u16,
-    pub inner: u16,
-    pub sweep: u16,
-}
-
-impl Underlay {
-    /// One colour under every edge.
-    pub const fn solid(c: u16) -> Self {
-        Underlay { outer: c, inner: c, sweep: c }
-    }
 }
 
 /// Splits a move of `rects` by (`dx`, `dy`) (`LcdBackend::move_rects`:
@@ -294,7 +266,6 @@ impl<B: LcdBackend> LcdImpl<B> {
         Self {
             be,
             scissor: Cell::new(None),
-            underlay: Cell::new(None),
             portrait: Cell::new(false),
             stream: Cell::new(RotStream::default()),
             target: Cell::new(None),
@@ -498,46 +469,16 @@ impl<B: LcdBackend> LcdImpl<B> {
     }
 
     /// Whether lines/circles/arcs/rounded rects are drawn anti-aliased
-    /// (`smooth.rs`) right now: always on readback backends; on
-    /// `AA_UNDERLAY` ones while an underlay is set.
+    /// (`smooth.rs`): on readback backends.
     #[inline]
     pub fn smooth(&self) -> bool {
-        B::HAS_ALPHA || (B::AA_UNDERLAY && self.underlay.get().is_some())
+        B::HAS_ALPHA
     }
 
-    /// `smooth()` for an ellipse primitive: without readback only circles
-    /// (`round`) are anti-aliased.
+    /// `smooth()` for an ellipse primitive.
     #[inline]
-    fn smooth_round(&self, round: bool) -> bool {
-        B::HAS_ALPHA || (B::AA_UNDERLAY && round && self.underlay.get().is_some())
-    }
-
-    /// Set what lies under the next shapes (`AA_UNDERLAY` backends; the
-    /// renderer sets it per widget). `None` = unknown: those backends then
-    /// draw aliased (e.g. VM `on_paint` drawing).
-    #[inline]
-    pub fn set_underlay(&self, u: Option<Underlay>) {
-        self.underlay.set(u);
-    }
-
-    #[inline]
-    pub fn underlay(&self) -> Option<Underlay> {
-        self.underlay.get()
-    }
-
-    /// Whether the renderer should supply underlays (`AA_UNDERLAY` without
-    /// readback).
-    #[inline]
-    pub fn wants_underlay(&self) -> bool {
-        B::AA_UNDERLAY && !B::HAS_ALPHA
-    }
-
-    /// Replace the underlay's colours if one is set (keeps "unknown" as is).
-    #[inline]
-    pub fn update_underlay(&self, f: impl FnOnce(Underlay) -> Underlay) {
-        if let Some(u) = self.underlay.get() {
-            self.underlay.set(Some(f(u)));
-        }
+    fn smooth_round(&self, _round: bool) -> bool {
+        B::HAS_ALPHA
     }
 
     /// Set (or clear) the scissor rect honored by `fill_rect`/`draw_pixel`.
@@ -889,14 +830,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
-    /// `draw_polyline` without anti-aliasing (e.g. a polygon outline over an
-    /// aliased fill on a write-only backend, where a soft inner edge would
-    /// mix toward the wrong colour).
+    /// `draw_polyline` for an outline over an aliased fill. Without the
+    /// write-only (underlay) path this is plain `draw_polyline`.
     pub fn draw_polyline_hard(&self, points: &[Offset], color: u16, closed: bool, thickness: u16) {
-        // Without an underlay only readback backends stay smooth.
-        let u = self.underlay.take();
         self.draw_polyline(points, color, closed, thickness);
-        self.underlay.set(u);
     }
 
     /// Tapered stroke from `a` (radius `ra_q8`, 1/256 px) to `b` (radius

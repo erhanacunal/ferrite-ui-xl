@@ -149,14 +149,9 @@ impl LcdBackend for SimLcd {
     const WIDTH: u16 = WIDTH;
     const HEIGHT: u16 = HEIGHT;
 
-    // The sim deliberately supports alpha even though nextion.json says
-    // caps.alpha = false: it is the host test vehicle for the tdo_y13
-    // framebuffer path. Build with `--features no-readback` to render like
-    // the Nextion instead (no blending; underlay anti-aliasing).
-    const HAS_ALPHA: bool = !cfg!(feature = "no-readback");
-    const AA_UNDERLAY: bool = cfg!(feature = "no-readback");
-    // Moving pixels needs readback too.
-    const CAN_MOVE: bool = !cfg!(feature = "no-readback");
+    // Readback framebuffer, like the Exynos shadow buffer.
+    const HAS_ALPHA: bool = true;
+    const CAN_MOVE: bool = true;
 
     fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
         if self.fb.layers.target().is_some() {

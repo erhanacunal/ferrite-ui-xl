@@ -3,7 +3,7 @@ use crate::ctx::Ctx;
 use crate::lcd::{self};
 use crate::types::{Color, Edges, Offset, Rect};
 use crate::pool::ObjPool;
-use crate::lcd::{LcdBackend, LcdImpl, Underlay};
+use crate::lcd::{LcdBackend, LcdImpl};
 use crate::platform::Platform;
 use crate::renderer::WidgetRenderer;
 use crate::widget::{
@@ -1659,14 +1659,6 @@ fn draw_widget_body<P: Platform>(
     } else {
         0
     };
-    // Write-only backends anti-alias against known colours: what is behind
-    // this widget, and (for its contents) its own background.
-    let back = backdrop(&ctx.objs, widget, P::DEFAULT_BG_COLOR);
-    let content_bg = if draw_bg { bg_color } else { back };
-    if ctx.lcd.wants_underlay() {
-        ctx.lcd.set_underlay(Some(Underlay::solid(back)));
-    }
-
     if r > 0 {
         // The rounded primitives take no clip, so confine them to the clip
         // region via the LCD scissor, once per (disjoint) clip rect. Without
@@ -1679,8 +1671,7 @@ fn draw_widget_body<P: Platform>(
                 // Anti-aliased: background first, then one border ring over
                 // it. The fill reaches halfway under the ring, so the ring's
                 // soft inner edge blends over the background rather than over
-                // what is behind the widget (without readback: mixes with the
-                // fill colour, its outer edge with the backdrop).
+                // what is behind the widget.
                 //
                 // Readback backends draw the whole box, partly off the screen
                 // or not (see `fill_rounded_rect_screen`); write-only backends
@@ -1712,7 +1703,6 @@ fn draw_widget_body<P: Platform>(
                         }
                     }
                 }
-                ctx.lcd.update_underlay(|u| Underlay { inner: content_bg, ..u });
                 ctx.lcd.stroke_rounded_rect(
                     outer.x,
                     outer.y,
@@ -1722,7 +1712,6 @@ fn draw_widget_body<P: Platform>(
                     bw as u16,
                     widget.border_color,
                 );
-                ctx.lcd.update_underlay(|_| Underlay::solid(back));
                 continue;
             }
             for i in 0..bw {
@@ -1795,9 +1784,6 @@ fn draw_widget_body<P: Platform>(
             }
         }
     }
-
-    // Contents (indicators, arcs, curves) sit on the widget's own background.
-    ctx.lcd.update_underlay(|_| Underlay::solid(content_bg));
 
     // Background image. KIND_GRAPH repurposes ext.image_id as graph flags,
     // and KIND_IMAGE draws its image centered below, so skip both here.
@@ -1917,9 +1903,6 @@ fn draw_widget_body<P: Platform>(
         }
         ctx.lcd.set_scissor(None);
     }
-    // Unknown again: VM drawing (on_paint) stays aliased on write-only
-    // backends rather than mixing against a stale colour.
-    ctx.lcd.set_underlay(None);
 }
 
 /// Colour painted behind widget `w`: its nearest ancestor that paints a
@@ -2032,13 +2015,7 @@ fn draw_smooth_oval_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, ext:
         );
     }
     if stroke {
-        // Without readback the ring's inner edge mixes with the fill.
-        let base = lcd.underlay();
-        if widget.background_color != 0 {
-            lcd.update_underlay(|u| Underlay { inner: widget.background_color, ..u });
-        }
         lcd.draw_oval(bx.x, bx.y, bx.w, bx.h, t, widget.border_color);
-        lcd.set_underlay(base);
     }
 }
 
@@ -2793,11 +2770,7 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, g: &GaugeGeom, e
         } else {
             (value_angle % 360) as i16
         };
-        // Without readback the value arc's leading end mixes with the track.
-        let base = lcd.underlay();
-        lcd.update_underlay(|u| Underlay { sweep: track_color, ..u });
         lcd.fill_arc(cx, cy, g.outer_r, g.inner_r, GAUGE_ARC_START, end, ext.press_color);
-        lcd.set_underlay(base);
     }
 
     // Tick marks at 0%, 25%, 50%, 75%, 100%, outside the arc
@@ -3475,7 +3448,7 @@ mod tests {
     }
 
     /// 128×128 frame buffer; `ALPHA` = readback backend (blends), else
-    /// write-only with underlays (Nextion).
+    /// write-only (aliased shapes).
     struct Fb<const ALPHA: bool> {
         px: core::cell::RefCell<alloc::vec::Vec<u16>>,
     }
@@ -3484,7 +3457,6 @@ mod tests {
         const WIDTH: u16 = FB as u16;
         const HEIGHT: u16 = FB as u16;
         const HAS_ALPHA: bool = ALPHA;
-        const AA_UNDERLAY: bool = !ALPHA;
         fn begin_frame(&mut self) {}
         fn end_frame(&mut self) {}
         fn back_buf(&self) -> u8 {
@@ -3525,16 +3497,12 @@ mod tests {
         e.press_color = 0x05FF;
         e.text_color = 0xF800;
         let g = GaugeGeom::new(&GAUGE_BOX).unwrap();
-        if lcd.wants_underlay() {
-            lcd.set_underlay(Some(Underlay::solid(GAUGE_BG)));
-        }
         for r in rects {
             lcd.set_scissor(Some(*r));
             lcd.fill_rect(GAUGE_BOX.x as u16, GAUGE_BOX.y as u16, GAUGE_BOX.w, GAUGE_BOX.h, GAUGE_BG);
             draw_gauge(lcd, &w, &g, &e);
         }
         lcd.set_scissor(None);
-        lcd.set_underlay(None);
     }
 
     fn fresh<const ALPHA: bool>() -> LcdImpl<Fb<ALPHA>> {

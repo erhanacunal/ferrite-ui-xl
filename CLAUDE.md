@@ -1,4 +1,17 @@
-# CLAUDE.md — ferrite-ui
+# CLAUDE.md — ferrite-ui-xl
+
+ferrite-ui for RAM-rich, multi-core devices (first target: Exynos 4412 tablet). Plan: `docs/plan.md`.
+
+**Differences from ferrite-ui (read these first; the sections below are inherited and still describe ferrite-ui where they disagree):**
+- Targets: `bsp/exynos4412` and `bsp/sim` only. The sim is always 1280×800 with a readback framebuffer.
+- Always compiled (no longer features): `layers`, `multi_program`, `perf`, `fast_vm`, `superops`, `render_cache`, `wide_obj`, `wide_code`, `pool_large`, `audio`. Remaining core features: `host`, `mock`, `external_alloc`, `jpeg`.
+- Removed: `epaper`, `sdcard`, `sdboot` (+ `sdcard.rs`, `fat.rs`, `sdboot.rs`), the write-only anti-aliasing path (`LcdBackend::AA_UNDERLAY`, `Underlay`, `set_underlay`), the sim's `no-readback`/`tablet` features.
+- Compiler, `.fl` library and Designer are NOT in this repo: they stay in ferrite-ui (single source). Examples include `../ferrite-ui/lib`; `sim.bat` uses `%FERRITE_UI%` (default `..errite-ui`). XL-only bytecode is enabled through device caps (`caps.*`).
+- Tests: `cargo test -p ferrite-core --features host,mock`. Firmware: `cd bsp/exynos4412 && cargo build --release` (or `exynos4412.ps1`).
+
+---
+
+# (inherited) ferrite-ui
 
 Bare-metal HMI framework written in Rust for the Nextion NX8048K070 display.
 

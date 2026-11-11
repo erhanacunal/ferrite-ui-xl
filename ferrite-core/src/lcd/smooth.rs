@@ -1,10 +1,6 @@
 //! Anti-aliased ("smooth") primitives. The public `LcdImpl` primitives route
 //! here on blend-capable backends (`LcdBackend::HAS_ALPHA`), where edge pixels
-//! go through `blend_pixel`, and — for the integer-only subset (circles,
-//! rings, arcs, rounded rects, lines) — on write-only backends that opt into
-//! `LcdBackend::AA_UNDERLAY`, where each edge pixel is mixed against the
-//! colour the renderer says lies underneath (`LcdImpl::set_underlay`) and
-//! written opaque. Solid interiors stay as `fill_rect` spans either way, so
+//! go through `blend_pixel`. Solid interiors stay as `fill_rect` spans, so
 //! filled shapes cost about the same as their aliased versions.
 //!
 //! Coverage conventions follow TFT_eSPI's smooth graphics, which this module
@@ -58,7 +54,7 @@
 //! either expressed or implied, of the FreeBSD Project.
 //! ---------------------------------------------------------------------------
 
-use super::{LcdBackend, LcdImpl, Underlay, isqrt, lerp_rgb565, sin_cos_deg};
+use super::{LcdBackend, LcdImpl, isqrt, lerp_rgb565, sin_cos_deg};
 use crate::types::Offset;
 use alloc::vec::Vec;
 
@@ -113,8 +109,7 @@ fn mul8(a: u8, b: u8) -> u8 {
 
 /// Coverage of one pixel by a shape's edges: the outer edge `o`, a ring's
 /// hole edge `i` and an arc's end edge `a` (255 = not on that edge). The
-/// pixel's coverage is their product; without readback, each partial edge
-/// mixes against its own underlay colour (`Underlay`).
+/// pixel's coverage is their product.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Cov {
     o: u8,
@@ -392,35 +387,13 @@ enum Seg {
 }
 
 impl<B: LcdBackend> LcdImpl<B> {
-    /// Draw an edge pixel with coverage `c` (and widget `alpha`): blended
-    /// over the frame buffer on readback backends, else mixed against the
-    /// underlay of the edge that is partial and written opaque.
+    /// Draw an edge pixel with coverage `c` (and widget `alpha`), blended
+    /// over the frame buffer.
     fn aa_cov(&self, x: i32, y: i32, color: u16, c: Cov, alpha: u8) {
-        if B::HAS_ALPHA {
-            let a = mul8(c.total(), alpha);
-            if a != 0 {
-                self.blend_pixel(x as u16, y as u16, color, a);
-            }
-            return;
+        let a = mul8(c.total(), alpha);
+        if a != 0 {
+            self.blend_pixel(x as u16, y as u16, color, a);
         }
-        let total = c.total();
-        if total == 0 {
-            return;
-        }
-        // What shows through is behind the partial edge. Where several
-        // edges are partial at once (thin rings, arc corners) it is a mix;
-        // the outer underlay is the closest single colour.
-        let u = self.underlay.get().unwrap_or(Underlay::solid(0));
-        let partial = (c.o < 255) as u8 + (c.i < 255) as u8 + (c.a < 255) as u8;
-        let back = if partial > 1 || c.o < 255 {
-            u.outer
-        } else if c.i < 255 {
-            u.inner
-        } else {
-            u.sweep
-        };
-        let total = mul8(total, alpha);
-        self.draw_pixel(x as u16, y as u16, lerp_rgb565(back, color, total as u16, 255));
     }
 
     #[inline]
@@ -435,12 +408,8 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
         if alpha == 255 {
             self.hline_clipped(x0 as i16, x1 as i16, y as i16, color);
-        } else if B::HAS_ALPHA {
-            self.blend_rect(l as u16, y as u16, (x1 - l + 1) as u16, 1, color, alpha);
         } else {
-            let back = self.underlay.get().map_or(0, |u| u.outer);
-            let c = lerp_rgb565(back, color, alpha as u16, 255);
-            self.hline_clipped(x0 as i16, x1 as i16, y as i16, c);
+            self.blend_rect(l as u16, y as u16, (x1 - l + 1) as u16, 1, color, alpha);
         }
     }
 
@@ -1840,107 +1809,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Write-only grid (`AA_UNDERLAY`): records each pixel's colour and
-    /// write count. Blends are not available, so nothing may call them.
-    struct UlGrid {
-        color: RefCell<Vec<u16>>,
-        hits: RefCell<Vec<u8>>,
-    }
-    impl LcdBackend for UlGrid {
-        const WIDTH: u16 = N as u16;
-        const HEIGHT: u16 = N as u16;
-        const AA_UNDERLAY: bool = true;
-        fn begin_frame(&mut self) {}
-        fn end_frame(&mut self) {}
-        fn back_buf(&self) -> u8 {
-            0
-        }
-        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16) {
-            for yy in y as usize..(y as usize + h as usize).min(N) {
-                for xx in x as usize..(x as usize + w as usize).min(N) {
-                    self.color.borrow_mut()[yy * N + xx] = c;
-                    self.hits.borrow_mut()[yy * N + xx] += 1;
-                }
-            }
-        }
-        fn blend_rect(&self, _: u16, _: u16, _: u16, _: u16, _: u16, _: u8) {
-            panic!("blend on a write-only backend");
-        }
-        fn blend_pixel(&self, _: u16, _: u16, _: u16, _: u8) {
-            panic!("blend on a write-only backend");
-        }
-        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
-        fn write_pixel(&self, _: u16) {}
-        fn send_command(&self, _: u16) {}
-        fn send_data(&self, _: u16) {}
-    }
-
-    /// Draw on a fresh write-only grid pre-filled with `under`; returns
-    /// (colour, write counts).
-    fn draw_ul(under: Option<Underlay>, f: impl Fn(&LcdImpl<UlGrid>)) -> (Vec<u16>, Vec<u8>) {
-        let fill = under.map_or(0, |u| u.outer);
-        let lcd = LcdImpl::with_backend(UlGrid {
-            color: RefCell::new(alloc::vec![fill; N * N]),
-            hits: RefCell::new(alloc::vec![0; N * N]),
-        });
-        lcd.set_underlay(under);
-        f(&lcd);
-        let be = lcd.backend();
-        (be.color.borrow().clone(), be.hits.borrow().clone())
-    }
-
-    #[test]
-    fn underlay_edges_are_mixes_of_the_alpha_coverage() {
-        // Same shape on a blending grid gives the coverage; without readback
-        // each pixel must be exactly underlay ⊕ colour at that coverage.
-        let (under, ink) = (0x18E3u16, 0xFD20u16);
-        let cases: [(&str, fn(&LcdImpl<AlphaGrid>), fn(&LcdImpl<UlGrid>)); 4] = [
-            ("circle", |l| l.fill_circle(48, 48, 30, 0xFD20), |l| l.fill_circle(48, 48, 30, 0xFD20)),
-            ("rrect", |l| l.fill_rounded_rect(10, 20, 70, 40, 15, 0xFD20), |l| l.fill_rounded_rect(10, 20, 70, 40, 15, 0xFD20)),
-            ("line", |l| l.draw_line_thick(5, 10, 90, 70, 0xFD20, 3), |l| l.draw_line_thick(5, 10, 90, 70, 0xFD20, 3)),
-            ("arc", |l| l.fill_arc(48, 48, 40, 30, 135, 45, 0xFD20), |l| l.fill_arc(48, 48, 40, 30, 135, 45, 0xFD20)),
-        ];
-        for (what, fa, fu) in cases {
-            let (cov, _) = draw(|l| fa(l));
-            let (col, hits) = draw_ul(Some(Underlay::solid(under)), |l| fu(l));
-            assert_single_hits(&hits, what);
-            for p in 0..N * N {
-                let want = if cov[p] == 0 { under } else { lerp_rgb565(under, ink, cov[p] as u16, 255) };
-                assert_eq!(col[p], want, "{what}: pixel ({}, {})", p % N, p / N);
-            }
-        }
-    }
-
-    #[test]
-    fn ring_hole_edge_mixes_with_the_inner_underlay() {
-        // White fill inside, black outside, blue ring: inner-edge pixels are
-        // white⊕blue (R = G/2 > 0 or pure blue), outer-edge black⊕blue (R = G = 0).
-        let u = Underlay { outer: 0x0000, inner: 0xFFFF, sweep: 0x0000 };
-        let (col, hits) = draw_ul(Some(u), |l| l.stroke_ellipse(48, 48, 40, 40, 6, 0x001F));
-        for y in 0..N {
-            for x in 0..N {
-                if hits[y * N + x] == 0 {
-                    continue;
-                }
-                let c = col[y * N + x];
-                let d = libm::sqrt(((x as f64 - 48.0).powi(2) + (y as f64 - 48.0).powi(2)) as f64);
-                let (r, g) = (c >> 11, (c >> 5) & 0x3F);
-                if d > 30.0 && d < 37.5 && c != 0x001F {
-                    assert!(r > 0 && (g as i32 / 2 - r as i32).abs() <= 1, "({x},{y}) d={d:.1}: {c:#06x} not white⊕blue");
-                }
-                if d > 38.0 && d < 42.0 {
-                    assert!(r == 0 && g == 0, "({x},{y}) d={d:.1}: {c:#06x} not black⊕blue");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn no_underlay_draws_aliased() {
-        let (col, _) = draw_ul(None, |l| l.fill_circle(48, 48, 30, 0xFD20));
-        assert!(col.iter().all(|&c| c == 0 || c == 0xFD20), "mixed pixel without an underlay");
     }
 
     #[test]

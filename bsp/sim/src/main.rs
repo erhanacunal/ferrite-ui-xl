@@ -101,6 +101,7 @@ fn main() {
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
         eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(eeprom_path)),
         cursor_visible: false,
+        tasks: ferrite_core::task::TaskTable::new(),
     });
 
     platform::install_host(window, fb.clone(), mouse.clone(), taps);

@@ -696,11 +696,6 @@ impl Image {
 // ImageList — application-wide image registry
 // ============================================================
 
-/// Maximum number of loaded images (~24 B of metadata each): 8 on small
-/// boards, 64 on the RAM-rich ones (`pool_large`) and the host.
-#[cfg(not(any(feature = "pool_large", feature = "host")))]
-const MAX_IMAGES: usize = 8;
-#[cfg(any(feature = "pool_large", feature = "host"))]
 const MAX_IMAGES: usize = 64;
 
 /// Application-wide image list. Holds loaded image metadata and supports

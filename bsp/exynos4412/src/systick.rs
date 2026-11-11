@@ -43,11 +43,9 @@ const MS_MUL: u128 = ((1u128 << MS_SHIFT) + COUNTS_PER_MS as u128 / 2) / COUNTS_
 /// store may leave an older `LAST`, which is still a past value within range.
 pub fn now() -> u64 {
     // Profiler: time the register read on CPU0 (its counters are CPU0-only).
-    #[cfg(feature = "perf")]
     let t0 = (exynos_4412_rs::cpu::id() == 0).then(crate::perf::cycles);
     let last = LAST.load(Ordering::Relaxed);
     let lo = Mct::new().count_low();
-    #[cfg(feature = "perf")]
     if let Some(t0) = t0 {
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::TIMER, crate::perf::cycles().wrapping_sub(t0));
     }

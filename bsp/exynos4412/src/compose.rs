@@ -854,7 +854,6 @@ impl State {
         let objs = &ctx.objs;
         let w = objs.get(id);
         let r = R::of(abs);
-        #[cfg(feature = "layers")]
         if let Some(s) = objs.composed_root(id) {
             // A composed layer's root: its surface (premultiplied ARGB), times the plane alpha.
             let screen = R { x0: 0, y0: 0, x1: ctx.lcd.width() as i32, y1: ctx.lcd.height() as i32 };
@@ -994,7 +993,6 @@ impl State {
     /// screen. The texture starts at that part (from the 64-byte boundary before it), so it
     /// is at most a screen wide: the fragment shader's texel coordinates are exact across
     /// 1280 texels (`gpu.rs` self-test), not across a 2560-wide pager. False to decline.
-    #[cfg(feature = "layers")]
     fn layer(&mut self, objs: &ObjPool, ui: &Ui, s: usize, r: &R, screen: &R) -> bool {
         let slot = &objs.layers.slots[s];
         let shown = r.meet(screen);
@@ -1536,7 +1534,6 @@ impl State {
             }
         };
         let tex = Tex { addr: px, w, h, stride: stride * 4, fmt: Fmt::Argb };
-        #[cfg(feature = "perf")]
         ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_BLITS, 1);
         self.flat(R::of(abs), abs.x as i32, abs.y as i32, tex, 0);
         Some(())
@@ -1577,7 +1574,6 @@ impl State {
 
     /// One frame over `c` (whole tiles, inside the shadow).
     fn frame(&mut self, ui: &Ui, gpu: &mut Gpu, c: &R) -> Result<(), gpu::Error> {
-        #[cfg(feature = "perf")]
         let t0 = crate::perf::cycles();
         let started = now_us();
         let first = self.items.iter().rposition(|it| it.opaque.is_some_and(|o| o.contains(c))).unwrap_or(0);
@@ -1625,7 +1621,6 @@ impl State {
             add_time(T_HW, t.total_us);
         }
         add_time(T_FRAME, now_us() - started);
-        #[cfg(feature = "perf")]
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
         shown.map(|_| ())
     }

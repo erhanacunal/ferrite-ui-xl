@@ -11,8 +11,6 @@ use crate::gpio::{GpioBackend, MODE_INPUT_PULLDOWN, MODE_INPUT_PULLUP, MODE_OUTP
 use crate::lcd::LcdBackend;
 use crate::platform::Platform;
 use crate::rtc::{DateTime, RtcBackend};
-#[cfg(feature = "sdcard")]
-use crate::sdcard::{CardType, SdCardBackend, SdError};
 use crate::systick::SystickBackend;
 use crate::touch::{CalParams, TouchBackend};
 use crate::usart::UsartBackend;
@@ -100,19 +98,6 @@ impl RtcBackend for MockRtc {
     fn clear_vl_flag(&self) {}
 }
 
-#[cfg(feature = "sdcard")]
-pub struct MockSdCard;
-#[cfg(feature = "sdcard")]
-impl SdCardBackend for MockSdCard {
-    fn card_type(&self) -> CardType {
-        CardType::SdHc
-    }
-    fn read_block(&self, _block: u32, _buf: &mut [u8; 512]) -> Result<(), SdError> {
-        Err(SdError::InitFailed)
-    }
-    fn release_bus(&self) {}
-    fn acquire_bus(&self) {}
-}
 
 /// Four pins with remembered mode and level (pull-down unsupported, like the
 /// N32903). An input reads its pull level; a floating input reads low.
@@ -208,7 +193,6 @@ impl Platform for MockPlatform {
     type RtcB = MockRtc;
     type UsartB = MockUsart;
     type SystickB = MockSystick;
-    #[cfg(feature = "audio")]
     type AudioB = crate::audio::NoAudio;
     #[cfg(feature = "jpeg")]
     type JpegB = crate::jpeg::NoJpeg;

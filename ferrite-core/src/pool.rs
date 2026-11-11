@@ -41,10 +41,6 @@ use crate::syscfg::try_alloc_slice;
 use crate::widget::{Widget, WidgetId};
 
 /// Object pointer: table index. `PTR_NONE` = no object.
-#[cfg(not(feature = "wide_obj"))]
-pub type ObjPtr = u16;
-/// Object pointer: table index. `PTR_NONE` = no object.
-#[cfg(feature = "wide_obj")]
 pub type ObjPtr = u32;
 pub const PTR_NONE: ObjPtr = ObjPtr::MAX;
 
@@ -57,26 +53,14 @@ pub const T_WIDGET: u8 = 1;
 pub const T_STRING: u8 = 2;
 pub const T_ARRAY: u8 = 3;
 
-/// Largest pointer count: the block header stores the pointer in 14 bits.
-#[cfg(not(feature = "wide_obj"))]
-pub const MAX_OBJECTS: usize = 0x3FFF;
 /// Largest pointer count: the pointer has its own header word; the table
 /// entry's free tag (bit 31) caps it -- in practice the heap does first.
-#[cfg(feature = "wide_obj")]
 pub const MAX_OBJECTS: usize = 0x7FFF_FFFE;
 /// Largest payload of one object, in words. The header field has 16 bits,
 /// and a freed block becomes a hole whose field holds its whole length - 1
 /// (`HDR - 1` words more than the payload), which must fit too.
 pub const MAX_OBJ_WORDS: usize = 0xFFFF - (HDR - 1);
 
-#[cfg(not(feature = "pool_large"))]
-mod profile {
-    /// Table entry: word offset. 15 bits address 128 KB of arena.
-    pub type Off = u16;
-    pub const DEFAULT_ARENA_BYTES: usize = 8 * 1024;
-    pub const DEFAULT_MAX_OBJECTS: usize = 320;
-}
-#[cfg(feature = "pool_large")]
 mod profile {
     /// Table entry: word offset, for arenas past 128 KB.
     pub type Off = u32;
@@ -90,24 +74,14 @@ const FREE_TAG: Off = 1 << (Off::BITS - 1);
 /// Largest arena (words) a table entry can address.
 const MAX_ARENA_WORDS: usize = (FREE_TAG as usize) - 1;
 
-/// Header words of a live block (a hole always has one).
-#[cfg(not(feature = "wide_obj"))]
-pub(crate) const HDR: usize = 1;
-#[cfg(feature = "wide_obj")]
 pub(crate) const HDR: usize = 2;
 
-#[cfg(feature = "wide_obj")]
-const _: () = assert!(cfg!(feature = "pool_large"), "wide_obj needs pool_large (u32 table entries)");
+const _: () = assert!(true, "wide_obj needs pool_large (u32 table entries)");
 
 /// Write a live block header at `at`.
 #[inline]
 fn put_header(arena: &mut [u32], at: usize, ptr: ObjPtr, ty: u8, words: usize) {
     let h = ((ty as u32) << 14) | ((words as u32) << 16);
-    #[cfg(not(feature = "wide_obj"))]
-    {
-        arena[at] = h | (ptr as u32 & 0x3FFF);
-    }
-    #[cfg(feature = "wide_obj")]
     {
         arena[at] = h;
         arena[at + 1] = ptr;
@@ -121,11 +95,6 @@ fn hole(len: usize) -> u32 {
 /// Pointer of the live block at `at`.
 #[inline]
 fn hdr_ptr(arena: &[u32], at: usize) -> ObjPtr {
-    #[cfg(not(feature = "wide_obj"))]
-    {
-        (arena[at] & 0x3FFF) as ObjPtr
-    }
-    #[cfg(feature = "wide_obj")]
     {
         arena[at + 1]
     }
@@ -174,11 +143,8 @@ pub(crate) struct RenderState {
     /// Scratch for pass 2: the part of a shifted subtree's box still to draw.
     pub(crate) shift_keep: Vec<crate::types::Rect>,
     /// Geometry by DFS index for the current render pass (`geo.rs`).
-    #[cfg(feature = "render_cache")]
     pub(crate) geo: Vec<crate::geo::Geo>,
-    #[cfg(feature = "render_cache")]
     pub(crate) geo_stack: Vec<u32>,
-    #[cfg(feature = "render_cache")]
     pub(crate) geo_valid: bool,
 }
 
@@ -192,11 +158,8 @@ impl RenderState {
             settled_epoch: u32::MAX,
             shifted: Vec::new(),
             shift_keep: Vec::new(),
-            #[cfg(feature = "render_cache")]
             geo: Vec::new(),
-            #[cfg(feature = "render_cache")]
             geo_stack: Vec::new(),
-            #[cfg(feature = "render_cache")]
             geo_valid: false,
         }
     }
@@ -208,7 +171,6 @@ impl RenderState {
         self.changed_n = 0;
         self.settled_epoch = self.draw_epoch.wrapping_sub(1);
         self.shifted.clear();
-        #[cfg(feature = "render_cache")]
         {
             self.geo_valid = false;
         }
@@ -231,15 +193,12 @@ pub struct ObjPool {
     live: [u32; 4],
     /// Task that allocated each object (`multi_program`): it is freed when
     /// that task ends.
-    #[cfg(feature = "multi_program")]
     pub(crate) owner: Box<[u8]>,
     /// Task that handles each widget's events (`multi_program`): the one that
     /// allocated it, or that set its last on_click / on_tap / on_paint.
-    #[cfg(feature = "multi_program")]
     pub(crate) handler: Box<[u8]>,
     /// Task the next allocations belong to (`multi_program`). The runtime sets
     /// it around everything a task's VM runs; 0 (main) otherwise.
-    #[cfg(feature = "multi_program")]
     pub cur_task: u8,
 
     // --- Widget tree state (see widget.rs) ---
@@ -256,7 +215,6 @@ pub struct ObjPool {
     /// (`WidgetRenderer::compose`) leaves areas that touch it to the built-in passes.
     pub overlay: Option<crate::types::Rect>,
     /// Retained layers: roots, plane alphas, the running pass's scope (`layer.rs`).
-    #[cfg(feature = "layers")]
     pub layers: crate::layer::Layers,
 }
 
@@ -279,11 +237,8 @@ impl ObjPool {
             free_tail: PTR_NONE,
             garbage: 0,
             live: [0; 4],
-            #[cfg(feature = "multi_program")]
             owner: Box::new([]),
-            #[cfg(feature = "multi_program")]
             handler: Box::new([]),
-            #[cfg(feature = "multi_program")]
             cur_task: 0,
             root: WidgetId::NONE,
             dfs_cache: Vec::new(),
@@ -291,7 +246,6 @@ impl ObjPool {
             dead: Widget::DEAD,
             render: RenderState::new(),
             overlay: None,
-            #[cfg(feature = "layers")]
             layers: crate::layer::Layers::new(),
         }
     }
@@ -330,7 +284,6 @@ impl ObjPool {
         ) else {
             return false;
         };
-        #[cfg(feature = "multi_program")]
         {
             let (Some(owner), Some(handler)) = (try_alloc_slice(objects, 0u8), try_alloc_slice(objects, 0u8))
             else {
@@ -353,7 +306,6 @@ impl ObjPool {
         self.free_tail = PTR_NONE;
         self.garbage = 0;
         self.live = [0; 4];
-        #[cfg(feature = "multi_program")]
         {
             self.cur_task = 0;
         }
@@ -361,7 +313,6 @@ impl ObjPool {
         self.dfs_cache.clear();
         self.dfs_valid = false;
         self.render.reset();
-        #[cfg(feature = "layers")]
         {
             // The surfaces stay shown until the next render hides them.
             self.layers = crate::layer::Layers::new();
@@ -410,11 +361,8 @@ impl ObjPool {
     /// Heap bytes held by the pool (arena + table + DFS cache).
     pub fn heap_bytes(&self) -> usize {
         use core::mem::size_of;
-        let tasks = if cfg!(feature = "multi_program") { 2 * self.table.len() } else { 0 };
-        #[cfg(feature = "render_cache")]
+        let tasks = if true { 2 * self.table.len() } else { 0 };
         let geo = self.render.geo.capacity() * size_of::<crate::geo::Geo>() + self.render.geo_stack.capacity() * 4;
-        #[cfg(not(feature = "render_cache"))]
-        let geo = 0;
         self.arena.len() * 4
             + self.table.len() * size_of::<Off>()
             + self.dfs_cache.capacity() * size_of::<WidgetId>()
@@ -513,7 +461,6 @@ impl ObjPool {
             return None;
         }
         let p = self.take_ptr()?;
-        #[cfg(feature = "multi_program")]
         {
             self.owner[p as usize] = self.cur_task;
             self.handler[p as usize] = self.cur_task;
@@ -622,14 +569,8 @@ impl ObjPool {
     /// `multi_program`. Scopes the string sweep and literal sharing.
     #[inline]
     pub(crate) fn mine(&self, p: ObjPtr) -> bool {
-        #[cfg(feature = "multi_program")]
         {
             self.owner.get(p as usize) == Some(&self.cur_task)
-        }
-        #[cfg(not(feature = "multi_program"))]
-        {
-            let _ = p;
-            true
         }
     }
 
@@ -638,12 +579,9 @@ impl ObjPool {
     /// `multi_program`.
     #[inline]
     pub(crate) fn adopt(&mut self, obj: ObjPtr, like: ObjPtr) {
-        #[cfg(feature = "multi_program")]
         if let (Some(&o), true) = (self.owner.get(like as usize), (obj as usize) < self.owner.len()) {
             self.owner[obj as usize] = o;
         }
-        #[cfg(not(feature = "multi_program"))]
-        let _ = (obj, like);
     }
 
     /// Pointers of the live objects of type `ty`, in pointer order.
@@ -788,7 +726,6 @@ mod tests {
     }
 
     /// The arena of a narrow build is smaller than the largest object.
-    #[cfg(feature = "pool_large")]
     #[test]
     fn largest_object_leaves_a_walkable_hole() {
         let mut p = pool(4 * (2 * (HDR + MAX_OBJ_WORDS) + 2 * (HDR + 1)), 8);
@@ -811,7 +748,6 @@ mod tests {
         assert_eq!(p.used_bytes(), 4 * (2 * (HDR + 1) + HDR + MAX_OBJ_WORDS));
     }
 
-    #[cfg(feature = "wide_obj")]
     #[test]
     fn wide_pointers_past_14_bits() {
         let n = 0x4100usize;

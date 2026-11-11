@@ -90,10 +90,7 @@ pub unsafe fn init(start: *mut u8, len: usize) {
 /// global one).
 pub fn size() -> usize {
     // esp-alloc: every region (internal SRAM + PSRAM).
-    #[cfg(feature = "epaper")]
-    return esp_alloc::HEAP.stats().size;
 
-    #[cfg_attr(feature = "epaper", allow(unreachable_code))]
     unsafe {
         if HEAP.initialized { HEAP.size } else { 0 }
     }
@@ -102,10 +99,7 @@ pub fn size() -> usize {
 /// Return (total_free_bytes, largest_free_block) for diagnostics. esp-alloc
 /// (epaper) does not track its largest block: 0 = unknown.
 pub fn stats() -> (usize, usize) {
-    #[cfg(feature = "epaper")]
-    return (esp_alloc::HEAP.free(), 0);
 
-    #[cfg_attr(feature = "epaper", allow(unreachable_code))]
     unsafe {
         if !HEAP.initialized {
             return (0, 0);
@@ -246,10 +240,6 @@ unsafe impl GlobalAlloc for FerriAllocator {
 // have no other one: the GD32 (nextion). The epaper BSP uses `esp_alloc`, the
 // tdo_y13 BSP uses the f1c100s HAL's thread-safe allocator (`external_alloc`),
 // and the host simulator uses the std allocator — none want this heap.
-#[cfg(all(
-    not(feature = "epaper"),
-    not(feature = "host"),
-    not(feature = "external_alloc")
-))]
+#[cfg(all(not(feature = "host"), not(feature = "external_alloc")))]
 #[global_allocator]
 static ALLOCATOR: FerriAllocator = FerriAllocator;

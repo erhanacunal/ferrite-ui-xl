@@ -117,11 +117,6 @@ impl WidgetId {
     }
 }
 
-/// `Widget::value`: progress/slider value, input cursor, scroll offset, and
-/// the graph's array id -- so it is as wide as an object pointer.
-#[cfg(not(feature = "wide_obj"))]
-pub type WValue = i16;
-#[cfg(feature = "wide_obj")]
 pub type WValue = i32;
 
 // --- Widget object layout ---
@@ -178,9 +173,6 @@ pub struct Widget {
     pub value: WValue,
 }
 
-#[cfg(not(feature = "wide_obj"))]
-const _: () = assert!(size_of::<Widget>() == 24 && align_of::<Widget>() <= 4);
-#[cfg(feature = "wide_obj")]
 const _: () = assert!(size_of::<Widget>() == 32 && align_of::<Widget>() <= 4);
 
 impl Widget {
@@ -833,7 +825,6 @@ impl ObjPool {
             return;
         }
         // An active layer's root only moves its surface.
-        #[cfg(feature = "layers")]
         if self.is_active_layer_root(id) {
             return;
         }
@@ -940,7 +931,6 @@ impl ObjPool {
         }
 
         // A layer pass draws in its surface's coordinates.
-        #[cfg(feature = "layers")]
         {
             x = x.wrapping_sub(self.layers.origin.x);
             y = y.wrapping_sub(self.layers.origin.y);
@@ -1164,7 +1154,6 @@ impl ObjPool {
     /// listed as changed, so the renderer may shift its pixels instead of
     /// redrawing it (`render::shift_moved`). Call `will_move` first.
     pub fn mark_moved(&mut self, id: WidgetId) {
-        #[cfg(feature = "layers")]
         if self.layer_placement_changed(id) {
             return;
         }

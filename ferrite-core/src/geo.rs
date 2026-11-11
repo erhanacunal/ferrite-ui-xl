@@ -21,11 +21,9 @@ use crate::pool::ObjPool;
 use crate::types::Rect;
 use crate::widget::WidgetId;
 
-#[cfg(feature = "render_cache")]
 use crate::widget::{FLAG_CLIP_CHILDREN, FLAG_DESTROYED, KIND_DROPDOWN};
 
 /// One DFS entry's geometry.
-#[cfg(feature = "render_cache")]
 #[derive(Clone, Copy)]
 pub(crate) struct Geo {
     /// `absolute_rect`.
@@ -45,19 +43,16 @@ impl ObjPool {
     /// Fills the geometry table for the current DFS order (`ensure_dfs`
     /// first). No-op without `render_cache`.
     pub(crate) fn geo_begin(&mut self) {
-        #[cfg(feature = "render_cache")]
         self.geo_build();
     }
 
     /// Ends the pass: the accessors compute live again.
     pub(crate) fn geo_end(&mut self) {
-        #[cfg(feature = "render_cache")]
         {
             self.render.geo_valid = false;
         }
     }
 
-    #[cfg(feature = "render_cache")]
     fn geo_build(&mut self) {
         self.render.geo_valid = false;
         let n = self.dfs_cache.len();
@@ -112,7 +107,6 @@ impl ObjPool {
         self.render.geo_stack = stack;
     }
 
-    #[cfg(feature = "render_cache")]
     #[inline(always)]
     fn geo(&self, i: usize) -> Option<&Geo> {
         if self.render.geo_valid { self.render.geo.get(i) } else { None }
@@ -121,15 +115,11 @@ impl ObjPool {
     /// `absolute_rect` of DFS entry `i`.
     #[inline]
     pub fn abs_at(&self, i: usize) -> Rect {
-        #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
-            #[cfg(feature = "layers")]
             {
                 let o = self.layers.origin;
                 return Rect::new(g.abs.x.wrapping_sub(o.x), g.abs.y.wrapping_sub(o.y), g.abs.w, g.abs.h);
             }
-            #[cfg(not(feature = "layers"))]
-            return g.abs;
         }
         self.absolute_rect(self.dfs_at(i))
     }
@@ -138,11 +128,9 @@ impl ObjPool {
     #[inline]
     pub fn vis_at(&self, i: usize) -> bool {
         // Outside the running pass's layer scope: as if hidden.
-        #[cfg(feature = "layers")]
         if !self.in_scope(i) {
             return false;
         }
-        #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.vis;
         }
@@ -152,7 +140,6 @@ impl ObjPool {
     /// `scroll_parent` of DFS entry `i`.
     #[inline]
     pub fn scroll_parent_at(&self, i: usize) -> WidgetId {
-        #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.sp;
         }
@@ -162,7 +149,6 @@ impl ObjPool {
     /// DFS index one past the subtree of entry `i` (its descendants follow
     /// it contiguously).
     pub fn sub_end_at(&self, i: usize) -> usize {
-        #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.end as usize;
         }
@@ -175,7 +161,7 @@ impl ObjPool {
     }
 }
 
-#[cfg(all(test, feature = "render_cache"))]
+#[cfg(test)]
 mod tests {
     use crate::pool::ObjPool;
     use crate::widget::{FLAG_CLIP_CHILDREN, KIND_DROPDOWN, WidgetId};

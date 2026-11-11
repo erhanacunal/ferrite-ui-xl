@@ -78,7 +78,6 @@ mod net;
 // FIMD window 1 board test, driven over HTTP (`POST /api/overlay`).
 #[cfg(feature = "wifi")]
 mod overlay_test;
-#[cfg(feature = "perf")]
 mod perf;
 mod platform;
 mod renderer;

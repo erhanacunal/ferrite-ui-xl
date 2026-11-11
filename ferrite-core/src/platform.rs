@@ -5,7 +5,6 @@
 ///
 /// The framework (`Ctx`, `Vm`, `render`, etc.) is then generic over
 /// `P: Platform`, giving it access to all hardware through a single parameter.
-#[cfg(feature = "audio")]
 use crate::audio::AudioBackend;
 use crate::backlight::BacklightBackend;
 use crate::eeprom::EepromBackend;
@@ -53,7 +52,6 @@ pub trait Platform: Sized {
     type SystickB: SystickBackend;
     // Sound output — only with the `audio` feature, which a BSP enables
     // when its board has audio hardware (`NoAudio` is a placeholder).
-    #[cfg(feature = "audio")]
     type AudioB: AudioBackend;
     // JPEG image decoder (FI mode 3) — only with the `jpeg` feature.
     #[cfg(feature = "jpeg")]

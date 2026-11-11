@@ -147,7 +147,6 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
     let mut paint = PaintList::new();
     let buf = ctx.lcd.back_buf();
     // Layers are a dirty-mode feature.
-    #[cfg(feature = "layers")]
     if ctx.lcd.layers_allocated() != 0 {
         layers_off(ctx);
     }
@@ -318,7 +317,6 @@ fn redraw_behind_region<P: Platform>(
     bounds: &Rect,
 ) {
     // Behind a layer's root there is nothing: transparent.
-    #[cfg(feature = "layers")]
     if ctx.objs.in_layer_pass() {
         for r in clip.iter() {
             ctx.lcd.layer_clear(r);
@@ -367,7 +365,6 @@ fn redraw_behind_region<P: Platform>(
 pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
     ctx.objs.ensure_dfs();
     ctx.objs.geo_begin();
-    #[cfg(feature = "layers")]
     let active = {
         let active = layers_sync(ctx);
         for slot in ctx.objs.layers.slots.iter_mut() {
@@ -388,7 +385,6 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
     };
     let n = ctx.objs.dfs_len();
     render_all_iterative(ctx, 0, n);
-    #[cfg(feature = "layers")]
     {
         ctx.objs.layers.scope = crate::layer::Scope::All;
         if active != 0 {
@@ -470,10 +466,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     }
     // A layer moved, faded, was shown/hidden or (un)marked: placements and
     // eligibility change even with nothing dirty.
-    #[cfg(feature = "layers")]
     let placed = core::mem::take(&mut ctx.objs.layers.placed);
-    #[cfg(not(feature = "layers"))]
-    let placed = false;
     if !has_dirty && !placed {
         // Dirty mode uses only the A bits: nothing left to draw until a
         // widget is marked again.
@@ -483,17 +476,13 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     }
     ctx.objs.geo_begin();
 
-    #[cfg(feature = "layers")]
     let active = layers_sync(ctx);
-    #[cfg(not(feature = "layers"))]
-    let active = 0usize;
 
     // A board that repaints whole areas (a GPU) takes the render over.
     if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && compose_dirty(ctx, false) {
         ctx.objs.geo_end();
         return;
     }
-    #[cfg(feature = "layers")]
     if active != 0 {
         // Composed layers' surfaces first: what changed in them is blended
         // into the screen (by the compositor or the passes), their root
@@ -517,7 +506,6 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     // With layers: the screen's part (their subtrees left out; a composed
     // layer's root is its surface). The windowed layers' surfaces are drawn
     // by the passes after.
-    #[cfg(feature = "layers")]
     if active != 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES {
         ctx.objs.layers.scope = base_scope(&ctx.objs);
         let taken = compose_dirty(ctx, true);
@@ -538,12 +526,10 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         }
     }
 
-    #[cfg(feature = "layers")]
     if active != 0 {
         ctx.objs.layers.scope = base_scope(&ctx.objs);
     }
     dirty_passes(ctx, settled, true);
-    #[cfg(feature = "layers")]
     if active != 0 {
         ctx.objs.layers.scope = crate::layer::Scope::All;
         for s in 0..crate::layer::MAX_LAYERS {
@@ -553,7 +539,6 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             }
         }
     }
-    #[cfg(feature = "layers")]
     place_layers(ctx);
     ctx.objs.geo_end();
 
@@ -570,11 +555,8 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
     if base && <P::LcdB as LcdBackend>::CAN_MOVE {
         shift_moved(ctx, settled, &mut restores);
     }
-    #[cfg(not(feature = "layers"))]
-    let _ = base;
     // Layers that just moved into their surface: put back what the screen
     // drew of them.
-    #[cfg(feature = "layers")]
     if base {
         for s in 0..crate::layer::MAX_LAYERS {
             let slot = ctx.objs.layers.slots[s];
@@ -598,7 +580,6 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         if !ctx.objs.get(id).is_dirty() {
             continue;
         }
-        #[cfg(feature = "layers")]
         if !ctx.objs.in_scope(di) {
             continue;
         }
@@ -610,10 +591,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
                     // siblings, not just the nearest ancestor's bg: a hidden
                     // popup would otherwise leave a blank hole). In a layer
                     // the restore starts from transparent instead.
-                    #[cfg(feature = "layers")]
                     let erase = !ctx.objs.in_layer_pass();
-                    #[cfg(not(feature = "layers"))]
-                    let erase = true;
                     if erase {
                         erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
                     }
@@ -634,7 +612,6 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         if !w.is_dirty() {
             continue;
         }
-        #[cfg(feature = "layers")]
         if !ctx.objs.in_scope(di) {
             continue;
         }
@@ -643,7 +620,6 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
             continue;
         }
         // Recorded on screen; a layer pass draws in its surface's coordinates.
-        #[cfg(feature = "layers")]
         let stale = {
             let o = ctx.objs.layers.origin;
             Rect::new(stale.x.wrapping_sub(o.x), stale.y.wrapping_sub(o.y), stale.w, stale.h)
@@ -818,7 +794,6 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
 /// to the tree, and for composed ones notes where the screen must show them
 /// (`Slot::shown`; the old place goes to `Slot::restore`). Scope must be
 /// `All`, origin 0. Returns how many are active.
-#[cfg(feature = "layers")]
 fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
     use crate::layer::{Fit, MAX_LAYERS, Slot};
     let none = Rect::new(0, 0, 0, 0);
@@ -917,7 +892,6 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
 }
 
 /// The screen's scope: every DFS entry but the active layers' subtrees.
-#[cfg(feature = "layers")]
 fn base_scope(objs: &ObjPool) -> crate::layer::Scope {
     let mut excl = [(0u32, 0u32); crate::layer::MAX_LAYERS];
     let mut n = 0;
@@ -934,7 +908,6 @@ fn base_scope(objs: &ObjPool) -> crate::layer::Scope {
 /// Draws layer `s`'s dirty widgets into its surface (`all`: every widget,
 /// from a cleared surface). Scope must be `All` on entry and is again after.
 /// True if anything was drawn.
-#[cfg(feature = "layers")]
 fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) -> bool {
     let slot = ctx.objs.layers.slots[s];
     let Some(ri) = ctx.objs.dfs_index(slot.root) else { return false };
@@ -981,7 +954,6 @@ fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) -> bool {
 }
 
 /// Shows every active layer where its root is (scope `All`, origin 0).
-#[cfg(feature = "layers")]
 fn place_layers<P: Platform>(ctx: &mut Ctx<P>) {
     for s in 0..crate::layer::MAX_LAYERS {
         let slot = ctx.objs.layers.slots[s];
@@ -998,7 +970,6 @@ fn place_layers<P: Platform>(ctx: &mut Ctx<P>) {
 
 /// Hands every active layer back to the tree and frees the surfaces
 /// (buffered mode, which doesn't use layers).
-#[cfg(feature = "layers")]
 fn layers_off<P: Platform>(ctx: &mut Ctx<P>) {
     for s in 0..crate::layer::MAX_LAYERS {
         let slot = ctx.objs.layers.slots[s];
@@ -1101,10 +1072,7 @@ fn bounds(a: &Rect, b: &Rect) -> Rect {
 /// then draws the layers and settles; their widgets' flags are left alone.
 #[inline(never)]
 fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
-    #[cfg(feature = "layers")]
     let mine = |objs: &ObjPool, di: usize| objs.in_scope(di);
-    #[cfg(not(feature = "layers"))]
-    let mine = |_: &ObjPool, _: usize| true;
     let screen = screen_rect(&ctx.lcd);
     let mut areas = Areas::new();
     for di in 0..ctx.objs.dfs_len() {
@@ -1118,7 +1086,6 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
         }
         areas.add(buf_prev_rect(&ctx.objs, id, 0), &screen);
     }
-    #[cfg(feature = "layers")]
     if layered {
         for slot in ctx.objs.layers.slots.iter().filter(|s| s.active) {
             areas.add(slot.restore, &screen);
@@ -1127,7 +1094,6 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
     if areas.n > 0 && !<P::Renderer as WidgetRenderer<P>>::compose(ctx, &areas.list[..areas.n]) {
         return false;
     }
-    #[cfg(feature = "layers")]
     if layered {
         for slot in ctx.objs.layers.slots.iter_mut() {
             slot.restore = Rect::new(0, 0, 0, 0);
@@ -1239,7 +1205,6 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
         if !exact || moves.is_empty() || !ctx.lcd.move_rects(&moves, dx, dy) {
             continue;
         }
-        #[cfg(feature = "perf")]
         {
             use crate::perf::{add_count, count};
             add_count(count::SHIFTS, 1);
@@ -1278,7 +1243,6 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
 /// None if anything behind it may show through elsewhere (or it paints by
 /// script, `on_paint`).
 fn opaque_radius(tree: &ObjPool, id: WidgetId, abs: &Rect) -> Option<u16> {
-    #[cfg(feature = "layers")]
     if tree.composed_root(id).is_some() {
         return None;
     }
@@ -1436,7 +1400,6 @@ fn painted_before(tree: &ObjPool, idx: usize, rect: &Rect) -> bool {
 /// A widget that draws no pixel: a label without text, background, border
 /// or background image (tablet demo groups).
 fn paints_nothing(tree: &ObjPool, id: WidgetId) -> bool {
-    #[cfg(feature = "layers")]
     if tree.composed_root(id).is_some() {
         return false;
     }
@@ -1499,7 +1462,6 @@ fn contains(outer: &Rect, inner: &Rect) -> bool {
 /// absolute rect is `abs`)? True for a solid, square-cornered widget with a
 /// background: its border strips plus background fill tile its whole rect.
 pub fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
-    #[cfg(feature = "layers")]
     if tree.composed_root(id).is_some() {
         return false;
     }
@@ -1524,7 +1486,6 @@ pub fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) ->
 /// As the board's renderer reports it (`WidgetRenderer::shows_behind`), else
 /// the built-in rule ([`shows_behind`]).
 fn shows_behind_on<P: Platform>(tree: &ObjPool, id: WidgetId) -> bool {
-    #[cfg(feature = "layers")]
     if tree.composed_root(id).is_some() {
         return true;
     }
@@ -1533,7 +1494,6 @@ fn shows_behind_on<P: Platform>(tree: &ObjPool, id: WidgetId) -> bool {
 
 /// [`shows_behind_on`] for the built-in drawing.
 pub fn shows_behind(tree: &ObjPool, id: WidgetId) -> bool {
-    #[cfg(feature = "layers")]
     if tree.composed_root(id).is_some() {
         return true;
     }
@@ -1643,9 +1603,7 @@ fn resolved_text_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt, fallback: 
 /// same clamp `fill_rect_screen` already does) — so the full path pays nothing
 /// for going through the clip.
 fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
-    #[cfg(feature = "perf")]
     let t0 = crate::perf::now();
-    #[cfg(feature = "layers")]
     if let Some(s) = ctx.objs.composed_root(id) {
         // A composed layer's root on the screen: its surface.
         let slot = &ctx.objs.layers.slots[s];
@@ -1653,14 +1611,12 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
         for r in clip.iter() {
             ctx.lcd.layer_compose(s, at, size, r, slot.alpha);
         }
-        #[cfg(feature = "perf")]
         crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
         return;
     }
     if !P::Renderer::draw(ctx, id, abs, clip) {
         draw_widget_body(ctx, id, abs, clip);
     }
-    #[cfg(feature = "perf")]
     crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
 }
 
@@ -3872,7 +3828,6 @@ mod shift_tests {
         type RtcB = MockRtc;
         type UsartB = MockUsart;
         type SystickB = MockSystick;
-        #[cfg(feature = "audio")]
         type AudioB = crate::audio::NoAudio;
         #[cfg(feature = "jpeg")]
         type JpegB = crate::jpeg::NoJpeg;
@@ -3893,14 +3848,12 @@ mod shift_tests {
             rtc: RtcImpl::with_backend(MockRtc),
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
-            #[cfg(feature = "audio")]
             audio: crate::audio::AudioImpl::none(),
             #[cfg(feature = "jpeg")]
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(MockEeprom::default()),
             cursor_visible: false,
-            #[cfg(feature = "multi_program")]
             tasks: crate::task::TaskTable::new(),
         }
     }

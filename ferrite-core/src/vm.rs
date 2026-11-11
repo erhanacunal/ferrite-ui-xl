@@ -266,10 +266,7 @@ const IMAGE_FLAG_PORTRAIT: u16 = 0x08;
 /// Bytecode address: pc, return addresses, callback entry points. `u32` with
 /// the `wide_code` feature (RAM-rich BSPs), `u16` otherwise so the GD32 build
 /// keeps call frames and queued callbacks small.
-#[cfg(feature = "wide_code")]
 pub type CodeAddr = u32;
-#[cfg(not(feature = "wide_code"))]
-pub type CodeAddr = u16;
 
 // --- 1-byte opcode map (IL-style) ---
 
@@ -349,28 +346,18 @@ const OP_W_LOAD: u8 = 0x44; // + u16 block offset in the widget page (RES_PAGE)
 // Superinstructions (`superops` feature, 0x45..=0x4D). `cond`/`op` operand = the opcode
 // of the fused binary op (OP_ADD..=OP_OR, OP_SHL, OP_SHR, OP_EQ..=OP_GE).
 // Keep in sync with tools/ferrite_cc.py (Op, OP_NAMES, disassembler).
-#[cfg(feature = "superops")]
 const OP_JCMP: u8 = 0x45; // + u8 cond + addr: pop a, b; jump if a <cond> b
-#[cfg(feature = "superops")]
 const OP_JCMP_VI: u8 = 0x46; // + u8 cond + u8 slot + i16 imm + addr: jump if var <cond> imm
-#[cfg(feature = "superops")]
 const OP_JCMP_VV: u8 = 0x47; // + u8 cond + u8 slot_a + u8 slot_b + addr
-#[cfg(feature = "superops")]
 const OP_BIN_I: u8 = 0x48; // + u8 op + i16: top = top <op> imm
-#[cfg(feature = "superops")]
 const OP_BIN_I32: u8 = 0x49; // + u8 op + i32: top = top <op> imm
-#[cfg(feature = "superops")]
 const OP_BIN_V: u8 = 0x4A; // + u8 op + u8 slot: top = top <op> var
-#[cfg(feature = "superops")]
 const OP_ADD_VI: u8 = 0x4B; // + u8 slot + i16: var += imm (no stack)
-#[cfg(feature = "superops")]
 const OP_ARR_LOAD_V: u8 = 0x4C; // + u8 slot: pop index, push array(var)[index]
-#[cfg(feature = "superops")]
 const OP_STORE_OP: u8 = 0x4D; // + u8 op + u8 slot: pop b; var = var <op> b
 
 /// The integer binary ops (and comparisons, as 0/1) by opcode, as the plain
 /// opcodes compute them. None = not a binary op.
-#[cfg(feature = "superops")]
 #[inline(always)]
 fn int_binop(op: u8, a: i32, b: i32) -> Option<i32> {
     Some(match op {
@@ -400,7 +387,6 @@ fn int_binop(op: u8, a: i32, b: i32) -> Option<i32> {
 }
 
 /// The comparisons by opcode (OP_EQ..=OP_GE).
-#[cfg(feature = "superops")]
 #[inline(always)]
 fn int_cmp(op: u8, a: i32, b: i32) -> Option<bool> {
     Some(match op {
@@ -491,29 +477,18 @@ const OP_PROGRAM_ARG: u8 = 0xBE; // push the arg this program was started with (
 const OP_PROGRAM_NAME: u8 = 0xBF; // pop index → push str_id: nth program's name, "" past the end, -1 = own
 // Tasks (`multi_program`; elsewhere bad opcodes). Requests go to `Ctx::tasks`
 // and the runtime acts on them after the burst.
-#[cfg(feature = "multi_program")]
 const OP_TASK_SPAWN: u8 = 0xD4; // pop arg, pop str_id → push task id, -1 (no such program / no free slot)
-#[cfg(feature = "multi_program")]
 const OP_TASK_KILL: u8 = 0xD5; // pop id → push 1 if it will end, 0 (main / not running)
-#[cfg(feature = "multi_program")]
 const OP_TASK_ID: u8 = 0xD6; // push the running task's id (0 = main)
-#[cfg(feature = "multi_program")]
 const OP_TASK_ALIVE: u8 = 0xD7; // pop id → push 1 while starting / running, else 0
-#[cfg(feature = "multi_program")]
 const OP_TASK_SEND: u8 = 0xD8; // pop b, pop a, pop id → push 1 queued / 0
-#[cfg(feature = "multi_program")]
 const OP_TASK_SET_FG: u8 = 0xD9; // pop id → push 1 if it now gets the global input events
-#[cfg(feature = "multi_program")]
 const OP_TASK_FG: u8 = 0xDA; // push the foreground task's id
 // Sound opcodes exist only with the `audio` feature; elsewhere they are
 // bad opcodes.
-#[cfg(feature = "audio")]
 const OP_SOUND_PLAY: u8 = 0xB9; // pop looping, pop str_id (RES_SOUND name) → push 1 started / 0
-#[cfg(feature = "audio")]
 const OP_SOUND_STOP: u8 = 0xBA; // stop the playing sound
-#[cfg(feature = "audio")]
 const OP_SOUND_VOLUME: u8 = 0xBB; // pop volume 0..100 → output volume
-#[cfg(feature = "audio")]
 const OP_SOUND_PLAYING: u8 = 0xBC; // push 1 while a sound plays, else 0
 
 // Float ops (all no-arg)
@@ -657,16 +632,9 @@ impl ProgramRef {
 /// Default evaluation stack depth (overridable via RES_SYSCFG `eval_stack`).
 const STACK_SIZE: usize = 32;
 const MAX_SYSCALL_ARGS: usize = 16;
-/// Variable entry — sparse mapping from slot ID to value.
-#[cfg(not(feature = "fast_vm"))]
-struct VmVar {
-    id: u16,
-    val: i32,
-}
 
 /// Dense variable table size (`fast_vm`): a slot is a global (0..=127) or
 /// `frame_base` (u8) + a local index (0..=127), so always below 383.
-#[cfg(feature = "fast_vm")]
 const VAR_SLOTS: usize = 512;
 /// Default call stack depth (overridable via RES_SYSCFG `call_stack`).
 const CALL_STACK_SIZE: usize = 16;
@@ -813,10 +781,7 @@ pub struct Vm {
     // `configure` (RES_SYSCFG); each is at most 255 deep (u8 indices).
     stack: Box<[i32]>,
     sp: u8,
-    #[cfg(not(feature = "fast_vm"))]
-    vars: Vec<VmVar>,
     /// `fast_vm`: every slot, indexed directly (2 KB).
-    #[cfg(feature = "fast_vm")]
     vars: Box<[i32]>,
     call_stack: Box<[CallFrame]>,
     call_sp: u8,
@@ -887,7 +852,6 @@ pub struct Vm {
     page_len: u32,
     /// Instructions executed (`perf` feature; read and reset by the
     /// runtime's perf report).
-    #[cfg(feature = "perf")]
     pub instructions: u64,
 }
 
@@ -917,9 +881,6 @@ impl Vm {
             pc: 0,
             stack: alloc::vec![0; STACK_SIZE].into_boxed_slice(),
             sp: 0,
-            #[cfg(not(feature = "fast_vm"))]
-            vars: Vec::new(),
-            #[cfg(feature = "fast_vm")]
             vars: alloc::vec![0; VAR_SLOTS].into_boxed_slice(),
             call_stack: alloc::vec![EMPTY_FRAME; CALL_STACK_SIZE].into_boxed_slice(),
             call_sp: 0,
@@ -947,7 +908,6 @@ impl Vm {
             in_paint: false,
             page_base: 0,
             page_len: 0,
-            #[cfg(feature = "perf")]
             instructions: 0,
             tree_hint: None,
             open_files: [None, None],
@@ -1025,38 +985,16 @@ impl Vm {
         }
     }
 
-    #[cfg(not(feature = "fast_vm"))]
-    fn var_get(&self, slot: u16) -> i32 {
-        for v in &self.vars {
-            if v.id == slot {
-                return v.val;
-            }
-        }
-        0
-    }
 
-    #[cfg(not(feature = "fast_vm"))]
-    #[inline]
-    fn var_set(&mut self, slot: u16, val: i32) {
-        for v in &mut self.vars {
-            if v.id == slot {
-                v.val = val;
-                return;
-            }
-        }
-        self.vars.push(VmVar { id: slot, val });
-    }
 
     // `fast_vm`: the mask keeps the index in bounds without a branch (slots
     // never reach VAR_SLOTS, see there); unset slots read 0 as before.
-    #[cfg(feature = "fast_vm")]
     #[inline(always)]
     fn var_get(&self, slot: u16) -> i32 {
         // SAFETY: masked to VAR_SLOTS - 1, and vars.len() == VAR_SLOTS.
         unsafe { *self.vars.get_unchecked(slot as usize & (VAR_SLOTS - 1)) }
     }
 
-    #[cfg(feature = "fast_vm")]
     #[inline(always)]
     fn var_set(&mut self, slot: u16, val: i32) {
         // SAFETY: as in var_get.
@@ -1263,26 +1201,12 @@ impl Vm {
             return;
         }
         let mut budget = budget.max(1);
-        #[cfg(not(feature = "fast_vm"))]
-        loop {
-            self.step(ctx);
-            while self.critical && self.state == VmState::Running {
-                self.step(ctx);
-            }
-            budget -= 1;
-            if budget == 0 || self.state != VmState::Running {
-                break;
-            }
-        }
         // Same loop with the instruction body inlined, so the burst pays the
         // large prologue of `step` once instead of per instruction.
-        #[cfg(feature = "fast_vm")]
         {
-            #[cfg(feature = "perf")]
             let mut n: u64 = 0;
             loop {
                 self.exec_one(ctx);
-                #[cfg(feature = "perf")]
                 {
                     n += 1;
                 }
@@ -1297,7 +1221,6 @@ impl Vm {
                     break;
                 }
             }
-            #[cfg(feature = "perf")]
             {
                 self.instructions = self.instructions.wrapping_add(n);
             }
@@ -1670,9 +1593,6 @@ impl Vm {
         self.target = WidgetId::NONE;
         self.state = VmState::Ready;
         self.fault = fault::NONE;
-        #[cfg(not(feature = "fast_vm"))]
-        self.vars.clear();
-        #[cfg(feature = "fast_vm")]
         self.vars.fill(0);
         self.wait_until = 0;
         self.code = VmCode::None;
@@ -1725,7 +1645,6 @@ impl Vm {
 
     /// `fast_vm`: RAM code is read inline; flash code and the out-of-range
     /// fault go through `read_u8_slow`.
-    #[cfg(feature = "fast_vm")]
     #[inline(always)]
     fn read_u8(&mut self) -> u8 {
         if let VmCode::Ram(data) = &self.code {
@@ -1737,14 +1656,8 @@ impl Vm {
         self.read_u8_slow()
     }
 
-    #[cfg(not(feature = "fast_vm"))]
-    #[inline(never)]
-    fn read_u8(&mut self) -> u8 {
-        self.read_u8_slow()
-    }
 
-    #[cfg_attr(not(feature = "fast_vm"), inline(always))]
-    #[cfg_attr(feature = "fast_vm", inline(never))]
+    #[inline(never)]
     fn read_u8_slow(&mut self) -> u8 {
         let pos = self.pc as usize;
         if pos < self.code.len() {
@@ -1764,7 +1677,6 @@ impl Vm {
     /// The next `N` code bytes. `fast_vm`: one bounds check for RAM code
     /// instead of one per byte; flash code and the out-of-range fault go
     /// byte by byte through `read_u8_slow` (first fault wins, as before).
-    #[cfg(feature = "fast_vm")]
     #[inline(always)]
     fn fetch<const N: usize>(&mut self) -> [u8; N] {
         if let VmCode::Ram(data) = &self.code {
@@ -1779,7 +1691,6 @@ impl Vm {
         self.fetch_slow()
     }
 
-    #[cfg(feature = "fast_vm")]
     #[inline(never)]
     fn fetch_slow<const N: usize>(&mut self) -> [u8; N] {
         let mut out = [0u8; N];
@@ -1789,24 +1700,8 @@ impl Vm {
         out
     }
 
-    /// Byte-wise without `fast_vm` (superinstructions only).
-    #[cfg(all(feature = "superops", not(feature = "fast_vm")))]
-    fn fetch<const N: usize>(&mut self) -> [u8; N] {
-        let mut out = [0u8; N];
-        for b in &mut out {
-            *b = self.read_u8();
-        }
-        out
-    }
 
-    #[cfg(not(feature = "fast_vm"))]
-    #[inline(never)]
-    fn read_u16(&mut self) -> u16 {
-        let lo = self.read_u8() as u16;
-        lo | (self.read_u8() as u16) << 8
-    }
 
-    #[cfg(feature = "fast_vm")]
     #[inline(always)]
     fn read_u16(&mut self) -> u16 {
         u16::from_le_bytes(self.fetch())
@@ -1817,14 +1712,7 @@ impl Vm {
         self.read_u16() as i16
     }
 
-    #[cfg(not(feature = "fast_vm"))]
-    #[inline(never)]
-    fn read_i32(&mut self) -> i32 {
-        let lo = self.read_u16() as u32;
-        (lo | (self.read_u16() as u32) << 16) as i32
-    }
 
-    #[cfg(feature = "fast_vm")]
     #[inline(always)]
     fn read_i32(&mut self) -> i32 {
         i32::from_le_bytes(self.fetch())
@@ -1840,7 +1728,7 @@ impl Vm {
     /// narrow builds compile the u32 path out).
     #[inline]
     fn read_addr(&mut self) -> CodeAddr {
-        if cfg!(feature = "wide_code") && self.wide_addr {
+        if true && self.wide_addr {
             self.read_u32() as CodeAddr
         } else {
             self.read_u16() as CodeAddr
@@ -1850,7 +1738,6 @@ impl Vm {
     // --- Execute a single instruction ---
 
     pub fn step<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
-        #[cfg(feature = "perf")]
         {
             self.instructions = self.instructions.wrapping_add(1);
         }
@@ -1859,7 +1746,7 @@ impl Vm {
 
     /// The instruction body of `step`. `fast_vm` inlines it into the burst
     /// loop in `tick` as well.
-    #[cfg_attr(feature = "fast_vm", inline(always))]
+    #[inline(always)]
     fn exec_one<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         self.op_pc = self.pc;
         let op = self.read_u8();
@@ -2655,7 +2542,6 @@ impl Vm {
                 }
             }
             OP_PROGRAM_ARG => self.push(self.program.arg),
-            #[cfg(feature = "multi_program")]
             OP_TASK_SPAWN..=OP_TASK_FG => self.task_op(ctx, op),
             OP_PROGRAM_NAME => {
                 let index = self.pop();
@@ -2680,7 +2566,6 @@ impl Vm {
             }
 
             // --- Sound (RES_SOUND resources, streamed by runtime's audio pump) ---
-            #[cfg(feature = "audio")]
             OP_SOUND_PLAY => {
                 let (str_id, looping) = self.pop2();
                 let name = ctx.objs.str_get(str_id as ObjPtr);
@@ -2690,14 +2575,11 @@ impl Vm {
                 };
                 self.push(ok as i32);
             }
-            #[cfg(feature = "audio")]
             OP_SOUND_STOP => ctx.audio.stop(),
-            #[cfg(feature = "audio")]
             OP_SOUND_VOLUME => {
                 let vol = self.pop().clamp(0, 100) as u8;
                 ctx.audio.set_volume(vol);
             }
-            #[cfg(feature = "audio")]
             OP_SOUND_PLAYING => self.push(ctx.audio.playing() as i32),
 
             // --- Animation engine ---
@@ -2930,14 +2812,12 @@ impl Vm {
                 self.push(libm::ceilf(v).to_bits() as i32);
             }
 
-            #[cfg(feature = "superops")]
             OP_JCMP => {
                 let cond = self.read_u8();
                 let target = self.read_addr();
                 let (a, b) = self.pop2();
                 self.jump_if(cond, a, b, target);
             }
-            #[cfg(feature = "superops")]
             OP_JCMP_VI => {
                 let [cond, raw, lo, hi] = self.fetch();
                 let imm = i16::from_le_bytes([lo, hi]) as i32;
@@ -2945,7 +2825,6 @@ impl Vm {
                 let a = self.var_get(self.resolve_slot(raw));
                 self.jump_if(cond, a, imm, target);
             }
-            #[cfg(feature = "superops")]
             OP_JCMP_VV => {
                 let [cond, ra, rb] = self.fetch();
                 let target = self.read_addr();
@@ -2953,23 +2832,19 @@ impl Vm {
                 let b = self.var_get(self.resolve_slot(rb));
                 self.jump_if(cond, a, b, target);
             }
-            #[cfg(feature = "superops")]
             OP_BIN_I => {
                 let [op, lo, hi] = self.fetch();
                 self.top_binop(op, i16::from_le_bytes([lo, hi]) as i32);
             }
-            #[cfg(feature = "superops")]
             OP_BIN_I32 => {
                 let [op, a, b, c, d] = self.fetch();
                 self.top_binop(op, i32::from_le_bytes([a, b, c, d]));
             }
-            #[cfg(feature = "superops")]
             OP_BIN_V => {
                 let [op, raw] = self.fetch();
                 let b = self.var_get(self.resolve_slot(raw));
                 self.top_binop(op, b);
             }
-            #[cfg(feature = "superops")]
             OP_ADD_VI => {
                 let [raw, lo, hi] = self.fetch();
                 let imm = i16::from_le_bytes([lo, hi]) as i32;
@@ -2979,7 +2854,6 @@ impl Vm {
                     self.var_set(slot, v);
                 }
             }
-            #[cfg(feature = "superops")]
             OP_STORE_OP => {
                 let [op, raw] = self.fetch();
                 let b = self.pop();
@@ -2991,7 +2865,6 @@ impl Vm {
                     }
                 }
             }
-            #[cfg(feature = "superops")]
             OP_ARR_LOAD_V => {
                 let raw = self.read_u8();
                 let idx = self.pop();
@@ -3006,7 +2879,6 @@ impl Vm {
     }
 
     /// Superinstruction tail: jump to `target` if `a <cond> b`.
-    #[cfg(feature = "superops")]
     #[inline(always)]
     fn jump_if(&mut self, cond: u8, a: i32, b: i32, target: CodeAddr) {
         if self.state == VmState::Error {
@@ -3020,7 +2892,6 @@ impl Vm {
     }
 
     /// Superinstruction tail: top of stack = top <op> b, in place.
-    #[cfg(feature = "superops")]
     #[inline(always)]
     fn top_binop(&mut self, op: u8, b: i32) {
         if self.state == VmState::Error {
@@ -3040,7 +2911,6 @@ impl Vm {
     }
 
     /// The `multi_program` task opcodes (0xD4..=0xDA).
-    #[cfg(feature = "multi_program")]
     #[inline(never)]
     fn task_op<P: Platform>(&mut self, ctx: &mut Ctx<P>, op: u8) {
         let me = ctx.objs.cur_task;
@@ -3090,7 +2960,6 @@ impl Vm {
 
     /// A fresh VM for another task, with this one's pool sizes and platform
     /// hooks. None if the heap can't hold its stacks.
-    #[cfg(feature = "multi_program")]
     pub fn sibling(&self) -> Option<Self> {
         let mut vm = Self::new();
         let (eval, call, cbq) = self.limits();
@@ -3104,8 +2973,7 @@ impl Vm {
 
     // --- Stack operations ---
 
-    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
-    #[cfg_attr(feature = "fast_vm", inline(always))]
+    #[inline(always)]
     fn push(&mut self, val: i32) {
         if (self.sp as usize) < self.stack.len() {
             self.stack[self.sp as usize] = val;
@@ -3118,8 +2986,7 @@ impl Vm {
     // Out of line: once unchecked it is small enough for LLVM to inline at
     // some call sites, which costs more flash than the `bl` it replaces.
     // `fast_vm` (RAM-rich boards) inlines it everywhere.
-    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
-    #[cfg_attr(feature = "fast_vm", inline(always))]
+    #[inline(always)]
     fn pop(&mut self) -> i32 {
         if self.sp > self.sp_floor {
             self.sp -= 1;
@@ -3152,8 +3019,7 @@ impl Vm {
 
     /// `pop2` body, out of line so each call site is just `mov r0, vm; bl`
     /// (inlined with `fast_vm`).
-    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
-    #[cfg_attr(feature = "fast_vm", inline(always))]
+    #[inline(always)]
     fn pop2_raw(&mut self) -> StackPair {
         if self.sp as usize >= self.sp_floor as usize + 2 {
             self.sp -= 2;
@@ -3221,7 +3087,6 @@ impl Vm {
             }
         }
         // An active layer root's position/visibility only places its surface.
-        #[cfg(feature = "layers")]
         if matches!(prop_id, PROP_LOC_X | PROP_LOC_Y | PROP_VISIBLE) && ctx.objs.is_active_layer_root(self.target) {
             return;
         }
@@ -3237,7 +3102,6 @@ impl Vm {
     fn w_set_len<P: Platform>(&mut self, ctx: &mut Ctx<P>, prop_id: u8, data: &[u8]) {
         if self.target.is_some() {
             self.set_compound_prop(prop_id, data, ctx);
-            #[cfg(feature = "layers")]
             if prop_id == PROP_LOCATION && ctx.objs.is_active_layer_root(self.target) {
                 return;
             }
@@ -3335,14 +3199,11 @@ impl Vm {
     fn set_scalar_prop_on<P: Platform>(ctx: &mut Ctx<P>, target: WidgetId, prop_id: u8, val: i32) {
         // Layer props live in the pool's layer table, not in the widget.
         if matches!(prop_id, crate::proto::PROP_LAYER | crate::proto::PROP_LAYER_ALPHA) {
-            #[cfg(feature = "layers")]
             if prop_id == crate::proto::PROP_LAYER {
                 ctx.objs.set_layer(target, val);
             } else {
                 ctx.objs.set_layer_alpha(target, val);
             }
-            #[cfg(not(feature = "layers"))]
-            let _ = (target, val);
             return;
         }
         // Boolean flag props: one table lookup + one set_flag instead of a
@@ -3375,12 +3236,10 @@ impl Vm {
             }
             set_flag(&mut ctx.objs.get_mut(target).flags, flag, val != 0);
             // The task that wires a handler gets the widget's events.
-            #[cfg(feature = "multi_program")]
             if val != 0 && flag & (FLAG_HAS_ON_CLICK | FLAG_HAS_ON_TAP | FLAG_HAS_ON_PAINT) != 0 {
                 ctx.objs.take_handler(target);
             }
             // Showing/hiding an active layer's root only shows/hides its surface.
-            #[cfg(feature = "layers")]
             if flag == FLAG_VISIBLE && ctx.objs.layer_placement_changed(target) {
                 return;
             }
@@ -3497,14 +3356,8 @@ impl Vm {
         let e = &ctx.objs.ext(target);
         let link = |id: WidgetId| if id.is_none() { -1 } else { id.0 as i32 };
         match prop_id {
-            #[cfg(feature = "layers")]
             crate::proto::PROP_LAYER => ctx.objs.layer_of(target),
-            #[cfg(feature = "layers")]
             crate::proto::PROP_LAYER_ALPHA => ctx.objs.layer_alpha(target),
-            #[cfg(not(feature = "layers"))]
-            crate::proto::PROP_LAYER => 0,
-            #[cfg(not(feature = "layers"))]
-            crate::proto::PROP_LAYER_ALPHA => 255,
             // Base fields
             PROP_LOC_X => w.location.x as i32,
             PROP_LOC_Y => w.location.y as i32,
@@ -4053,7 +3906,7 @@ fn image_header_len(fixed: &[u8]) -> Option<usize> {
 /// `code_len` must fit `CodeAddr`, and wide (u32-operand) images need the
 /// `wide_code` feature to decode at all.
 fn code_addressable(wide: bool, code_len: usize) -> bool {
-    (cfg!(feature = "wide_code") || !wide) && code_len <= CodeAddr::MAX as usize
+    (true || !wide) && code_len <= CodeAddr::MAX as usize
 }
 
 // --- Packed u32 helper ---
@@ -4142,7 +3995,6 @@ mod anim_tests {
     use crate::font::FontList;
     use crate::image::ImageList;
     use crate::pool::ObjPool;
-    #[cfg(feature = "audio")]
     use crate::audio::AudioImpl;
     use crate::gpio::GpioImpl;
 
@@ -4158,14 +4010,12 @@ mod anim_tests {
             rtc: RtcImpl::with_backend(MockRtc),
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
-            #[cfg(feature = "audio")]
             audio: AudioImpl::none(),
             #[cfg(feature = "jpeg")]
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,
-            #[cfg(feature = "multi_program")]
             tasks: crate::task::TaskTable::new(),
         }
     }
@@ -4880,7 +4730,6 @@ mod anim_tests {
 
     /// Each superinstruction against the plain sequence it replaces, over
     /// operand values around the edges (overflow, division by 0 and -1).
-    #[cfg(feature = "superops")]
     #[test]
     fn superops_match_plain_sequences() {
         const VALS: [i32; 9] = [0, 1, -1, 7, -13, 255, 32767, i32::MAX, i32::MIN];
@@ -5003,7 +4852,6 @@ mod anim_tests {
 
     /// Dispatch speed on the host (`cargo test --release ... vm_dispatch_bench
     /// -- --ignored --nocapture`): bench mode 0's loop, plain and fused.
-    #[cfg(feature = "superops")]
     #[test]
     #[ignore]
     fn vm_dispatch_bench() {
@@ -5058,14 +4906,6 @@ mod anim_tests {
         }
     }
 
-    #[cfg(not(feature = "superops"))]
-    #[test]
-    fn superops_are_bad_opcodes_without_the_feature() {
-        for op in 0x45..=0x4D {
-            let vm = run_code(&[OP_PUSH_1, op, OP_ADD, 0, 0, 0, 0]);
-            assert_eq!(vm.fault(), fault::BAD_OPCODE, "op {op:#x}");
-        }
-    }
 
     #[test]
     fn fault_bad_opcode() {
@@ -5074,14 +4914,6 @@ mod anim_tests {
         assert_eq!(vm.fault_pc(), 0);
     }
 
-    #[cfg(not(feature = "audio"))]
-    #[test]
-    fn sound_ops_are_bad_opcodes_without_audio() {
-        for op in 0xB9..=0xBC {
-            let vm = run_code(&[op]);
-            assert_eq!(vm.fault(), fault::BAD_OPCODE, "op {op:#x}");
-        }
-    }
 
     #[test]
     fn first_fault_wins_within_instruction() {
@@ -5324,17 +5156,16 @@ mod anim_tests {
     fn wide_image_needs_wide_code() {
         let mut vm = Vm::new();
         let ok = vm.load_ram(&image(IMAGE_FLAG_WIDE_ADDR, &[OP_HALT]));
-        assert_eq!(ok, cfg!(feature = "wide_code"));
+        assert_eq!(ok, true);
     }
 
     #[test]
     fn narrow_build_rejects_code_past_64k() {
         let mut vm = Vm::new();
         let ok = vm.load_ram(&image(0, &alloc::vec![OP_HALT; 0x1_0001]));
-        assert_eq!(ok, cfg!(feature = "wide_code"));
+        assert_eq!(ok, true);
     }
 
-    #[cfg(feature = "wide_code")]
     #[test]
     fn wide_jump_and_call_past_64k() {
         // 0x00000: JMP 0x10000

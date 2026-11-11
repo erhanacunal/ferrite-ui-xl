@@ -524,7 +524,6 @@ fn copy_to_back(l: &Layer) {
             mmu::invalidate_dcache_range(a, e - a);
         }
     }
-    #[cfg(feature = "perf")]
     super::COPY_BYTES.fetch_add(bytes as u32, Ordering::Relaxed);
 }
 

@@ -41,7 +41,7 @@ impl Platform for SimPlatform {
 
     // Software JPEG decoder (sim/src/jpeg.rs) + silent real-time audio
     // output (sim/src/audio.rs).
-    const CAPS: u32 = CAP_AUDIO | CAP_JPEG;
+    const CAPS: u32 = CAP_AUDIO | CAP_JPEG | ferrite_core::platform::CAP_MULTI_PROGRAM | ferrite_core::platform::CAP_SUPEROPS;
     // The tablet demo animates more widgets at once (exynos4412 has 64).
     #[cfg(feature = "tablet")]
     const ANIM_SLOTS: usize = 64;

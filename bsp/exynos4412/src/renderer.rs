@@ -171,7 +171,6 @@ fn draw_plain(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool
         },
         None => {
             // First sighting: drawn by the CPU this time.
-            #[cfg(feature = "perf")]
             ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_FIRST, 1);
             return false;
         }
@@ -185,7 +184,6 @@ fn draw_plain(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool
         let (sx, sy) = ((r.x - abs.x) as usize, (r.y - abs.y) as usize);
         let (dx, dy) = (r.x as usize, r.y as usize);
         let px = sprite.pixels();
-        #[cfg(feature = "perf")]
         ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_BLITS, 1);
         if !lcd::blit_sprite(px, sprite.w, sprite.h, sprite.stride, sx, sy, dx, dy, r.w as usize, r.h as usize) {
             // The G2D gave up (it stays off): this rect by the CPU.
@@ -511,7 +509,6 @@ impl Sprite {
         let start = (px.as_ptr() as usize).next_multiple_of(ROW_ALIGN * 4) - px.as_ptr() as usize;
         let start = start / 4;
         let base = px[start..].as_mut_ptr();
-        #[cfg(feature = "perf")]
         let t0 = crate::perf::cycles();
         // SAFETY: `base` has stride * h words in `px`, and only the
         // primitives touch them until `end_sprite`; w, h are within the panel.
@@ -519,7 +516,6 @@ impl Sprite {
         let local = Rect::new(0, 0, abs.w, abs.h);
         render::draw_default(ctx, id, &local, &ClipRegion::from_rect(local));
         lcd::end_sprite(base, stride * h);
-        #[cfg(feature = "perf")]
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::SPRITE, crate::perf::cycles().wrapping_sub(t0));
         Some(Self { key, w, h, stride, px, start, used: 0 })
     }

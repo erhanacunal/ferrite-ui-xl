@@ -182,12 +182,10 @@ impl PlatformRuntime for Exynos4412Platform {
         heap::stats().size
     }
 
-    #[cfg(feature = "perf")]
     fn cycles() -> u32 {
         crate::perf::cycles()
     }
 
-    #[cfg(feature = "perf")]
     fn cycle_hz() -> u32 {
         crate::perf::hz()
     }
@@ -196,7 +194,6 @@ impl PlatformRuntime for Exynos4412Platform {
         lcd::render_due()
     }
 
-    #[cfg(feature = "perf")]
     fn perf_take_wait() -> u64 {
         crate::perf::take_wait()
     }

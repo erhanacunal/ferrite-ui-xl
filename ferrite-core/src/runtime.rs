@@ -255,13 +255,10 @@ pub trait InputHandler<P: PlatformRuntime>: Sized {
 /// foreground task; without `multi_program` both are `main`.
 pub struct Tasks {
     main: Box<Vm>,
-    #[cfg(feature = "multi_program")]
     kids: Vec<Option<Box<Vm>>>,
     /// Foreground task (copied from `Ctx::tasks` before input handling).
-    #[cfg(feature = "multi_program")]
     fg: u8,
     /// A runtime-owned widget (the task-fault dialog's button) was clicked.
-    #[cfg(feature = "multi_program")]
     sys_click: bool,
 }
 
@@ -269,11 +266,8 @@ impl Tasks {
     fn new(main: Box<Vm>) -> Self {
         Self {
             main,
-            #[cfg(feature = "multi_program")]
             kids: (1..crate::task::MAX_TASKS).map(|_| None).collect(),
-            #[cfg(feature = "multi_program")]
             fg: crate::task::TASK_MAIN,
-            #[cfg(feature = "multi_program")]
             sys_click: false,
         }
     }
@@ -297,17 +291,13 @@ impl Tasks {
         if id == 0 {
             return Some(&mut self.main);
         }
-        #[cfg(feature = "multi_program")]
         {
             self.kids.get_mut(id as usize - 1).and_then(|k| k.as_deref_mut())
         }
-        #[cfg(not(feature = "multi_program"))]
-        None
-    }
+}
 
     /// The task that gets global input events.
     fn fg(&mut self) -> &mut Vm {
-        #[cfg(feature = "multi_program")]
         if self.fg != 0 && self.get(self.fg).is_some() {
             return self.get(self.fg).unwrap();
         }
@@ -316,14 +306,8 @@ impl Tasks {
 
     /// The task that handles widget `id`'s events (None: a runtime widget).
     fn for_widget(&mut self, objs: &ObjPool, id: WidgetId) -> Option<&mut Vm> {
-        #[cfg(feature = "multi_program")]
         {
             self.get(objs.handler_of(id))
-        }
-        #[cfg(not(feature = "multi_program"))]
-        {
-            let _ = (objs, id);
-            Some(&mut self.main)
         }
     }
 
@@ -343,7 +327,6 @@ impl Tasks {
     /// on_click of widget `id` (it has `FLAG_HAS_ON_CLICK`): a modal
     /// overlay's click function, else the handling task's click dispatcher.
     pub fn widget_click(&mut self, objs: &ObjPool, id: WidgetId) {
-        #[cfg(feature = "multi_program")]
         if objs.handler_of(id) == crate::task::TASK_SYSTEM {
             self.sys_click = true;
             return;
@@ -364,7 +347,6 @@ impl Tasks {
     }
 
     /// Drop every child task's VM (program switch / reload).
-    #[cfg(feature = "multi_program")]
     fn drop_kids(&mut self) {
         for k in self.kids.iter_mut() {
             *k = None;
@@ -391,12 +373,10 @@ fn send_kind(vm: &mut Vm, kind: FunctionKind, args: &[i32]) -> bool {
 /// Run `f` on every task's VM, `main` first, with the pool stamping new
 /// objects with that task.
 fn each_task<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, mut f: impl FnMut(&mut Ctx<P>, &mut Vm)) {
-    #[cfg(feature = "multi_program")]
     {
         ctx.objs.cur_task = crate::task::TASK_MAIN;
     }
     f(ctx, &mut tasks.main);
-    #[cfg(feature = "multi_program")]
     {
         for (i, slot) in tasks.kids.iter_mut().enumerate() {
             if let Some(vm) = slot.as_deref_mut() {
@@ -435,10 +415,8 @@ pub struct Runtime<P: PlatformRuntime> {
     /// Time the last USART byte was taken from the RX ring (for resync).
     last_rx_ms: u32,
     /// The open task-fault dialog (`multi_program`).
-    #[cfg(feature = "multi_program")]
     fault_dialog: WidgetId,
     /// Main-loop profile (`perf` feature).
-    #[cfg(feature = "perf")]
     perf: crate::perf::Perf,
 }
 
@@ -446,7 +424,6 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// Runs the startup sequence: ROM font, `P::boot`, mount, syscfg, root
     /// widget, `main` + `setup()`, first frame or error screen.
     pub fn new(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::TouchB>) -> Self {
-        #[cfg(feature = "perf")]
         crate::perf::set_clock(P::cycles);
         // --- Embedded ROM font (always font 0) ---
         ctx.fonts.add(font::Font::from_embedded(
@@ -510,9 +487,7 @@ impl<P: PlatformRuntime> Runtime<P> {
             protocol: Protocol::new(P::FS_BASE),
             error_code,
             last_rx_ms,
-            #[cfg(feature = "multi_program")]
             fault_dialog: WidgetId::NONE,
-            #[cfg(feature = "perf")]
             perf: crate::perf::Perf::new(),
         }
     }
@@ -530,7 +505,6 @@ impl<P: PlatformRuntime> Runtime<P> {
         let wants = |vm: &Vm| {
             matches!(vm.state, VmState::Running | VmState::Yielded | VmState::Exit) || vm.has_pending_callbacks()
         };
-        #[cfg(feature = "multi_program")]
         if self.tasks.kids.iter().flatten().any(|vm| wants(vm)) {
             return true;
         }
@@ -548,11 +522,9 @@ impl<P: PlatformRuntime> Runtime<P> {
         if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.render.maybe_dirty {
             return Some(0);
         }
-        #[cfg(feature = "layers")]
         if self.ctx.objs.layers.placed {
             return Some(0);
         }
-        #[cfg(feature = "audio")]
         if self.ctx.audio.playing() {
             return Some(0);
         }
@@ -561,10 +533,7 @@ impl<P: PlatformRuntime> Runtime<P> {
         }
         let now = self.ctx.systick.millis();
         let mut left: Option<u32> = None;
-        #[cfg(feature = "multi_program")]
         let kids = self.tasks.kids.iter().filter_map(|k| k.as_deref());
-        #[cfg(not(feature = "multi_program"))]
-        let kids = core::iter::empty::<&Vm>();
         for vm in core::iter::once(&*self.tasks.main).chain(kids) {
             if vm.animating() {
                 return Some(0);
@@ -579,7 +548,6 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// One main-loop pass: VM, USART protocol, input, animations, audio,
     /// render, callbacks, `P::frame_end`.
     pub fn step(&mut self) {
-        #[cfg(feature = "perf")]
         let mut t = {
             let now = P::cycles();
             self.perf.pass_start(now);
@@ -588,7 +556,6 @@ impl<P: PlatformRuntime> Runtime<P> {
         // Ends the phase that started at `t` (`perf` feature; else nothing).
         macro_rules! lap {
             ($id:ident) => {
-                #[cfg(feature = "perf")]
                 {
                     t = self.perf.add(crate::perf::phase::$id, t, P::cycles());
                 }
@@ -624,13 +591,11 @@ impl<P: PlatformRuntime> Runtime<P> {
 
         // --- Input ---
         if self.error_code == 0 {
-            #[cfg(feature = "multi_program")]
             {
                 self.tasks.fg = self.ctx.tasks.fg;
             }
             self.input.handle(&mut self.ctx, &mut self.tasks, &mut self.touch);
             self.input.tick(&mut self.ctx);
-            #[cfg(feature = "multi_program")]
             self.close_fault_dialog_on_click();
         }
         lap!(INPUT);
@@ -647,7 +612,6 @@ impl<P: PlatformRuntime> Runtime<P> {
         lap!(ANIM);
 
         // --- Stream the playing sound (if any) into the audio backend ---
-        #[cfg(feature = "audio")]
         self.ctx.audio.pump(&self.ctx.flash);
         lap!(AUDIO);
 
@@ -678,7 +642,6 @@ impl<P: PlatformRuntime> Runtime<P> {
 
         // --- Child tasks: end the ones that exited or faulted, act on
         //     spawn / kill requests, deliver messages ---
-        #[cfg(feature = "multi_program")]
         if self.error_code == 0 {
             self.service_tasks();
         }
@@ -691,7 +654,6 @@ impl<P: PlatformRuntime> Runtime<P> {
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
         P::frame_end(&mut self.ctx);
         lap!(FRAME_END);
-        #[cfg(feature = "perf")]
         {
             self.perf.add_cycles(crate::perf::phase::VSYNC_WAIT, P::perf_take_wait());
             self.perf.pass_end(t);
@@ -699,7 +661,6 @@ impl<P: PlatformRuntime> Runtime<P> {
     }
 
     /// Answers a `Perf` query: the profile since the last one, then resets it.
-    #[cfg(feature = "perf")]
     fn send_perf(&mut self) {
         use crate::perf::{phase, to_us};
         let hz = P::cycle_hz();
@@ -797,7 +758,6 @@ impl<P: PlatformRuntime> Runtime<P> {
                 let entries = mem_detail(&self.ctx, &self.tasks.main);
                 protocol::send_memdetail(&self.ctx.usart, &entries);
             }
-            #[cfg(feature = "perf")]
             RxEvent::Perf => self.send_perf(),
             RxEvent::SetDateTime => {
                 let dt = self.protocol.datetime();
@@ -820,7 +780,6 @@ impl<P: PlatformRuntime> Runtime<P> {
             RxEvent::FsReady => {
                 self.drop_children();
                 self.tasks.main.reset();
-                #[cfg(feature = "audio")]
                 self.ctx.audio.stop();
                 self.ctx.objs.clear();
                 self.ctx.images.clear();
@@ -1086,7 +1045,6 @@ fn switch_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut
     ctx.objs.clear();
     ctx.images.clear();
     vm.reset();
-    #[cfg(feature = "audio")]
     ctx.audio.stop();
     input.reset(ctx);
     ctx.cursor_visible = false;
@@ -1114,7 +1072,6 @@ fn reload_program<P: PlatformRuntime>(
 ) -> u8 {
     ctx.objs.clear();
     vm.reset();
-    #[cfg(feature = "audio")]
     ctx.audio.stop();
     input.reset(ctx);
     ctx.cursor_visible = false;
@@ -1147,9 +1104,6 @@ fn check_vm_fault<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) -> u8 {
 /// Run the on_paint dispatchers for the widgets in `paint`: each task paints
 /// the widgets it handles.
 fn run_paint<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, paint: &render::PaintList) {
-    #[cfg(not(feature = "multi_program"))]
-    tasks.main.run_paint(ctx, paint);
-    #[cfg(feature = "multi_program")]
     each_task(ctx, tasks, |ctx, vm| {
         let me = ctx.objs.cur_task;
         let mut mine = render::PaintList::new();
@@ -1169,7 +1123,6 @@ fn run_paint<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, paint: &re
 impl<P: PlatformRuntime> Runtime<P> {
     /// End every child task (main program switch, reload, filesystem write).
     fn drop_children(&mut self) {
-        #[cfg(feature = "multi_program")]
         {
             self.tasks.drop_kids();
             self.ctx.tasks.reset();
@@ -1178,7 +1131,6 @@ impl<P: PlatformRuntime> Runtime<P> {
     }
 }
 
-#[cfg(feature = "multi_program")]
 impl<P: PlatformRuntime> Runtime<P> {
     /// Once per pass, after the bursts and callbacks: end the children that
     /// exited or faulted, act on kill / spawn requests, deliver messages.
@@ -1319,13 +1271,11 @@ impl<P: PlatformRuntime> Runtime<P> {
 }
 
 /// A line of text assembled from parts (cut at 64 bytes).
-#[cfg(feature = "multi_program")]
 struct Line {
     buf: [u8; 64],
     len: usize,
 }
 
-#[cfg(feature = "multi_program")]
 impl Line {
     fn new() -> Self {
         Self { buf: [0; 64], len: 0 }
@@ -1363,7 +1313,6 @@ impl Line {
 }
 
 /// A runtime widget under `parent`, with centred `text` (if any).
-#[cfg(feature = "multi_program")]
 #[allow(clippy::too_many_arguments)]
 fn sys_widget<P: PlatformRuntime>(
     ctx: &mut Ctx<P>,
@@ -1393,7 +1342,6 @@ fn sys_widget<P: PlatformRuntime>(
 }
 
 /// The task-fault dialog (see `Runtime::show_fault_dialog`).
-#[cfg(feature = "multi_program")]
 fn build_fault_dialog<P: PlatformRuntime>(
     ctx: &mut Ctx<P>,
     name: &[u8],
@@ -2471,7 +2419,6 @@ mod mock_runtime {
 #[cfg(all(test, feature = "mock"))]
 mod mem_detail_tests {
     use super::*;
-    #[cfg(feature = "audio")]
     use crate::audio::AudioImpl;
     use crate::backlight::BacklightImpl;
     use crate::flash::FlashImpl;
@@ -2497,14 +2444,12 @@ mod mem_detail_tests {
             rtc: RtcImpl::with_backend(MockRtc),
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
-            #[cfg(feature = "audio")]
             audio: AudioImpl::none(),
             #[cfg(feature = "jpeg")]
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,
-            #[cfg(feature = "multi_program")]
             tasks: crate::task::TaskTable::new(),
         }
     }
@@ -2547,7 +2492,7 @@ mod mem_detail_tests {
     }
 }
 
-#[cfg(all(test, feature = "mock", feature = "multi_program"))]
+#[cfg(all(test, feature = "mock"))]
 mod multi_tests {
     //! Several programs on one tree, through `Runtime::new` + `step` on a
     //! mock filesystem with hand-assembled programs.

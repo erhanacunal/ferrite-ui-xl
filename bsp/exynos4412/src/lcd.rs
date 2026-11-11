@@ -77,27 +77,17 @@ use ferrite_core::types::Rect as UiRect;
 
 use crate::systick;
 
-#[cfg(feature = "layers")]
 #[path = "lcd_layers.rs"]
 mod layers;
 
 /// Layer shadows drawn through the uncached alias (`layers::UNCACHED`).
-#[cfg(feature = "layers")]
 pub use layers::UNCACHED as LAYER_UNCACHED;
-/// Without layers: nothing to switch.
-#[cfg(not(feature = "layers"))]
-pub static LAYER_UNCACHED: AtomicBool = AtomicBool::new(false);
 
 /// Some layer surface is allocated or shown (FIMD windows 1-4 are the
 /// renderer's then: the overlay board test stays off).
 pub fn layers_in_use() -> bool {
-    #[cfg(feature = "layers")]
     {
         layers::in_use()
-    }
-    #[cfg(not(feature = "layers"))]
-    {
-        false
     }
 }
 
@@ -237,7 +227,6 @@ impl Target {
         if !self.sprite {
             mark(x, y, w, h);
         } else if self.layer != NO_LAYER {
-            #[cfg(feature = "layers")]
             layers::mark(self.layer as usize, x, y, w, h);
         }
     }
@@ -373,7 +362,6 @@ struct G2dJob {
     /// (CPU fallback).
     back: usize,
     nc: usize,
-    #[cfg(feature = "perf")]
     t0: u32,
 }
 
@@ -386,7 +374,6 @@ static JOB: JobCell = JobCell(UnsafeCell::new(G2dJob {
     band_end: 0,
     back: 0,
     nc: 0,
-    #[cfg(feature = "perf")]
     t0: 0,
 }));
 
@@ -414,7 +401,6 @@ struct Present {
     nc: [usize; 2],
     /// Layer window changes that go out with this present's switch (written
     /// before `STATE` = COPY, taken by [`show`]).
-    #[cfg(feature = "layers")]
     layers: layers::Commit,
 }
 
@@ -428,7 +414,6 @@ static PRESENT: PresentCell = PresentCell(UnsafeCell::new(Present {
     front: SCAN_A,
     fb: [None, None],
     nc: [0, 0],
-    #[cfg(feature = "layers")]
     layers: layers::Commit { windows: [None; layers::COUNT] },
 }));
 
@@ -447,7 +432,6 @@ const POLL_LIMIT: u32 = 10_000_000;
 /// the profiler (`CPU_BLEND_KPX`).
 macro_rules! cpu_blend {
     ($t:expr, $px:expr) => {{
-        #[cfg(feature = "perf")]
         if !$t.sprite {
             crate::perf::add_px(ferrite_core::perf::count::CPU_BLEND_KPX, $px);
         }
@@ -456,10 +440,8 @@ macro_rules! cpu_blend {
 
 macro_rules! timed {
     ($body:block) => {{
-        #[cfg(feature = "perf")]
         let t0 = crate::perf::cycles();
         let r = $body;
-        #[cfg(feature = "perf")]
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::PIXELS, crate::perf::cycles().wrapping_sub(t0));
         r
     }};
@@ -477,7 +459,6 @@ fn fence(y0: usize, y1: usize) {
 #[cold]
 #[inline(never)]
 fn wait_rows(y0: usize, y1: usize) {
-    #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();
     // `lo` is read before `hi`: CPU2 only raises `lo` and lowers `hi` within
     // a copy, so the pair always covers what it may still read.
@@ -500,7 +481,6 @@ fn wait_rows(y0: usize, y1: usize) {
         }
         core::hint::spin_loop();
     }
-    #[cfg(feature = "perf")]
     crate::perf::add_wait(crate::perf::cycles().wrapping_sub(t0));
 }
 
@@ -511,7 +491,6 @@ fn wait_rows(y0: usize, y1: usize) {
 /// that present is done; drawing more meanwhile is wasted.
 pub fn render_due() -> bool {
     let nothing_waits = unsafe { is_empty(&*(&raw const DIRTY)) };
-    #[cfg(feature = "layers")]
     let nothing_waits = nothing_waits && !layers::pending();
     nothing_waits || STATE.load(Ordering::Acquire) == IDLE
 }
@@ -532,7 +511,6 @@ pub fn flush() {
     let d = unsafe { &mut *(&raw mut DIRTY) };
     // Layers: their new pixels into their back buffers; the window changes
     // go out with window 0's switch below, or now if it has nothing.
-    #[cfg(feature = "layers")]
     if STATE.load(Ordering::Acquire) == IDLE {
         // A layer flip not on screen yet: window 0 waits too (same frame).
         let Some(commit) = layers::prepare() else { return };
@@ -595,13 +573,8 @@ pub fn settled() -> bool {
 }
 
 fn layers_pending() -> bool {
-    #[cfg(feature = "layers")]
     {
         layers::pending()
-    }
-    #[cfg(not(feature = "layers"))]
-    {
-        false
     }
 }
 
@@ -609,11 +582,8 @@ fn layers_pending() -> bool {
 /// window changes handed over for this present in the same frame.
 fn show(p: &mut Present, i: usize) -> Result<(), display::Error> {
     let fimd = Fimd::new();
-    #[cfg(feature = "layers")]
     let commit = core::mem::take(&mut p.layers);
-    #[cfg(feature = "layers")]
     let hold = if commit.any() { 1 | commit.mask() } else { 0 };
-    #[cfg(feature = "layers")]
     if hold != 0 {
         fimd.hold_updates(hold);
     }
@@ -621,7 +591,6 @@ fn show(p: &mut Present, i: usize) -> Result<(), display::Error> {
         Some(fb) => fimd.show(fb),
         None => Err(display::Error::BadSize),
     };
-    #[cfg(feature = "layers")]
     if hold != 0 {
         commit.apply(&fimd);
         fimd.release_updates(hold);
@@ -641,7 +610,6 @@ fn g2d_start(d: &mut Rect) {
     *d = EMPTY;
     let r = union(p.prev, p.req);
     let nc = p.nc[back_i];
-    #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();
     // The G2D reads DRAM: what this core drew is still in its L1 and in the
     // PL310. L1 by set/way is ~1000 operations, the PL310 by way one
@@ -664,7 +632,6 @@ fn g2d_start(d: &mut Rect) {
     j.band_end = r[1];
     j.back = back;
     j.nc = nc;
-    #[cfg(feature = "perf")]
     {
         j.t0 = t0;
     }
@@ -769,14 +736,11 @@ fn g2d_finish(j: &G2dJob) {
     // The copy has reached DRAM before the FIMD may scan it.
     // SAFETY: a barrier only.
     unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
-    #[cfg(feature = "perf")]
     {
         COPY_CYCLES.fetch_add(crate::perf::cycles().wrapping_sub(j.t0), Ordering::Relaxed);
         COPY_COUNT.fetch_add(1, Ordering::Relaxed);
         COPY_BYTES.fetch_add(((j.r[3] - j.r[1]) * (j.r[2] - j.r[0]) * 4) as u32, Ordering::Relaxed);
     }
-    #[cfg(not(feature = "perf"))]
-    let _ = j;
     FRAMES.fetch_add(1, Ordering::Relaxed);
     let p = present_state();
     let _ = show(p, 1 - p.front);
@@ -813,7 +777,6 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     let nc = p.nc[back_i];
     let dst = if nc != 0 { nc as *mut u32 } else { buf_ptr(back_i) };
     rows(r[1], r[3]);
-    #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();
     for y in r[1]..r[3] {
         let at = y * W + x;
@@ -828,7 +791,6 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     // The copy has reached DRAM before the FIMD may scan it.
     // SAFETY: a barrier only.
     unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
-    #[cfg(feature = "perf")]
     {
         COPY_CYCLES.fetch_add(crate::perf::cycles().wrapping_sub(t0), Ordering::Relaxed);
         COPY_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1258,31 +1220,25 @@ impl LcdBackend for FimdLcd {
     }
 
     // Retained layers on FIMD windows 1-4 (`lcd_layers.rs`).
-    #[cfg(feature = "layers")]
     const LAYERS: usize = layers::COUNT;
 
-    #[cfg(feature = "layers")]
     fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
         layers::alloc(n, w as usize, h as usize)
     }
 
-    #[cfg(feature = "layers")]
     fn layer_free(&self, n: usize) {
         COMPOSED.fetch_and(!(1 << n), Ordering::Relaxed);
         layers::free(n);
     }
 
-    #[cfg(feature = "layers")]
     fn layer_target(&self, n: Option<usize>) {
         layers::target(n);
     }
 
-    #[cfg(feature = "layers")]
     fn layer_clear(&self, x: u16, y: u16, w: u16, h: u16) {
         layers::clear(x, y, w, h);
     }
 
-    #[cfg(feature = "layers")]
     fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
         if visible && COMPOSED.fetch_and(!(1 << n), Ordering::Relaxed) & 1 << n != 0 {
             exynos_4412_rs::println!("ferrite: layer {} in its window again", n);
@@ -1290,10 +1246,8 @@ impl LcdBackend for FimdLcd {
         layers::place(n, x, y, alpha, visible);
     }
 
-    #[cfg(feature = "layers")]
     const LAYER_COMPOSE: bool = true;
 
-    #[cfg(feature = "layers")]
     fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
         if COMPOSED.fetch_or(1 << n, Ordering::Relaxed) & 1 << n == 0 {
             exynos_4412_rs::println!("ferrite: layer {} composed into the screen", n);
@@ -1305,7 +1259,6 @@ impl LcdBackend for FimdLcd {
 /// The GPU compositor samples a composed layer's shadow: layer `n`'s shadow as (address,
 /// width, height), rect (`x`, `y`, `w`, `h`) of it cleaned to DRAM first (as for the G2D).
 /// None if the layer has no surface.
-#[cfg(feature = "layers")]
 pub fn layer_texture(n: usize, x: usize, y: usize, w: usize, h: usize) -> Option<(usize, usize, usize)> {
     if COMPOSED.fetch_or(1 << n, Ordering::Relaxed) & 1 << n == 0 {
         exynos_4412_rs::println!("ferrite: layer {} composed into the screen", n);
@@ -1316,7 +1269,6 @@ pub fn layer_texture(n: usize, x: usize, y: usize, w: usize, h: usize) -> Option
 
 /// Layers composed into the screen since they were last placed in their
 /// window (bit n), only for the console lines (as the sim prints them).
-#[cfg(feature = "layers")]
 static COMPOSED: AtomicU8 = AtomicU8::new(0);
 
 /// `LcdBackend::layer_compose`: blends `size` pixels of layer `n`'s shadow
@@ -1324,7 +1276,6 @@ static COMPOSED: AtomicU8 = AtomicU8::new(0);
 /// The G2D blends (as a sprite blit) when the plane alpha is 255, or below it
 /// once its global-alpha "over" has been checked ([`g2d_global_alpha_matches`]);
 /// otherwise, or if it can't, the CPU.
-#[cfg(feature = "layers")]
 fn compose_layer(n: usize, src: (usize, usize), size: (usize, usize), dst: (usize, usize), alpha: u8) {
     let t = target();
     let ((sx, sy), (w, h), (dx, dy)) = (src, size, dst);
@@ -1441,16 +1392,12 @@ fn g2d_op(what: &str, px: usize, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>
     if !G2D_DRAW.load(Ordering::Relaxed) {
         return false;
     }
-    #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();
     let ok = g2d_op_inner(what, op);
-    #[cfg(feature = "perf")]
     {
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
         crate::perf::add_px(ferrite_core::perf::count::G2D_KPX, px);
     }
-    #[cfg(not(feature = "perf"))]
-    let _ = px;
     ok
 }
 
@@ -1602,7 +1549,6 @@ pub fn blit_sprite(
     #[cfg(feature = "g2d_render")]
     {
         let sprite = Surface { address: px as usize, stride: stride * 4, width: sw, height: sh, format: Format::Argb8888 };
-        #[cfg(feature = "layers")]
         if let Some(t) = unsafe { *(&raw const LAYER_TARGET) } {
             return blit_layer(&t, &sprite, sx, sy, dx, dy, w, h);
         }
@@ -1670,11 +1616,11 @@ pub static LAYER_BLITS: AtomicBool = AtomicBool::new(false);
 /// large see-through widgets inside layers that way): G2D drawing is on and
 /// its "over" onto an ARGB8888 target matches the CPU's ([`g2d_over_matches`]).
 pub fn layer_blits_ready() -> bool {
-    #[cfg(all(feature = "g2d_render", feature = "layers"))]
+    #[cfg(feature = "g2d_render")]
     {
         LAYER_BLITS.load(Ordering::Relaxed) && g2d_draw_ready() && g2d_over_matches()
     }
-    #[cfg(not(all(feature = "g2d_render", feature = "layers")))]
+    #[cfg(not(feature = "g2d_render"))]
     {
         false
     }
@@ -1683,7 +1629,7 @@ pub fn layer_blits_ready() -> bool {
 /// [`blit_sprite`] into the targeted layer's surface (premultiplied
 /// ARGB8888, drawn cached by the CPU): cleaned before the G2D reads it,
 /// dropped from the caches after it wrote it.
-#[cfg(all(feature = "g2d_render", feature = "layers"))]
+#[cfg(feature = "g2d_render")]
 #[allow(clippy::too_many_arguments)]
 fn blit_layer(t: &Target, sprite: &Surface, sx: usize, sy: usize, dx: usize, dy: usize, w: usize, h: usize) -> bool {
     if !g2d_over_matches() {
@@ -1693,19 +1639,15 @@ fn blit_layer(t: &Target, sprite: &Surface, sx: usize, sy: usize, dx: usize, dy:
     let Some((phys, _)) = layers::shadow(t) else { return false };
     let target = Surface { address: phys, stride: t.stride * 4, width: t.w, height: t.h, format: Format::Argb8888 };
     // The cache maintenance counts as G2D drawing time (`perf`).
-    #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();
     layers::g2d_begin(t, dx, dy, w, h);
-    #[cfg(feature = "perf")]
     ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
     let ok = g2d_op("layer sprite blit", w * h, |g| {
         let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
         g.blend(sprite, from, Alpha::Premultiplied, &target, to, Filter::Nearest, 255)
     });
-    #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();
     layers::g2d_end(t, dx, dy, w, h);
-    #[cfg(feature = "perf")]
     ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
     if ok {
         t.mark(dx, dy, w, h);
@@ -1716,18 +1658,18 @@ fn blit_layer(t: &Target, sprite: &Surface, sx: usize, sy: usize, dx: usize, dy:
 /// 0 = not checked yet, 1 = a G2D premultiplied blend onto an ARGB8888
 /// target gives what the CPU's [`over`] gives (alpha byte included, within
 /// rounding), 2 = it does not (layer sprites drawn by the CPU).
-#[cfg(all(feature = "g2d_render", feature = "layers"))]
+#[cfg(feature = "g2d_render")]
 static G2D_OVER: AtomicU8 = AtomicU8::new(0);
 
 /// Most a G2D blend byte may differ from the CPU's: both round, differently
 /// (the screen's sprite blits differ by as much).
-#[cfg(all(feature = "g2d_render", feature = "layers"))]
+#[cfg(feature = "g2d_render")]
 const OVER_TOLERANCE: u32 = 3;
 
 /// Whether a G2D premultiplied "over" onto an ARGB8888 target computes the
 /// target's alpha as Sa + Da·(1 − Sa) (and the colours likewise), checked
 /// once on translucent, opaque and transparent pixels.
-#[cfg(all(feature = "g2d_render", feature = "layers"))]
+#[cfg(feature = "g2d_render")]
 fn g2d_over_matches() -> bool {
     match G2D_OVER.load(Ordering::Relaxed) {
         1 => return true,
@@ -1794,7 +1736,7 @@ fn g2d_over_matches() -> bool {
 /// onto the XRGB8888 screen gives what [`compose_layer`]'s CPU loop gives
 /// (within [`OVER_TOLERANCE`]), 2 = it does not (plane alpha < 255 composed
 /// by the CPU).
-#[cfg(all(feature = "g2d_render", feature = "layers"))]
+#[cfg(feature = "g2d_render")]
 static G2D_GA: AtomicU8 = AtomicU8::new(0);
 
 /// Whether the G2D's "over" with a global alpha Ga (the vendor kernel's
@@ -1803,7 +1745,7 @@ static G2D_GA: AtomicU8 = AtomicU8::new(0);
 /// target like the screen's shadow. Checked once, on translucent, opaque and
 /// transparent pixels at several global alphas; the result goes to the
 /// console either way.
-#[cfg(all(feature = "g2d_render", feature = "layers"))]
+#[cfg(feature = "g2d_render")]
 fn g2d_global_alpha_matches() -> bool {
     match G2D_GA.load(Ordering::Relaxed) {
         1 => return true,
@@ -1893,7 +1835,6 @@ pub fn grab() -> Option<alloc::vec::Vec<u32>> {
     // SAFETY: the shadow holds PIXELS words; nothing draws while CPU0 is here.
     copy.extend_from_slice(unsafe { core::slice::from_raw_parts(back() as *const u32, PIXELS) });
     // What the FIMD shows over it.
-    #[cfg(feature = "layers")]
     layers::composite(&mut copy, W, H);
     Some(copy)
 }
@@ -1942,7 +1883,6 @@ pub fn copy_rgb565(addr: usize, sw: usize, sh: usize, sx: usize, sy: usize, dx: 
         });
         if ok {
             mark(dx, dy, w, h);
-            #[cfg(feature = "perf")]
             ferrite_core::perf::add_count(ferrite_core::perf::count::PICTURE_COPIES, 1);
         }
         ok
@@ -2070,7 +2010,6 @@ fn g2d_move(way: Moved, rects: &[UiRect], dx: i16, dy: i16) -> Moved {
     // One G2D copy of `r` from `src` to `dst` at (`tx`, `ty`).
     let copy = |what: &str, src: &Surface, r: &UiRect, dst: &Surface, tx: usize, ty: usize| {
         let (x, y, w, h) = (r.x as usize, r.y as usize, r.w as usize, r.h as usize);
-        #[cfg(feature = "perf")]
         ferrite_core::perf::add_count(ferrite_core::perf::count::MOVE_OPS, 1);
         let (from, to) = (g2d::Rect::new(x, y, w, h), g2d::Rect::new(tx, ty, w, h));
         g2d_op(what, w * h, |g| g.copy(src, from, dst, to, Filter::Nearest))

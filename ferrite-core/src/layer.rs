@@ -734,7 +734,6 @@ mod tests {
         type RtcB = MockRtc;
         type UsartB = MockUsart;
         type SystickB = MockSystick;
-        #[cfg(feature = "audio")]
         type AudioB = crate::audio::NoAudio;
         #[cfg(feature = "jpeg")]
         type JpegB = crate::jpeg::NoJpeg;
@@ -761,14 +760,12 @@ mod tests {
             rtc: RtcImpl::with_backend(MockRtc),
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
-            #[cfg(feature = "audio")]
             audio: crate::audio::AudioImpl::none(),
             #[cfg(feature = "jpeg")]
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(MockEeprom::default()),
             cursor_visible: false,
-            #[cfg(feature = "multi_program")]
             tasks: crate::task::TaskTable::new(),
         }
     }
@@ -1243,7 +1240,6 @@ mod tests {
         type RtcB = MockRtc;
         type UsartB = MockUsart;
         type SystickB = MockSystick;
-        #[cfg(feature = "audio")]
         type AudioB = crate::audio::NoAudio;
         #[cfg(feature = "jpeg")]
         type JpegB = crate::jpeg::NoJpeg;
@@ -1265,14 +1261,12 @@ mod tests {
             rtc: c.rtc,
             usart: c.usart,
             systick: c.systick,
-            #[cfg(feature = "audio")]
             audio: c.audio,
             #[cfg(feature = "jpeg")]
             jpeg: c.jpeg,
             gpio: c.gpio,
             eeprom: c.eeprom,
             cursor_visible: c.cursor_visible,
-            #[cfg(feature = "multi_program")]
             tasks: c.tasks,
         }
     }

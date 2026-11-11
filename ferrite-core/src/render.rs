@@ -4476,4 +4476,35 @@ mod shift_tests {
             assert!(direct.lcd.scissor() == replayed.lcd.scissor());
         }
     }
+
+    /// What the VM's drawing builtins (`Vm::draw_op`) call, recorded and
+    /// replayed (an `on_paint` with display lists), draws what drawing them
+    /// directly does, the 1 px arc (`Op::ThinArc`) included.
+    #[test]
+    fn recorded_vm_drawing_matches_direct_drawing() {
+        fn draw<C: Canvas>(c: &C) {
+            c.fill_rect(4, 4, 60, 30, 0x1234);
+            c.draw_rect(10, 40, 50, 20, 0xF800);
+            c.draw_line(0, 0, 120, 90, 0x07E0);
+            c.draw_circle(80, 30, 18, 0x001F);
+            c.fill_circle(40, 100, 14, 0xFFE0);
+            c.draw_rounded_rect(70, 60, 50, 30, 8, 0xF81F);
+            c.fill_rounded_rect(20, 70, 40, 24, 6, 0x07FF);
+            c.draw_arc(90, 100, 20, 30, 250, 0xFFFF);
+            c.draw_arc(30, 30, 12, 300, 60, 0x8410);
+        }
+        let direct = ctx::<false>();
+        draw(&direct.lcd);
+        let replayed = ctx::<false>();
+        let rec = crate::dl::Recorder::new();
+        assert!(rec.begin(&replayed.lcd));
+        draw(&rec);
+        rec.end();
+        assert!(rec.list().ops.iter().any(|op| matches!(op, crate::dl::Op::ThinArc { .. })));
+        rec.list().replay(&replayed.lcd);
+        let (a, b) = (direct.lcd.backend().px.borrow(), replayed.lcd.backend().px.borrow());
+        assert!(a.iter().filter(|&&p| p != 0).count() > 1000);
+        let diff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+        assert_eq!(diff, 0, "{diff} pixels differ");
+    }
 }

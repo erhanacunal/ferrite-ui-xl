@@ -150,6 +150,12 @@ pub(crate) struct RenderState {
     pub(crate) dl: crate::dl::Recorder,
     /// Recorded lists by look (`render::dl_key`); emptied with the tree.
     pub(crate) dl_cache: core::cell::RefCell<crate::dl::Cache>,
+    /// `on_paint` recording (display lists, `Vm::run_paint`): the VM's
+    /// drawing builtins go to `paint_rec` while `painting` is up.
+    pub(crate) paint_rec: crate::dl::Recorder,
+    pub(crate) painting: core::cell::Cell<bool>,
+    /// Each `on_paint` widget's last paint list, by widget id.
+    pub(crate) paints: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, crate::dl::List>>,
 }
 
 impl RenderState {
@@ -164,6 +170,9 @@ impl RenderState {
             shift_keep: Vec::new(),
             dl: crate::dl::Recorder::new(),
             dl_cache: core::cell::RefCell::new(crate::dl::Cache::new()),
+            paint_rec: crate::dl::Recorder::new(),
+            painting: core::cell::Cell::new(false),
+            paints: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             geo: Vec::new(),
             geo_stack: Vec::new(),
             geo_valid: false,
@@ -182,6 +191,7 @@ impl RenderState {
         }
         // Images, fonts and strings are reloaded with the tree.
         self.dl_cache.get_mut().clear();
+        self.paints.get_mut().clear();
     }
 }
 

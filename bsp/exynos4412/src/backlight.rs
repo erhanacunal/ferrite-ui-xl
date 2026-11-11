@@ -9,6 +9,24 @@ use ferrite_core::backlight::BacklightBackend;
 
 static LEVEL: AtomicU8 = AtomicU8::new(0);
 
+/// A level asked for over HTTP (`/api/backlight`), applied by CPU0 in
+/// `frame_end` (`service`); `NONE` = nothing asked.
+pub static WANT: AtomicU8 = AtomicU8::new(NONE);
+const NONE: u8 = u8::MAX;
+
+/// Apply a level asked for over HTTP.
+pub fn service(ctx: &ferrite_core::ctx::Ctx<crate::platform::Exynos4412Platform>) {
+    let p = WANT.swap(NONE, Ordering::Relaxed);
+    if p != NONE {
+        ctx.backlight.set_brightness(p);
+    }
+}
+
+/// The level now, in percent.
+pub fn level() -> u8 {
+    LEVEL.load(Ordering::Relaxed)
+}
+
 pub struct GpioBacklight;
 
 impl BacklightBackend for GpioBacklight {

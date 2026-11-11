@@ -50,7 +50,8 @@ pub fn verify() -> bool {
 
 /// Counters since boot (free-running; take differences): replays from the
 /// cache, direct draws (a look not seen before), lists recorded, lists
-/// evicted; and the bytes held now.
+/// evicted, `on_paint` lists recorded (`Vm::run_paint`); and the bytes held now.
+pub static PAINTS: AtomicU32 = AtomicU32::new(0);
 pub static HITS: AtomicU32 = AtomicU32::new(0);
 pub static DIRECT: AtomicU32 = AtomicU32::new(0);
 pub static STORES: AtomicU32 = AtomicU32::new(0);
@@ -111,6 +112,7 @@ pub enum Op {
     StrokeEllipse { cx: i16, cy: i16, rx: i16, ry: i16, thickness: i16, color: u16 },
     Oval { x: i16, y: i16, w: u16, h: u16, t: u16, color: u16 },
     Arc { cx: i16, cy: i16, r: i16, ir: i16, start: i16, end: i16, color: u16 },
+    ThinArc { cx: i16, cy: i16, r: i16, start: i16, end: i16, color: u16 },
     RoundedRect { x: u16, y: u16, w: u16, h: u16, r: u16, color: u16 },
     FillRoundedRect { x: u16, y: u16, w: u16, h: u16, r: u16, color: u16 },
     FillRoundedRectAt { x: i16, y: i16, w: u16, h: u16, r: u16, color: u16, alpha: u8 },
@@ -310,6 +312,7 @@ impl List {
                 }
                 Op::Oval { x, y, w, h, t, color } => c.draw_oval(x, y, w, h, t, color),
                 Op::Arc { cx, cy, r, ir, start, end, color } => c.fill_arc(cx, cy, r, ir, start, end, color),
+                Op::ThinArc { cx, cy, r, start, end, color } => c.draw_arc(cx, cy, r, start, end, color),
                 Op::RoundedRect { x, y, w, h, r, color } => c.draw_rounded_rect(x, y, w, h, r, color),
                 Op::FillRoundedRect { x, y, w, h, r, color } => c.fill_rounded_rect(x, y, w, h, r, color),
                 Op::FillRoundedRectAt { x, y, w, h, r, color, alpha } => {
@@ -579,6 +582,9 @@ impl Canvas for Recorder {
     }
     fn fill_arc(&self, cx: i16, cy: i16, r: i16, ir: i16, start: i16, end: i16, color: u16) {
         self.push(Op::Arc { cx, cy, r, ir, start, end, color });
+    }
+    fn draw_arc(&self, cx: i16, cy: i16, r: i16, start: i16, end: i16, color: u16) {
+        self.push(Op::ThinArc { cx, cy, r, start, end, color });
     }
     fn draw_rounded_rect(&self, x: u16, y: u16, w: u16, h: u16, r: u16, color: u16) {
         self.push(Op::RoundedRect { x, y, w, h, r, color });

@@ -85,7 +85,7 @@ pub const ALIGN_RIGHT: u8 = 2;
 // --- WidgetId ---
 
 /// Widget pointer (an `ObjPtr` naming a `T_WIDGET` object). NONE = no link.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WidgetId(pub ObjPtr);
 
 impl WidgetId {

@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use crate::canvas::Canvas;
 use crate::ctx::Ctx;
 use crate::flash::{FlashBackend, FlashImpl};
 use crate::platform::Platform;
@@ -33,6 +34,20 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::syscfg::try_alloc_slice;
+
+/// Run `$body` with `$c` = the canvas VM drawing goes to: the `on_paint`
+/// recorder while one is recording (`Vm::run_paint`), else the screen.
+macro_rules! canvas {
+    ($ctx:expr, |$c:ident| $body:block) => {
+        if $ctx.objs.render.painting.get() {
+            let $c = &$ctx.objs.render.paint_rec;
+            $body
+        } else {
+            let $c = &$ctx.lcd;
+            $body
+        }
+    };
+}
 
 // === Code source — owned by VM ===
 
@@ -1304,6 +1319,10 @@ impl Vm {
         if n == 0 {
             return;
         }
+        if crate::dl::enabled() {
+            self.record_paint(ctx, offset, &ids[..n]);
+            return;
+        }
         let Some(arr_id) = ctx.objs.arr_from(&ids[..n]) else {
             return;
         };
@@ -1313,6 +1332,151 @@ impl Vm {
         // The id list lives only for the call (it used to leak one array per
         // painted frame).
         ctx.objs.arr_free(arr_id);
+    }
+
+    /// Display lists: run the `on_paint` dispatcher once per widget with the
+    /// drawing builtins recording (`draw_op`), replay each list where the
+    /// drawing would have gone and keep it as the widget's paint list
+    /// (`ObjPool::render.paints`). Pixel-identical to drawing directly.
+    fn record_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, offset: CodeAddr, ids: &[i32]) {
+        for &raw in ids {
+            if self.state == VmState::Error {
+                break;
+            }
+            let Some(arr_id) = ctx.objs.arr_from(&[raw]) else {
+                return;
+            };
+            let state = &ctx.objs.render;
+            let recording = state.paint_rec.begin(&ctx.lcd);
+            state.painting.set(recording);
+            self.in_paint = true;
+            self.call_now(offset, &[arr_id as i32], ctx);
+            self.in_paint = false;
+            ctx.objs.arr_free(arr_id);
+            let state = &ctx.objs.render;
+            if !recording {
+                continue;
+            }
+            state.painting.set(false);
+            state.paint_rec.end();
+            let list = state.paint_rec.list().compact();
+            crate::dl::PAINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            list.replay(&ctx.lcd);
+            let id = WidgetId::from_vm(raw);
+            let mut paints = state.paints.borrow_mut();
+            paints.insert(id, list);
+            // Forget widgets that are gone or no longer paint.
+            if paints.len() > 2 * render::PAINT_MAX {
+                paints.retain(|&w, _| ctx.objs.get(w).flags & crate::widget::FLAG_HAS_ON_PAINT != 0);
+            }
+        }
+    }
+
+    /// The VM's drawing builtins. They draw on the screen, or into the
+    /// `on_paint` recorder while `run_paint` records a widget's paint list
+    /// (display lists, `ObjPool::render.painting`). Out of line: kept out of
+    /// `exec_one`'s body (one copy per canvas type).
+    #[inline(never)]
+    fn draw_op<P: Platform>(&mut self, ctx: &mut Ctx<P>, op: u8) {
+        ctx.objs.screen_touched();
+        match op {
+            OP_FILL_RECT => canvas!(ctx, |c| {
+                let (wh, color) = self.pop2();
+                let (w, h) = unpack_pair(wh);
+                let (x, y) = unpack_pair(self.pop());
+                let color = color as u16;
+                c.fill_rect(x, y, w, h, color);
+            }),
+            OP_RECT => canvas!(ctx, |c| {
+                let (wh, color) = self.pop2();
+                let (w, h) = unpack_pair(wh);
+                let (x, y) = unpack_pair(self.pop());
+                let color = color as u16;
+                c.draw_rect(x, y, w, h, color);
+            }),
+            OP_LINE => canvas!(ctx, |c| {
+                let (xy1, color) = self.pop2();
+                let (x1, y1) = unpack_pair(xy1);
+                let color = color as u16;
+                let (x0, y0) = unpack_pair(self.pop());
+                c.draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
+            }),
+            OP_CIRCLE => canvas!(ctx, |c| {
+                let (radius, color) = self.pop2();
+                let (radius, color) = (radius as i16, color as u16);
+                let (cx, cy) = unpack_pair(self.pop());
+                c.draw_circle(cx as i16, cy as i16, radius, color);
+            }),
+            OP_FILL_CIRCLE => canvas!(ctx, |c| {
+                let (radius, color) = self.pop2();
+                let (radius, color) = (radius as i16, color as u16);
+                let (cx, cy) = unpack_pair(self.pop());
+                c.fill_circle(cx as i16, cy as i16, radius, color);
+            }),
+            OP_DRAW_IMAGE => canvas!(ctx, |c| {
+                let (xy, image_id) = self.pop2();
+                let (x, y) = unpack_pair(xy);
+                let image_id = image_id as u8;
+                if let Some(img) = ctx.images.find(image_id) {
+                    img.draw(c, &ctx.flash, x as i16, y as i16);
+                }
+            }),
+            OP_DRAW_TEXT_LIT => canvas!(ctx, |c| {
+                // Inline text: u8 len + text bytes, stack: [colors, font_id, loc]
+                let len = self.read_u8() as usize;
+                let start = self.pc as usize;
+                if start + len <= self.code.len() {
+                    self.pc = (start + len) as CodeAddr;
+                    let (font_id, colors) = self.pop2();
+                    let (fg, bg) = unpack_pair(colors);
+                    let font_id = font_id as u8;
+                    let (x, y) = unpack_pair(self.pop());
+                    if let Some(font) = ctx.fonts.resolve(font_id) {
+                        let bg_opt = if bg == 0 { None } else { Some(bg) };
+                        self.code.with_bytes(start, len, |text| {
+                            font.draw_str(c, &ctx.flash, text, x as i16, y as i16, fg, bg_opt);
+                        });
+                    }
+                } else {
+                    self.fail(fault::CODE_OOB);
+                }
+            }),
+            OP_DRAW_STR => canvas!(ctx, |c| {
+                let str_id = self.pop() as ObjPtr;
+                let (font_id, colors) = self.pop2();
+                let (fg, bg) = unpack_pair(colors);
+                let font_id = font_id as u8;
+                let (x, y) = unpack_pair(self.pop());
+                let data = ctx.objs.str_get(str_id);
+                if let Some(font) = ctx.fonts.resolve(font_id) {
+                    let bg_opt = if bg == 0 { None } else { Some(bg) };
+                    font.draw_str(c, &ctx.flash, data, x as i16, y as i16, fg, bg_opt);
+                }
+            }),
+            OP_ROUNDED_RECT => canvas!(ctx, |c| {
+                let (r, color) = self.pop2();
+                let (r, color) = (r as u16, color as u16);
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                c.draw_rounded_rect(x, y, w, h, r, color);
+            }),
+            OP_FILL_ROUNDED_RECT => canvas!(ctx, |c| {
+                let (r, color) = self.pop2();
+                let (r, color) = (r as u16, color as u16);
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                c.fill_rounded_rect(x, y, w, h, r, color);
+            }),
+            OP_ARC => canvas!(ctx, |c| {
+                let (end, color) = self.pop2();
+                let (end, color) = (end as i16, color as u16);
+                let start = self.pop() as i16;
+                let radius = self.pop() as i16;
+                let (cx, cy) = unpack_pair(self.pop());
+                c.draw_arc(cx as i16, cy as i16, radius, start, end, color);
+            }),
+            _ => {}
+        }
     }
 
     // === Modal dialog support ===
@@ -2208,75 +2372,17 @@ impl Vm {
             }
 
             // --- Builtins (args on stack) ---
-            OP_FILL_RECT => {
-                ctx.objs.screen_touched();
-                let (wh, color) = self.pop2();
-                let (w, h) = unpack_pair(wh);
-                let (x, y) = unpack_pair(self.pop());
-                let color = color as u16;
-                ctx.lcd.fill_rect(x, y, w, h, color);
-            }
-            OP_RECT => {
-                ctx.objs.screen_touched();
-                let (wh, color) = self.pop2();
-                let (w, h) = unpack_pair(wh);
-                let (x, y) = unpack_pair(self.pop());
-                let color = color as u16;
-                ctx.lcd.draw_rect(x, y, w, h, color);
-            }
-            OP_LINE => {
-                ctx.objs.screen_touched();
-                let (xy1, color) = self.pop2();
-                let (x1, y1) = unpack_pair(xy1);
-                let color = color as u16;
-                let (x0, y0) = unpack_pair(self.pop());
-                ctx.lcd
-                    .draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
-            }
-            OP_CIRCLE => {
-                ctx.objs.screen_touched();
-                let (radius, color) = self.pop2();
-                let (radius, color) = (radius as i16, color as u16);
-                let (cx, cy) = unpack_pair(self.pop());
-                ctx.lcd.draw_circle(cx as i16, cy as i16, radius, color);
-            }
-            OP_FILL_CIRCLE => {
-                ctx.objs.screen_touched();
-                let (radius, color) = self.pop2();
-                let (radius, color) = (radius as i16, color as u16);
-                let (cx, cy) = unpack_pair(self.pop());
-                ctx.lcd.fill_circle(cx as i16, cy as i16, radius, color);
-            }
-            OP_DRAW_IMAGE => {
-                ctx.objs.screen_touched();
-                let (xy, image_id) = self.pop2();
-                let (x, y) = unpack_pair(xy);
-                let image_id = image_id as u8;
-                if let Some(img) = ctx.images.find(image_id) {
-                    img.draw(&ctx.lcd, &ctx.flash, x as i16, y as i16);
-                }
-            }
-            OP_DRAW_TEXT_LIT => {
-                ctx.objs.screen_touched();
-                // Inline text: u8 len + text bytes, stack: [colors, font_id, loc]
-                let len = self.read_u8() as usize;
-                let start = self.pc as usize;
-                if start + len <= self.code.len() {
-                    self.pc = (start + len) as CodeAddr;
-                    let (font_id, colors) = self.pop2();
-                    let (fg, bg) = unpack_pair(colors);
-                    let font_id = font_id as u8;
-                    let (x, y) = unpack_pair(self.pop());
-                    if let Some(font) = ctx.fonts.resolve(font_id) {
-                        let bg_opt = if bg == 0 { None } else { Some(bg) };
-                        self.code.with_bytes(start, len, |text| {
-                            font.draw_str(&ctx.lcd, &ctx.flash, text, x as i16, y as i16, fg, bg_opt);
-                        });
-                    }
-                } else {
-                    self.fail(fault::CODE_OOB);
-                }
-            }
+            OP_FILL_RECT
+            | OP_RECT
+            | OP_LINE
+            | OP_CIRCLE
+            | OP_FILL_CIRCLE
+            | OP_DRAW_IMAGE
+            | OP_DRAW_TEXT_LIT
+            | OP_DRAW_STR
+            | OP_ROUNDED_RECT
+            | OP_FILL_ROUNDED_RECT
+            | OP_ARC => self.draw_op(ctx, op),
             OP_DELAY => {
                 let ms = self.pop() as u32;
                 self.wait_until = ctx.systick.millis().wrapping_add(ms);
@@ -2353,49 +2459,10 @@ impl Vm {
                     ctx.objs.mark_dirty(self.target);
                 }
             }
-            OP_DRAW_STR => {
-                ctx.objs.screen_touched();
-                let str_id = self.pop() as ObjPtr;
-                let (font_id, colors) = self.pop2();
-                let (fg, bg) = unpack_pair(colors);
-                let font_id = font_id as u8;
-                let (x, y) = unpack_pair(self.pop());
-                let data = ctx.objs.str_get(str_id);
-                if let Some(font) = ctx.fonts.resolve(font_id) {
-                    let bg_opt = if bg == 0 { None } else { Some(bg) };
-                    font.draw_str(&ctx.lcd, &ctx.flash, data, x as i16, y as i16, fg, bg_opt);
-                }
-            }
             OP_STR_CLEAR => ctx.objs.str_sweep(),
             OP_STR_FREE => {
                 let str_id = self.pop() as ObjPtr;
                 ctx.objs.str_free(str_id);
-            }
-            OP_ROUNDED_RECT => {
-                ctx.objs.screen_touched();
-                let (r, color) = self.pop2();
-                let (r, color) = (r as u16, color as u16);
-                let (w, h) = unpack_pair(self.pop());
-                let (x, y) = unpack_pair(self.pop());
-                ctx.lcd.draw_rounded_rect(x, y, w, h, r, color);
-            }
-            OP_FILL_ROUNDED_RECT => {
-                ctx.objs.screen_touched();
-                let (r, color) = self.pop2();
-                let (r, color) = (r as u16, color as u16);
-                let (w, h) = unpack_pair(self.pop());
-                let (x, y) = unpack_pair(self.pop());
-                ctx.lcd.fill_rounded_rect(x, y, w, h, r, color);
-            }
-            OP_ARC => {
-                ctx.objs.screen_touched();
-                let (end, color) = self.pop2();
-                let (end, color) = (end as i16, color as u16);
-                let start = self.pop() as i16;
-                let radius = self.pop() as i16;
-                let (cx, cy) = unpack_pair(self.pop());
-                ctx.lcd
-                    .draw_arc(cx as i16, cy as i16, radius, start, end, color);
             }
             OP_BEGIN_FRAME => {
                 ctx.objs.screen_touched();

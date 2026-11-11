@@ -32,8 +32,9 @@ pub fn passes() -> u32 {
     PASSES.load(Ordering::Relaxed)
 }
 
-/// Backlight at boot, in percent.
-const BOOT_BRIGHTNESS: u8 = 50;
+/// Backlight at boot, in percent (low: the board runs on its battery for
+/// hours of measurements; `POST /api/backlight?percent=N` changes it).
+const BOOT_BRIGHTNESS: u8 = 6;
 
 pub struct Exynos4412Platform;
 
@@ -231,6 +232,8 @@ impl PlatformRuntime for Exynos4412Platform {
         crate::compose::service(ctx);
         // A CPU clock asked for over HTTP.
         crate::cpuclock::service();
+        // A backlight level asked for over HTTP.
+        crate::backlight::service(ctx);
         // Config writes (touch calibration…): save once they settle.
         crate::flash::save_if_dirty(false);
         // An FS image uploaded over HTTP, a restart request (net/).

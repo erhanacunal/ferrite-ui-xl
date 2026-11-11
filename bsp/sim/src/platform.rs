@@ -275,12 +275,13 @@ fn print_dl_stats() {
     use ferrite_core::dl;
     if dl::enabled() {
         eprintln!(
-            "sim: dl hits {} direct {} stored {} evicted {} bytes {}",
+            "sim: dl hits {} direct {} stored {} evicted {} bytes {} paints {}",
             dl::HITS.load(Relaxed),
             dl::DIRECT.load(Relaxed),
             dl::STORES.load(Relaxed),
             dl::EVICTS.load(Relaxed),
-            dl::BYTES.load(Relaxed)
+            dl::BYTES.load(Relaxed),
+            dl::PAINTS.load(Relaxed)
         );
     }
 }

@@ -78,6 +78,8 @@ pub trait Canvas {
     fn stroke_ellipse(&self, cx: i16, cy: i16, rx: i16, ry: i16, thickness: i16, color: u16);
     fn draw_oval(&self, x: i16, y: i16, w: u16, h: u16, t: u16, color: u16);
     fn fill_arc(&self, cx: i16, cy: i16, r: i16, ir: i16, start: i16, end: i16, color: u16);
+    /// A 1 px arc (the VM's `arc` builtin).
+    fn draw_arc(&self, cx: i16, cy: i16, r: i16, start: i16, end: i16, color: u16);
     fn draw_rounded_rect(&self, x: u16, y: u16, w: u16, h: u16, r: u16, color: u16);
     fn fill_rounded_rect(&self, x: u16, y: u16, w: u16, h: u16, r: u16, color: u16);
     fn fill_rounded_rect_at(&self, x: i16, y: i16, w: u16, h: u16, r: u16, color: u16, alpha: u8);
@@ -218,6 +220,10 @@ impl<B: LcdBackend> Canvas for LcdImpl<B> {
     #[inline]
     fn fill_arc(&self, cx: i16, cy: i16, r: i16, ir: i16, start: i16, end: i16, color: u16) {
         LcdImpl::fill_arc(self, cx, cy, r, ir, start, end, color)
+    }
+    #[inline]
+    fn draw_arc(&self, cx: i16, cy: i16, r: i16, start: i16, end: i16, color: u16) {
+        LcdImpl::draw_arc(self, cx, cy, r, start, end, color)
     }
     #[inline]
     fn draw_rounded_rect(&self, x: u16, y: u16, w: u16, h: u16, r: u16, color: u16) {

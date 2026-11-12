@@ -560,6 +560,12 @@ pub static MERGE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 /// draws the straight parts like the solids, at under half the vertices, for a dearer shader
 /// over the box's inside. For the many small boxes of the Monitor stress test's tiles. 0 =
 /// always nine pieces; HTTP `POST /api/compose?round_px=N`.
+/// The most tiles of one GPU frame (HTTP `?frame_tiles=N`, 512..=`gpu::MAX_FRAME_TILES`): up
+/// to `gpu::MAX_TILES` 512 every tile has its own polygon list block, past it tiles share
+/// blocks (HAL `mali::Blocking`). Board, Monitor stress, the once-a-second job over most of
+/// the screen: 512 13.5 ms, 1024 10.5 ms, 2048 11.4 ms, 4096 11.3 ms (fewer frames, but the
+/// PPs slow down as more tiles share a block).
+pub static FRAME_TILES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1024);
 /// Pixels either side of an area a graph's pieces are made for (the curve's width).
 const GRAPH_PAD: i32 = 4;
 /// How far (1/100 px) a graph's curve may pass from a point it drops (`tess::polyline_within`);
@@ -638,7 +644,7 @@ const FRAME_KPX_US: i32 = 11;
 /// GPU frames `a` (whole tiles) is cut into: full-width strips of at most `MAX_TILES` tiles.
 fn frames_of(a: &R) -> i32 {
     let across = ((a.w() + TILE - 1) / TILE).max(1);
-    let lines = ((gpu::MAX_TILES as i32 / across).max(1) * TILE).min(a.h().max(TILE));
+    let lines = ((FRAME_TILES.load(core::sync::atomic::Ordering::Relaxed) as i32 / across).max(1) * TILE).min(a.h().max(TILE));
     (a.h() + lines - 1) / lines
 }
 
@@ -1641,7 +1647,7 @@ impl State {
             let a = R::of(a);
             // Full-width strips of at most MAX_TILES tiles.
             let across = (a.w() + TILE - 1) / TILE;
-            let lines = ((gpu::MAX_TILES as i32 / across.max(1)).max(1) * TILE).min(a.h().max(TILE));
+            let lines = ((FRAME_TILES.load(core::sync::atomic::Ordering::Relaxed) as i32 / across.max(1)).max(1) * TILE).min(a.h().max(TILE));
             let mut y = a.y0;
             while y < a.y1 {
                 let c = R { x0: a.x0, y0: y, x1: a.x1, y1: (y + lines).min(a.y1) };

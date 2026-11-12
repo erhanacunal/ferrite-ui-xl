@@ -217,6 +217,14 @@ enum Batch {
     Flat(Tex),
 }
 
+/// A frame's draw being gathered: the pieces of one batch (index in `prims`, rect inside the
+/// frame) and the box around them.
+struct Group {
+    batch: Batch,
+    bbox: R,
+    items: Vec<(u32, R)>,
+}
+
 /// A widget's image: where it is drawn (screen), its texture (`shift` texels from the
 /// texture's left edge), and whether it is opaque.
 #[derive(Clone, Copy)]
@@ -267,6 +275,8 @@ struct State {
     any_565: bool,
     /// A GPU error was printed: only the first is.
     told: bool,
+    /// The frame's draws while it is gathered (`frame`), kept for their room.
+    groups: Vec<Group>,
     /// One opaque white texel (heap, 64-byte aligned, cleaned): solid pieces are `ui_flat`
     /// with it, times their colour. 0 until the first render.
     white: usize,
@@ -294,6 +304,7 @@ static mut STATE: State = State {
     images: Images { entries: Vec::new(), bytes: 0, render: 0 },
     any_565: false,
     told: false,
+    groups: Vec::new(),
     white: 0,
 };
 
@@ -533,6 +544,19 @@ fn state() -> &'static mut State {
 /// 9.8–10.2 vs 9.4–9.5 ms. HTTP `POST /api/compose?on=1|0` switches it, for A/B runs and
 /// screenshots of the same scene both ways.
 pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// A piece joins an earlier draw of its program + texture when no piece of the draws in
+/// between touches it (the order only matters where pieces overlap), looking back at most
+/// [`MERGE_BACK`] draws. Off = only runs of consecutive pieces share a draw, as before: the
+/// Monitor stress test's tiles (flat pieces, `ui_round` corners, glyphs, each in turn) made
+/// ~45 draws a frame. HTTP `POST /api/compose?merge=0|1` switches it for A/B runs.
+pub static MERGE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// A `ui_round` box (`rounded`) of at most this many pixels is four `ui_round` quarters, each
+/// with its corner, not nine pieces (solids + corner squares): the same pixels, as `ui_round`
+/// draws the straight parts like the solids, at under half the vertices, for a dearer shader
+/// over the box's inside. For the many small boxes of the Monitor stress test's tiles. 0 =
+/// always nine pieces; HTTP `POST /api/compose?round_px=N`.
+pub static ROUND_WHOLE_PX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2048);
+const MERGE_BACK: usize = 12;
 /// Rounded boxes as anti-aliased triangles (`ferrite_core::lcd::tess`: coverage per vertex,
 /// `ui_flat` two instructions a pixel) rather than `ui_round` corner squares (the shader
 /// works the coverage out per pixel, ~a dozen instructions). On by default; HTTP
@@ -1463,8 +1487,24 @@ impl State {
         // Outwards from the left corners' centre (x0 + radius), the right ones' (x1 - radius).
         let qx = [(r.x0 as f32 + rad, -1.0), (FAR, 0.0), (-(r.x1 as f32 - rad), 1.0)];
         let qy = [(r.y0 as f32 + rad, -1.0), (FAR, 0.0), (-(r.y1 as f32 - rad), 1.0)];
-        let band = Lin::flat(border);
         let bw = bw.max(0);
+        let whole = ROUND_WHOLE_PX.load(core::sync::atomic::Ordering::Relaxed) as i32;
+        if radius > 0 && r.w() * r.h() <= whole {
+            // A small box: its four quarters, each `ui_round` with its corner's distances
+            // (the straight parts come out of the shader as the solids below would).
+            let (cx, cy) = (r.x0 + r.w() / 2, r.y0 + r.h() / 2);
+            let (xs, ys) = ([r.x0, cx, r.x1], [r.y0, cy, r.y1]);
+            for row in 0..2 {
+                for col in 0..2 {
+                    let rect = R { x0: xs[col], y0: ys[row], x1: xs[col + 1], y1: ys[row + 1] };
+                    if !rect.is_empty() {
+                        self.prims.push(Prim::Round { rect, qx: qx[col * 2], qy: qy[row * 2], radius: rad, bw: bw as f32, fill, border });
+                    }
+                }
+            }
+            return;
+        }
+        let band = Lin::flat(border);
         // Middle column (top, middle, bottom pieces) and middle row (left, right pieces).
         let (mx0, mx1) = (cols[1], cols[2]);
         let (my0, my1) = (rows[1], rows[2]);
@@ -1560,6 +1600,7 @@ impl State {
             let mut y = a.y0;
             while y < a.y1 {
                 let c = R { x0: a.x0, y0: y, x1: a.x1, y1: (y + lines).min(a.y1) };
+                lcd::gpu_fence(c.y0 as usize, c.y1 as usize);
                 if let Err(e) = self.frame(ui, gpu, &c) {
                     if !self.told {
                         self.told = true;
@@ -1583,8 +1624,11 @@ impl State {
         let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), 0xFF00_0000);
         add_time(T_BEGIN, now_us() - started);
         let scale = [2.0 / c.w() as f32, 2.0 / c.h() as f32];
-        let mut batch = None;
-        let mut drew = false;
+        // The pieces into draws: a piece joins the latest draw of its batch unless a piece of
+        // a draw after that one touches it (painter's order where they overlap).
+        let back = if MERGE.load(core::sync::atomic::Ordering::Relaxed) { MERGE_BACK } else { 1 };
+        let mut groups = core::mem::take(&mut self.groups);
+        let mut used = 0usize;
         for at in from..self.prims.len() {
             let p = self.prims[at];
             let rect = p.rect().meet(c);
@@ -1592,20 +1636,53 @@ impl State {
                 continue;
             }
             let b = p.batch();
-            if batch != Some(b) {
-                if let Some(done) = batch {
-                    self.flush(ui, &mut frame, done, scale)?;
-                    drew = true;
+            let mut to = None;
+            for g in (used.saturating_sub(back)..used).rev() {
+                let group = &groups[g];
+                if group.batch == b {
+                    to = Some(g);
+                    break;
                 }
-                batch = Some(b);
+                if group.bbox.meets(&rect) && group.items.iter().any(|(_, r)| r.meets(&rect)) {
+                    break;
+                }
             }
-            self.push(&p, &rect, c);
+            let g = to.unwrap_or_else(|| {
+                if used == groups.len() {
+                    groups.push(Group { batch: b, bbox: rect, items: Vec::new() });
+                } else {
+                    let group = &mut groups[used];
+                    group.batch = b;
+                    group.bbox = rect;
+                    group.items.clear();
+                }
+                used += 1;
+                used - 1
+            });
+            let group = &mut groups[g];
+            group.bbox = R {
+                x0: group.bbox.x0.min(rect.x0),
+                y0: group.bbox.y0.min(rect.y0),
+                x1: group.bbox.x1.max(rect.x1),
+                y1: group.bbox.y1.max(rect.y1),
+            };
+            group.items.push((at as u32, rect));
             add_time(T_PIECES, 1);
         }
-        if let Some(done) = batch {
-            self.flush(ui, &mut frame, done, scale)?;
-            drew = true;
+        let mut built = Ok(());
+        for group in &groups[..used] {
+            for &(at, rect) in &group.items {
+                let p = self.prims[at as usize];
+                self.push(&p, &rect, c);
+            }
+            built = self.flush(ui, &mut frame, group.batch, scale);
+            if built.is_err() {
+                break;
+            }
         }
+        self.groups = groups;
+        built?;
+        let drew = used != 0;
         if !drew {
             // Nothing there: black, as an empty frame would leave the area as it was.
             let black = solid_prim(*c, Lin::flat([0.0, 0.0, 0.0, 1.0]), self.white);
@@ -1642,13 +1719,17 @@ impl State {
             return;
         }
         let corners = [(rect.x0, rect.y0), (rect.x1, rect.y0), (rect.x0, rect.y1), (rect.x1, rect.y0), (rect.x1, rect.y1), (rect.x0, rect.y1)];
+        let piece_arc = match *p {
+            Prim::Round { radius, bw, .. } => arc(radius, bw),
+            _ => [0.0; 4],
+        };
         for (x, y) in corners {
             let (fx, fy) = (x as f32, y as f32);
             self.pos.push([(x - c.x0) as f32, (y - c.y0) as f32]);
             match *p {
                 Prim::Round { qx, qy, radius, bw, fill, border, .. } => {
                     self.shape.push([qx.0 + qx.1 * fx, qy.0 + qy.1 * fy, radius, bw]);
-                    self.arc.push(arc(radius, bw));
+                    self.arc.push(piece_arc);
                     self.fill.push(fill.at(fx, fy));
                     self.border.push(border);
                 }

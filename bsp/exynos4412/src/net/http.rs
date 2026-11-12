@@ -10,11 +10,11 @@
 //! | `POST /save` (or `PUT`) | a firmware `.bin`: checked, saved as `FERRITE/FERRITE.BIN` (uart_boot's file, with its `EXYNBOOT` header), then a restart, so uart_boot boots it |
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
-//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
+//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?merge=0\|1` pieces merged into fewer draws / a draw per run of pieces; `?round_px=N` largest `ui_round` box drawn as four quarters (0 = always nine pieces); `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
-//! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; counters in `/api/status` `rcore` |
+//! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; counters and the jobs' time breakdown in `/api/status` `rcore` |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
@@ -274,6 +274,13 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
 " }).await?;
                 return Ok(false);
             }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"merge") {
+                let on = v == b"1";
+                crate::compose::MERGE.store(on, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", if on { "Pieces merged into fewer draws\n" } else { "A draw per run of pieces\n" }).await?;
+                return Ok(false);
+            }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"glyphs") {
                 let on = v == b"1";
                 crate::compose::GLYPHS.store(on, Ordering::Relaxed);
@@ -309,6 +316,12 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 crate::compose::REPAINT.store(true, Ordering::Release);
                 text(socket, "200 OK", "Smallest corner radius drawn as triangles set
 ").await?;
+                return Ok(false);
+            }
+            if let Some(n) = number(b"round_px").filter(|&n| n <= 1 << 20) {
+                crate::compose::ROUND_WHOLE_PX.store(n, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", "Largest ui_round box drawn as four quarters set\n").await?;
                 return Ok(false);
             }
             if let Some(n) = number(b"free_frames").filter(|&n| n <= 64) {
@@ -391,12 +404,21 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
         (b"POST", b"/api/rcore") => {
             // Render jobs on CPU2 or CPU0 (`rcore::ENABLED`), for A/B measurements.
             use core::sync::atomic::Ordering;
-            match query_param(query, b"on") {
-                Some(v @ (b"0" | b"1")) => {
+            // `fence`: GPU frames wait for their own rows of a present copy, or the whole copy
+            // (`lcd::GPU_FENCE_ROWS`).
+            let on = query_param(query, b"on");
+            let fence = query_param(query, b"fence");
+            let bit = |v: Option<&[u8]>| matches!(v, None | Some(b"0" | b"1"));
+            if (on.is_some() || fence.is_some()) && bit(on) && bit(fence) {
+                if let Some(v) = on {
                     crate::rcore::ENABLED.store(v == b"1", Ordering::Relaxed);
-                    text(socket, "200 OK", if v == b"1" { "render core on\n" } else { "render core off\n" }).await?;
                 }
-                _ => text(socket, "400 Bad Request", "on=0|1\n").await?,
+                if let Some(v) = fence {
+                    crate::lcd::GPU_FENCE_ROWS.store(v == b"1", Ordering::Relaxed);
+                }
+                text(socket, "200 OK", "render core set\n").await?;
+            } else {
+                text(socket, "400 Bad Request", "on=0|1 and/or fence=0|1\n").await?;
             }
         }
         (b"POST", b"/api/dl") => {
@@ -798,7 +820,9 @@ fn status_json() -> String {
     );
     let _ = write!(
         s,
-        ",\"tess_min\":{},\"free_frames\":{},\"min_kpx\":{}",
+        ",\"merge\":{},\"round_px\":{},\"tess_min\":{},\"free_frames\":{},\"min_kpx\":{}",
+        crate::compose::MERGE.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::ROUND_WHOLE_PX.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::TESS_MIN_RADIUS.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::FREE_FRAMES.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::MIN_FRAME_KPX.load(core::sync::atomic::Ordering::Relaxed)
@@ -872,15 +896,27 @@ fn status_json() -> String {
         );
     }
     {
-        // Render core (`/api/rcore`): jobs, busy and longest job (µs) since the last status.
-        let (jobs, busy, max) = crate::rcore::take_stats();
+        // Render core (`/api/rcore`), since the last status: jobs on CPU2, their total and
+        // longest time; where the jobs' time went (`rcore::Stats`).
+        let t = crate::rcore::take_stats();
         let _ = write!(
             s,
-            ",\"rcore\":{{\"on\":{},\"jobs\":{},\"busy_us\":{},\"max_us\":{}}}",
+            ",\"rcore\":{{\"on\":{},\"fence_rows\":{},\"jobs\":{},\"busy_us\":{},\"max_us\":{}",
             crate::rcore::running(),
-            jobs,
-            busy,
-            max
+            crate::lcd::GPU_FENCE_ROWS.load(core::sync::atomic::Ordering::Relaxed),
+            t.jobs,
+            t.busy_us,
+            t.max_us
+        );
+        let _ = write!(
+            s,
+            ",\"lists_us\":{},\"render_us\":{},\"paints_us\":{},\"compose_us\":{},\"collect_us\":{},\"frames\":{},\"frame_us\":{},\"gp_us\":{},\"pp_us\":{}",
+            t.lists_us, t.render_us, t.paints_us, t.compose_us, t.collect_us, t.frames, t.frame_us, t.gp_us, t.pp_us
+        );
+        let _ = write!(
+            s,
+            ",\"present_waits\":{},\"present_wait_us\":{},\"clean_us\":{},\"start_clean_us\":{},\"pickup_us\":{},\"pickup_max_us\":{}}}",
+            t.waits, t.wait_us, t.clean_us, t.start_clean_us, t.pickup_us, t.pickup_max_us
         );
     }
     {

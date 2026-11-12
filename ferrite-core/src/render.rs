@@ -235,6 +235,7 @@ pub enum RenderJob {
 /// drawing and captured `on_paint` before the render, the other `on_paint`
 /// lists on the screen after it.
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
+    let t0 = crate::perf::now();
     let draws = core::mem::take(&mut r.objs.render.draws);
     let mut later = alloc::vec::Vec::new();
     for d in draws {
@@ -249,10 +250,12 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
             }
         }
     }
+    let t1 = crate::perf::now();
     match job {
         RenderJob::Dirty => render_dirty_view(r),
         RenderJob::All => render_all_view(r),
     }
+    let t2 = crate::perf::now();
     for (id, list) in later {
         if r.objs.is_tree_visible(id) {
             list.replay(&r.lcd);
@@ -260,7 +263,21 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
         }
         keep_paint(r, id, list);
     }
+    let t3 = crate::perf::now();
+    use core::sync::atomic::Ordering::Relaxed;
+    JOB_TICKS[JOB_LISTS].fetch_add(t1.wrapping_sub(t0) as u64, Relaxed);
+    JOB_TICKS[JOB_RENDER].fetch_add(t2.wrapping_sub(t1) as u64, Relaxed);
+    JOB_TICKS[JOB_PAINTS].fetch_add(t3.wrapping_sub(t2) as u64, Relaxed);
 }
+
+/// Where the render jobs' time went ([`run_job`], profiler clock ticks since
+/// boot, whichever core ran them): the VM's recorded drawing replayed before
+/// the render (screen lists, captured `on_paint` lists), the render itself,
+/// the `on_paint` lists replayed on the screen after it.
+pub static JOB_TICKS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+pub const JOB_LISTS: usize = 0;
+pub const JOB_RENDER: usize = 1;
+pub const JOB_PAINTS: usize = 2;
 
 /// The VM's drawing is recorded for the render side (`view::Draw`): there
 /// is a render context, here or away.

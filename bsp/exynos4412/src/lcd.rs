@@ -487,7 +487,13 @@ fn wait_rows(y0: usize, y1: usize) {
         }
         core::hint::spin_loop();
     }
-    crate::perf::add_wait(crate::perf::cycles().wrapping_sub(t0));
+    let dt = crate::perf::cycles().wrapping_sub(t0);
+    if cpu::id() == 0 {
+        crate::perf::add_wait(dt);
+    } else {
+        // The render core's (`perf::add_wait` is CPU0's alone).
+        crate::rcore::add_wait(dt);
+    }
 }
 
 /// Whether drawing now would reach the screen any sooner
@@ -1867,20 +1873,35 @@ pub fn grab() -> Option<alloc::vec::Vec<u32>> {
     Some(copy)
 }
 
-/// Before the GPU writes the shadow: waits for a present copy in flight
-/// (it reads the shadow), and puts what this core wrote through the alias
-/// into DRAM first. False if the shadow is not the GPU's to write (G2D
-/// drawing is off: [`gpu_target`]).
+/// Before the GPU writes the shadow: puts what this core wrote through the
+/// alias into DRAM first. False if the shadow is not the GPU's to write (G2D
+/// drawing is off: [`gpu_target`]). Each frame then waits for its own rows
+/// ([`gpu_fence`]).
 pub fn gpu_begin() -> bool {
     if !g2d_draw_ready() {
         return false;
     }
-    if STATE.load(Ordering::Acquire) == COPY {
-        wait_rows(0, H);
-    }
     // SAFETY: a barrier only.
     unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
     true
+}
+
+/// GPU frames wait only for their own rows of a present copy; off = for the
+/// whole copy, as before (`POST /api/rcore?fence=0|1`, for A/B measurements).
+pub static GPU_FENCE_ROWS: AtomicBool = AtomicBool::new(true);
+
+/// Before a GPU frame writes shadow rows `y0..y1`: waits while a present
+/// copy in flight may still read one of them, as the CPU's primitives do
+/// ([`fence`]). The copy goes top to bottom, so a frame over rows it has
+/// passed (or outside its box) starts at once.
+pub fn gpu_fence(y0: usize, y1: usize) {
+    if GPU_FENCE_ROWS.load(Ordering::Relaxed) {
+        fence(y0, y1);
+    } else {
+        fence(0, H);
+    }
+    // SAFETY: a barrier only.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
 }
 
 /// The GPU wrote `w` × `h` shadow pixels at (`x`, `y`): the next present

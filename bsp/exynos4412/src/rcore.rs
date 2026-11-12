@@ -25,7 +25,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use exynos_4412_rs::{mmu, smp};
 use ferrite_core::ctx::Ctx;
@@ -46,8 +46,29 @@ pub static ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Jobs run on CPU2, and the time they took (profiler clock ticks).
 pub static JOBS: AtomicU32 = AtomicU32::new(0);
-pub static BUSY_TICKS: AtomicU32 = AtomicU32::new(0);
+pub static BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
 pub static MAX_TICKS: AtomicU32 = AtomicU32::new(0);
+/// Inside the jobs: CPU2's waits for a present copy (`lcd::wait_rows`: count
+/// and ticks) and its L1 clean after each job.
+static WAITS: AtomicU32 = AtomicU32::new(0);
+static WAIT_TICKS: AtomicU64 = AtomicU64::new(0);
+static CLEAN_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Around the jobs, on CPU0: its L1 clean before each job, and how long a
+/// finished job waited for CPU0 to take it back and present (`render_poll`;
+/// total and longest).
+static START_CLEAN_TICKS: AtomicU64 = AtomicU64::new(0);
+static DONE_AT: AtomicU32 = AtomicU32::new(0);
+static PICKUP_TICKS: AtomicU64 = AtomicU64::new(0);
+static PICKUP_MAX: AtomicU32 = AtomicU32::new(0);
+/// `render::JOB_TICKS` and the compositor's `TIMES` at the last `take_stats`.
+static LAST_JOB: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static LAST_COMPOSE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+/// A render core's wait for a present copy (`lcd::wait_rows`, not on CPU0).
+pub fn add_wait(ticks: u32) {
+    WAITS.fetch_add(1, Ordering::Relaxed);
+    WAIT_TICKS.fetch_add(ticks as u64, Ordering::Relaxed);
+}
 
 /// Starts CPU2 as the render core (CPU0, at boot). Not fatal: the jobs then
 /// run on CPU0.
@@ -77,11 +98,15 @@ fn render_core(_cpu: usize) -> ! {
         render::run_job(r, job);
         // What this core drew in cached memory reaches L2/DRAM for the
         // devices CPU0 drives next (layer copies, present cleans).
+        let t1 = crate::perf::cycles();
         mmu::clean_l1_all();
-        let dt = crate::perf::cycles().wrapping_sub(t0);
+        let t2 = crate::perf::cycles();
+        let dt = t2.wrapping_sub(t0);
         JOBS.fetch_add(1, Ordering::Relaxed);
-        BUSY_TICKS.fetch_add(dt, Ordering::Relaxed);
+        BUSY_TICKS.fetch_add(dt as u64, Ordering::Relaxed);
         MAX_TICKS.fetch_max(dt, Ordering::Relaxed);
+        CLEAN_TICKS.fetch_add(t2.wrapping_sub(t1) as u64, Ordering::Relaxed);
+        DONE_AT.store(t2, Ordering::Relaxed);
         STATE.store(DONE, Ordering::Release);
         // SAFETY: wakes CPU0 if it waits in `wait`.
         unsafe { core::arch::asm!("dsb", "sev", options(nostack, preserves_flags)) };
@@ -94,7 +119,9 @@ pub fn render_start(r: Box<Ctx<P>>, job: RenderJob) -> Result<(), Box<Ctx<P>>> {
         return Err(r);
     }
     // What CPU0 wrote in cached memory that a device may read during the job.
+    let t0 = crate::perf::cycles();
     mmu::clean_l1_all();
+    START_CLEAN_TICKS.fetch_add(crate::perf::cycles().wrapping_sub(t0) as u64, Ordering::Relaxed);
     CTX.store(Box::into_raw(r), Ordering::Relaxed);
     JOB.store(if job == RenderJob::Dirty { 0 } else { 1 }, Ordering::Relaxed);
     STATE.store(BUSY, Ordering::Release);
@@ -110,6 +137,9 @@ pub fn render_poll() -> Option<Box<Ctx<P>>> {
     if STATE.load(Ordering::Acquire) != DONE {
         return None;
     }
+    let waited = crate::perf::cycles().wrapping_sub(DONE_AT.load(Ordering::Relaxed));
+    PICKUP_TICKS.fetch_add(waited as u64, Ordering::Relaxed);
+    PICKUP_MAX.fetch_max(waited, Ordering::Relaxed);
     let p = CTX.swap(null_mut(), Ordering::Relaxed);
     STATE.store(IDLE, Ordering::Release);
     crate::lcd::flush();
@@ -123,13 +153,66 @@ pub fn render_wait() {
     unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
 }
 
-/// Jobs, total and longest job (µs) since the last call, for `/api/status`.
-pub fn take_stats() -> (u32, u32, u32) {
+/// The render core since the last [`take_stats`], times in µs.
+pub struct Stats {
+    /// Jobs run on CPU2, their total and longest time.
+    pub jobs: u32,
+    pub busy_us: u32,
+    pub max_us: u32,
+    /// Inside the jobs (`render::run_job`, on whichever core): the VM's
+    /// lists before the render, the render, the `on_paint` lists after it.
+    pub lists_us: u32,
+    pub render_us: u32,
+    pub paints_us: u32,
+    /// Inside the render: the GPU compositor (whole `compose` calls), of
+    /// that gathering the pieces (CPU sprites included), its frames, and of
+    /// those the GP and the PPs.
+    pub compose_us: u32,
+    pub collect_us: u32,
+    pub frames: u32,
+    pub frame_us: u32,
+    pub gp_us: u32,
+    pub pp_us: u32,
+    /// CPU2's waits for a present copy (inside the render) and its L1 cleans
+    /// (after it).
+    pub waits: u32,
+    pub wait_us: u32,
+    pub clean_us: u32,
+    /// CPU0: its L1 cleans before the jobs; finished jobs waiting to be
+    /// taken back (total, longest).
+    pub start_clean_us: u32,
+    pub pickup_us: u32,
+    pub pickup_max_us: u32,
+}
+
+/// For `/api/status`: the counters since the last call.
+pub fn take_stats() -> Stats {
     let hz = crate::perf::hz().max(1) as u64;
-    let us = |t: u32| (t as u64 * 1_000_000 / hz) as u32;
-    (
-        JOBS.swap(0, Ordering::Relaxed),
-        us(BUSY_TICKS.swap(0, Ordering::Relaxed)),
-        us(MAX_TICKS.swap(0, Ordering::Relaxed)),
-    )
+    let us = |t: u64| (t * 1_000_000 / hz) as u32;
+    let take = |a: &AtomicU64| us(a.swap(0, Ordering::Relaxed));
+    // Free-running counters elsewhere: the difference to the last call.
+    let since = |now: u64, last: &AtomicU64| now.wrapping_sub(last.swap(now, Ordering::Relaxed));
+    let job = |i: usize| us(since(render::JOB_TICKS[i].load(Ordering::Relaxed), &LAST_JOB[i]));
+    // Slots of `compose::TIME_NAMES`.
+    let compose = |i: usize| since(crate::compose::TIMES[i].load(Ordering::Relaxed), &LAST_COMPOSE[i]) as u32;
+    Stats {
+        jobs: JOBS.swap(0, Ordering::Relaxed),
+        busy_us: take(&BUSY_TICKS),
+        max_us: us(MAX_TICKS.swap(0, Ordering::Relaxed) as u64),
+        lists_us: job(render::JOB_LISTS),
+        render_us: job(render::JOB_RENDER),
+        paints_us: job(render::JOB_PAINTS),
+        compose_us: compose(8),
+        collect_us: compose(9),
+        frames: compose(0),
+        frame_us: compose(7),
+        gp_us: compose(4),
+        pp_us: compose(5),
+        waits: WAITS.swap(0, Ordering::Relaxed),
+        wait_us: take(&WAIT_TICKS),
+        clean_us: take(&CLEAN_TICKS),
+        start_clean_us: take(&START_CLEAN_TICKS),
+        pickup_us: take(&PICKUP_TICKS),
+        pickup_max_us: us(PICKUP_MAX.swap(0, Ordering::Relaxed) as u64),
+    }
 }

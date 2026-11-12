@@ -1,0 +1,54 @@
+[
+ {
+  "incremental": 1,
+  "passes": 575,
+  "syncs": 14,
+  "full": 1,
+  "repacked_per_update": 57.1,
+  "capture_us_per_sync": 40.7,
+  "handoff_rest_us_per_sync": 21.4,
+  "capture_ms_per_s": 0.095,
+  "render_phase_ms_per_s": 1.692,
+  "vm_kinstr_s": 1.4,
+  "jobs": 14
+ },
+ {
+  "incremental": 0,
+  "passes": 578,
+  "syncs": 12,
+  "full": 12,
+  "repacked_per_update": 0.0,
+  "capture_us_per_sync": 70.0,
+  "handoff_rest_us_per_sync": 20.5,
+  "capture_ms_per_s": 0.14,
+  "render_phase_ms_per_s": 1.152,
+  "vm_kinstr_s": 1.4,
+  "jobs": 12
+ },
+ {
+  "incremental": 1,
+  "passes": 577,
+  "syncs": 12,
+  "full": 1,
+  "repacked_per_update": 57.8,
+  "capture_us_per_sync": 41.2,
+  "handoff_rest_us_per_sync": 20.6,
+  "capture_ms_per_s": 0.082,
+  "render_phase_ms_per_s": 1.088,
+  "vm_kinstr_s": 1.4,
+  "jobs": 12
+ },
+ {
+  "incremental": 0,
+  "passes": 576,
+  "syncs": 12,
+  "full": 12,
+  "repacked_per_update": 0.0,
+  "capture_us_per_sync": 70.0,
+  "handoff_rest_us_per_sync": 20.5,
+  "capture_ms_per_s": 0.14,
+  "render_phase_ms_per_s": 1.15,
+  "vm_kinstr_s": 1.4,
+  "jobs": 12
+ }
+]

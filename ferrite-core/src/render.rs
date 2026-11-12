@@ -383,7 +383,6 @@ pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -
     crate::vm::flex_flush(ctx);
     if let Some(mut r) = ctx.render_ctx.take() {
         // The render side's own context (step 3c).
-        ctx.objs.prepare_scene();
         let t0 = crate::perf::now();
         sync_render_ctx(ctx, &mut r);
         crate::perf::add_sub(
@@ -407,11 +406,7 @@ pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -
 /// (`ObjPool::sync_view`), the fonts and images the VM loaded, the
 /// filesystem, the orientation, the cursor blink.
 fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>) {
-    if ctx.objs.render.scene_ready {
-        ctx.objs.sync_view_prepared(&mut r.objs);
-    } else {
-        ctx.objs.sync_view(&mut r.objs);
-    }
+    ctx.objs.sync_view(&mut r.objs);
     r.fonts.sync_from(&ctx.fonts);
     r.images.sync_from(&ctx.images);
     if r.fs.is_none() != ctx.fs.is_none() {
@@ -518,10 +513,8 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     if !ctx.objs.needs_sync() && !ctx.render_pool().render.maybe_dirty {
         return;
     }
-    // Prepare the immutable input while the previous render may still be
-    // running on the other core. Keep render-owned messages and dirty state
-    // in the VM pool until the render context has returned.
-    ctx.objs.prepare_scene();
+    // While the last render still runs on the other core, the messages,
+    // dirty bits and touched objects wait in the VM pool.
     if !reclaim(ctx) {
         return;
     }

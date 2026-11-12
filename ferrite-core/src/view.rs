@@ -3,8 +3,10 @@
 //!
 //! Before each render (`render::with_view`) the VM pool hands over
 //! ([`ObjPool::sync_view`]):
-//! - the immutable scene (`RenderSnapshot::capture`): widgets plus referenced
-//!   text/graph data; no VM object arena or pointer table is copied;
+//! - the scene (`scene.rs`): widgets plus referenced text/graph data; no VM
+//!   object arena or pointer table is copied. The render pool keeps it: the
+//!   first sync captures the whole tree, later ones repack only the objects
+//!   the VM pool touched since (`ObjPool::touched`);
 //! - the dirty bits (then cleared in the VM pool), `maybe_dirty` and the
 //!   changed list;
 //! - the [`RenderMsg`]s queued since the last sync, replayed in order on the
@@ -92,21 +94,6 @@ impl ObjPool {
             || self.render.screen_rec.busy()
     }
 
-    /// Capture a renderer-owned scene on the VM core. It remains private to
-    /// the VM pool until the render context is ready to receive it.
-    pub(crate) fn prepare_scene(&mut self) {
-        debug_assert!(!self.is_view);
-        let t0 = crate::perf::now();
-        let mut scene = core::mem::take(&mut self.render.scene);
-        scene.capture(self);
-        self.render.scene = scene;
-        self.render.scene_ready = true;
-        crate::perf::add_sub(
-            crate::perf::phase::SCENE_CAPTURE,
-            crate::perf::now().wrapping_sub(t0),
-        );
-    }
-
     /// The canvas the VM's direct drawing records into (`render::records`):
     /// a recording against `lcd` is started on first use.
     pub(crate) fn screen_rec<B: crate::lcd::LcdBackend>(&self, lcd: &crate::lcd::LcdImpl<B>) -> &crate::dl::Recorder {
@@ -143,12 +130,24 @@ impl ObjPool {
         out
     }
 
-    /// Clear every widget's dirty bit.
-    fn clear_all_dirty(&mut self) {
-        for p in 0..self.ptr_count() as ObjPtr {
-            let id = WidgetId(p);
-            if self.is_live(id) {
-                self.get_mut(id).clear_dirty();
+    /// Clear the dirty bits handed over: of the touched widgets (a dirty bit
+    /// is set through `get_mut`, which notes the widget), or of every widget
+    /// when not all of those are known.
+    fn clear_synced_dirty(&mut self) {
+        use crate::pool::T_WIDGET;
+        let mut clear = |pool: &mut ObjPool, p: ObjPtr| {
+            if let Some(w) = pool.payload_mut_quiet(p, T_WIDGET) {
+                crate::widget::header_mut(w).clear_dirty();
+            }
+        };
+        if self.touched_over() {
+            for p in 0..self.ptr_count() as ObjPtr {
+                clear(self, p);
+            }
+        } else {
+            for i in 0..self.touched().len() {
+                let p = self.touched()[i];
+                clear(self, p);
             }
         }
     }
@@ -156,38 +155,56 @@ impl ObjPool {
     /// Hand the tree and everything queued for the renderer over to the
     /// render pool `view` (self = the VM pool).
     pub(crate) fn sync_view(&mut self, view: &mut ObjPool) {
-        self.prepare_scene();
-        self.sync_view_prepared(view);
-    }
-
-    /// Hand over a scene captured immediately before this sync.
-    pub(crate) fn sync_view_prepared(&mut self, view: &mut ObjPool) {
         debug_assert!(!self.is_view && view.is_view);
-        debug_assert!(self.render.scene_ready);
         self.close_screen_rec();
         view.render.draws.append(&mut self.render.draws);
         let mut msgs = core::mem::take(&mut self.render.msgs);
         let cleared = msgs.iter().any(|m| matches!(m, RenderMsg::Clear));
-        // The render pool's own pending dirty bits survive the copy.
-        let keep = if view.render.maybe_dirty && !cleared { view.dirty_widgets() } else { Vec::new() };
-        self.sync_view_metadata(view);
-        // Publish the complete scene by ownership transfer. The old render
-        // buffer returns to the VM pool for reuse during the next capture.
-        core::mem::swap(&mut self.render.scene, &mut view.render.scene);
-        self.render.scene_ready = false;
+        let t0 = crate::perf::now();
+        // The whole tree: the first time, when its shape changed (the scene
+        // is packed in paint order), when `view` missed a sync, when more
+        // was touched than noted, or to drop the packed data's garbage.
+        let full = self.render.shape_changed
+            || cleared
+            || self.touched_over()
+            || view.render.scene.generation != Some(self.sync_gen)
+            || view.render.scene.wasteful()
+            || !crate::scene::INCREMENTAL.load(core::sync::atomic::Ordering::Relaxed);
+        let mut repacked = 0;
+        if full {
+            // The render pool's own pending dirty bits survive the capture.
+            let keep = if view.render.maybe_dirty && !cleared { view.dirty_widgets() } else { Vec::new() };
+            self.sync_view_metadata(view);
+            view.render.scene.capture(self);
+            for &id in &keep {
+                if view.is_live(id) {
+                    view.get_mut(id).flags |= FLAG_DIRTY;
+                }
+            }
+            if !keep.is_empty() {
+                view.render.maybe_dirty = true;
+            }
+        } else {
+            self.sync_view_metadata(view);
+            repacked = view.render.scene.update(self);
+            if crate::scene::VERIFY.load(core::sync::atomic::Ordering::Relaxed) {
+                let mut whole = crate::scene::RenderSnapshot::new();
+                whole.capture(self);
+                view.render.scene.assert_matches(&whole);
+            }
+        }
+        crate::scene::count(full, repacked);
+        self.sync_gen = self.sync_gen.wrapping_add(1);
+        view.render.scene.generation = Some(self.sync_gen);
+        crate::perf::add_sub(
+            crate::perf::phase::SCENE_CAPTURE,
+            crate::perf::now().wrapping_sub(t0),
+        );
         if self.render.shape_changed {
             view.dfs_valid = false;
         }
-        for &id in &keep {
-            if view.is_live(id) {
-                view.get_mut(id).flags |= FLAG_DIRTY;
-            }
-        }
         for &m in &msgs {
             view.replay(m);
-        }
-        if !keep.is_empty() {
-            view.render.maybe_dirty = true;
         }
         view.render.maybe_dirty |= self.render.maybe_dirty;
         let n = self.render.changed_n as usize;
@@ -210,8 +227,9 @@ impl ObjPool {
         }
         // Handed over.
         if self.render.maybe_dirty {
-            self.clear_all_dirty();
+            self.clear_synced_dirty();
         }
+        self.clear_touched();
         self.render.maybe_dirty = false;
         self.render.changed_n = 0;
         self.render.shape_changed = false;

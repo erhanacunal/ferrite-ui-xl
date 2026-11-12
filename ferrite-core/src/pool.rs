@@ -168,10 +168,9 @@ pub(crate) struct RenderState {
     pub(crate) drawn_keys: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, u64>>,
     /// Render-owned values as of the last render pass (`snapshot.rs`).
     pub(crate) snapshot: crate::snapshot::Snapshot,
-    /// Packed renderer input captured on the VM core before handoff.
+    /// Render pool: the packed renderer input (`scene.rs`), captured at the
+    /// first sync and updated by the later ones. Empty in the VM pool.
     pub(crate) scene: crate::scene::RenderSnapshot,
-    /// The VM pool has captured a scene that has not been handed off yet.
-    pub(crate) scene_ready: bool,
     /// What the renderer knows of each widget, by object pointer
     /// (`widget::RenderRec`).
     pub(crate) recs: Vec<crate::widget::RenderRec>,
@@ -203,7 +202,6 @@ impl RenderState {
             drawn_keys: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             snapshot: crate::snapshot::Snapshot::new(),
             scene: crate::scene::RenderSnapshot::new(),
-            scene_ready: false,
             recs: Vec::new(),
             msgs: Vec::new(),
             shape_changed: true,
@@ -228,7 +226,6 @@ impl RenderState {
         self.paints.get_mut().clear();
         self.drawn_keys.get_mut().clear();
         self.snapshot.clear();
-        self.scene_ready = false;
         self.recs.clear();
     }
 }
@@ -280,7 +277,22 @@ pub struct ObjPool {
     /// tree, synced before each render. Render-owned state (`render`,
     /// `layers`) is kept here; the VM pool's `layers` is a mirror.
     pub(crate) is_view: bool,
+    /// VM pool: the objects given out for writing, allocated or freed since
+    /// the last sync (`touch`): a bit per pointer, and the pointers in the
+    /// order they were first touched (at most `TOUCHED_MAX`, else
+    /// `touched_over`). The sync repacks only these in the render pool's
+    /// scene (`scene.rs`).
+    touched_bits: Vec<u32>,
+    touched: Vec<ObjPtr>,
+    touched_over: bool,
+    /// VM pool: syncs so far. A render pool's scene can be updated only if
+    /// it took the last one (`RenderSnapshot::generation`).
+    pub(crate) sync_gen: u32,
 }
+
+/// Most objects noted between two syncs; more = the next sync captures the
+/// whole tree.
+const TOUCHED_MAX: usize = 1024;
 
 impl ObjPool {
     /// Renderer-only snapshot for this pool. On the render pool this is the
@@ -344,7 +356,59 @@ impl ObjPool {
             flex_pending: Vec::new(),
             flex_busy: false,
             is_view: false,
+            touched_bits: Vec::new(),
+            touched: Vec::new(),
+            touched_over: false,
+            sync_gen: 0,
         }
+    }
+
+    /// Notes that object `p` may differ from what the render pool was last
+    /// given: it is handed out for writing, was allocated or freed.
+    #[inline]
+    fn touch(&mut self, p: ObjPtr) {
+        let Some(word) = self.touched_bits.get_mut(p as usize >> 5) else {
+            return;
+        };
+        let bit = 1u32 << (p & 31);
+        if *word & bit == 0 {
+            *word |= bit;
+            if self.touched.len() < TOUCHED_MAX {
+                self.touched.push(p);
+            } else {
+                self.touched_over = true;
+            }
+        }
+    }
+
+    /// The objects touched since the last sync, each once (not all of them
+    /// if `touched_over`).
+    pub(crate) fn touched(&self) -> &[ObjPtr] {
+        &self.touched
+    }
+
+    /// More objects were touched than `touched` holds.
+    pub(crate) fn touched_over(&self) -> bool {
+        self.touched_over
+    }
+
+    /// `p` was touched since the last sync.
+    #[inline]
+    pub(crate) fn is_touched(&self, p: ObjPtr) -> bool {
+        self.touched_bits.get(p as usize >> 5).is_some_and(|w| w & (1 << (p & 31)) != 0)
+    }
+
+    /// Forget what was touched (the render pool has it now).
+    pub(crate) fn clear_touched(&mut self) {
+        if self.touched_over {
+            self.touched_bits.fill(0);
+        } else {
+            for &p in &self.touched {
+                self.touched_bits[p as usize >> 5] = 0;
+            }
+        }
+        self.touched.clear();
+        self.touched_over = false;
     }
 
     /// An empty render pool (`Ctx::view`): storage grows to the VM pool's
@@ -416,6 +480,9 @@ impl ObjPool {
         self.arena = arena;
         self.table = table;
         self.dfs_cache = dfs;
+        self.touched_bits = alloc::vec![0; objects / 32 + 1];
+        self.touched = Vec::with_capacity(TOUCHED_MAX);
+        self.touched_over = false;
         true
     }
 
@@ -436,6 +503,8 @@ impl ObjPool {
         self.render.reset();
         self.render.msgs.clear();
         self.render.shape_changed = true;
+        self.touched_over = true;
+        self.clear_touched();
         self.send(crate::view::RenderMsg::Clear);
         {
             // The surfaces stay shown until the next render hides them.
@@ -524,8 +593,19 @@ impl ObjPool {
         Some(&self.arena[at + HDR..at + HDR + n])
     }
 
+    /// Payload words of a live object of type `ty`, for writing: the object
+    /// is noted as touched (`touch`). Every write to an object's payload
+    /// comes through here.
     #[inline]
     pub(crate) fn payload_mut(&mut self, ptr: ObjPtr, ty: u8) -> Option<&mut [u32]> {
+        self.touch(ptr);
+        self.payload_mut_quiet(ptr, ty)
+    }
+
+    /// [`Self::payload_mut`] without the note: for writes the render pool
+    /// need not hear of (the sync's own).
+    #[inline]
+    pub(crate) fn payload_mut_quiet(&mut self, ptr: ObjPtr, ty: u8) -> Option<&mut [u32]> {
         let at = self.block(ptr, ty)?;
         let n = hdr_words(self.arena[at]);
         Some(&mut self.arena[at + HDR..at + HDR + n])
@@ -603,6 +683,7 @@ impl ObjPool {
         self.top += HDR + words;
         self.table[p as usize] = at as Off;
         self.live[ty as usize] += 1;
+        self.touch(p);
         Some(p)
     }
 
@@ -615,6 +696,7 @@ impl ObjPool {
         self.release_block(at, len);
         self.live[ty as usize] -= 1;
         self.put_ptr(ptr);
+        self.touch(ptr);
     }
 
     /// Turn the `len` words at `at` into a hole, or drop them when they end
@@ -642,6 +724,7 @@ impl ObjPool {
         if words == old {
             return true;
         }
+        self.touch(ptr);
         if words > MAX_OBJ_WORDS {
             return false;
         }

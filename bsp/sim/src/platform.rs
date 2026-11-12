@@ -327,6 +327,14 @@ fn print_snapshot_stats() {
         snapshot::STALE_DIFF.load(Relaxed),
         if snapshot::stale() { " (stale reads on)" } else { "" }
     );
+    use ferrite_core::scene;
+    eprintln!(
+        "sim: scene syncs: {} full, {} updates ({} widgets repacked){}",
+        scene::FULLS.load(Relaxed),
+        scene::UPDATES.load(Relaxed),
+        scene::UPDATED.load(Relaxed),
+        if scene::VERIFY.load(Relaxed) { " (verified)" } else { "" }
+    );
 }
 
 /// Display-list cache counters (stderr; with `FERRITE_SIM_DL`).

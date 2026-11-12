@@ -58,6 +58,16 @@ fn main() {
         ferrite_core::snapshot::STALE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
+    // `FERRITE_SIM_SCENE_VERIFY=1`: every incremental update of the render pool's scene is
+    // compared with a full capture (`scene.rs`), panicking on a difference;
+    // `FERRITE_SIM_SCENE_FULL=1`: a full capture every sync, as before.
+    if std::env::var_os("FERRITE_SIM_SCENE_VERIFY").is_some() {
+        ferrite_core::scene::VERIFY.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var_os("FERRITE_SIM_SCENE_FULL").is_some() {
+        ferrite_core::scene::INCREMENTAL.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+
     systick::init();
     if let Some(d) = &dump {
         systick::sim::set_virtual();

@@ -14,7 +14,7 @@
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
-//! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; counters and the jobs' time breakdown in `/api/status` `rcore` |
+//! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; `?scene=0\|1` syncs update the render pool's scene / capture it whole (`/api/status` `scene`); counters and the jobs' time breakdown in `/api/status` `rcore` |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
@@ -408,8 +408,14 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             // (`lcd::GPU_FENCE_ROWS`).
             let on = query_param(query, b"on");
             let fence = query_param(query, b"fence");
+            // `scene`: syncs update the render pool's scene, or capture it whole each time
+            // (`ferrite_core::scene::INCREMENTAL`).
+            let scene = query_param(query, b"scene");
             let bit = |v: Option<&[u8]>| matches!(v, None | Some(b"0" | b"1"));
-            if (on.is_some() || fence.is_some()) && bit(on) && bit(fence) {
+            if (on.is_some() || fence.is_some() || scene.is_some()) && bit(on) && bit(fence) && bit(scene) {
+                if let Some(v) = scene {
+                    ferrite_core::scene::INCREMENTAL.store(v == b"1", Ordering::Relaxed);
+                }
                 if let Some(v) = on {
                     crate::rcore::ENABLED.store(v == b"1", Ordering::Relaxed);
                 }
@@ -418,7 +424,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 text(socket, "200 OK", "render core set\n").await?;
             } else {
-                text(socket, "400 Bad Request", "on=0|1 and/or fence=0|1\n").await?;
+                text(socket, "400 Bad Request", "on=0|1, fence=0|1 and/or scene=0|1\n").await?;
             }
         }
         (b"POST", b"/api/dl") => {
@@ -899,6 +905,19 @@ fn status_json() -> String {
         // Render core (`/api/rcore`), since the last status: jobs on CPU2, their total and
         // longest time; where the jobs' time went (`rcore::Stats`).
         let t = crate::rcore::take_stats();
+        {
+            // The render pool's scene (`scene.rs`): syncs since boot.
+            use core::sync::atomic::Ordering::Relaxed;
+            use ferrite_core::scene;
+            let _ = write!(
+                s,
+                ",\"scene\":{{\"incremental\":{},\"full\":{},\"updates\":{},\"repacked\":{}}}",
+                scene::INCREMENTAL.load(Relaxed),
+                scene::FULLS.load(Relaxed),
+                scene::UPDATES.load(Relaxed),
+                scene::UPDATED.load(Relaxed)
+            );
+        }
         let _ = write!(
             s,
             ",\"rcore\":{{\"on\":{},\"fence_rows\":{},\"jobs\":{},\"busy_us\":{},\"max_us\":{}",

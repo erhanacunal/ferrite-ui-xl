@@ -1,0 +1,80 @@
+[
+ {
+  "incremental": 1,
+  "passes": 6113,
+  "syncs": 355,
+  "full": 0,
+  "repacked_per_update": 22.3,
+  "capture_us_per_sync": 14.4,
+  "handoff_rest_us_per_sync": 22.8,
+  "capture_ms_per_s": 0.85,
+  "render_phase_ms_per_s": 2.811,
+  "vm_kinstr_s": 2.9,
+  "jobs": 355
+ },
+ {
+  "incremental": 0,
+  "passes": 6102,
+  "syncs": 356,
+  "full": 356,
+  "repacked_per_update": 0.0,
+  "capture_us_per_sync": 43.7,
+  "handoff_rest_us_per_sync": 23.0,
+  "capture_ms_per_s": 2.595,
+  "render_phase_ms_per_s": 4.571,
+  "vm_kinstr_s": 2.9,
+  "jobs": 356
+ },
+ {
+  "incremental": 1,
+  "passes": 6114,
+  "syncs": 355,
+  "full": 0,
+  "repacked_per_update": 22.1,
+  "capture_us_per_sync": 14.1,
+  "handoff_rest_us_per_sync": 23.0,
+  "capture_ms_per_s": 0.835,
+  "render_phase_ms_per_s": 2.805,
+  "vm_kinstr_s": 2.9,
+  "jobs": 355
+ },
+ {
+  "incremental": 0,
+  "passes": 6103,
+  "syncs": 356,
+  "full": 356,
+  "repacked_per_update": 0.0,
+  "capture_us_per_sync": 43.6,
+  "handoff_rest_us_per_sync": 22.9,
+  "capture_ms_per_s": 2.585,
+  "render_phase_ms_per_s": 4.557,
+  "vm_kinstr_s": 2.9,
+  "jobs": 356
+ },
+ {
+  "incremental": 1,
+  "passes": 6112,
+  "syncs": 356,
+  "full": 0,
+  "repacked_per_update": 22.1,
+  "capture_us_per_sync": 14.3,
+  "handoff_rest_us_per_sync": 22.9,
+  "capture_ms_per_s": 0.848,
+  "render_phase_ms_per_s": 2.833,
+  "vm_kinstr_s": 2.9,
+  "jobs": 356
+ },
+ {
+  "incremental": 0,
+  "passes": 6101,
+  "syncs": 355,
+  "full": 355,
+  "repacked_per_update": 0.0,
+  "capture_us_per_sync": 43.8,
+  "handoff_rest_us_per_sync": 23.2,
+  "capture_ms_per_s": 2.593,
+  "render_phase_ms_per_s": 4.596,
+  "vm_kinstr_s": 2.9,
+  "jobs": 354
+ }
+]

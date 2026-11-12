@@ -418,6 +418,11 @@ fn cast<T>(w: &[u32]) -> &T {
 }
 
 #[inline]
+/// The widget header in a widget's payload words.
+pub(crate) fn header_mut(w: &mut [u32]) -> &mut Widget {
+    cast_mut(w)
+}
+
 fn cast_mut<T>(w: &mut [u32]) -> &mut T {
     assert!(w.len() * 4 >= size_of::<T>() && align_of::<T>() <= 4);
     // SAFETY: as in `cast`; the borrow is unique.

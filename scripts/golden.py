@@ -68,7 +68,7 @@ def run(name, sc, img, env=None):
     if r.returncode != 0:
         raise RuntimeError(f"sim exited {r.returncode}: {r.stderr.strip()[-300:]}")
     for line in r.stderr.splitlines():
-        if line.startswith("sim: dl ") or (line.startswith("sim: snapshot ") and not line.startswith("sim: snapshot reads 0 ")):
+        if line.startswith(("sim: dl ", "sim: scene ")) or (line.startswith("sim: snapshot ") and not line.startswith("sim: snapshot reads 0 ")):
             print(f"     {name}: {line[5:]}")
     frames = {}
     for t in sc["dump"]:
@@ -125,6 +125,8 @@ def main():
             skipped.append(name)
             continue
         env = dict(os.environ)
+        # Every incremental scene update is checked against a full capture (scene.rs).
+        env.update(FERRITE_SIM_SCENE_VERIFY="1")
         if a.dl:
             env.update(FERRITE_SIM_DL="1", FERRITE_SIM_DL_VERIFY="1")
         if a.stale:

@@ -499,8 +499,6 @@ fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>, post: bool) {
 }
 
 fn render_all_view<P: Platform>(ctx: &mut Ctx<P>) {
-    ctx.objs.render.graphs.clear();
-    ctx.objs.render.scrolled.clear();
     ctx.objs.ensure_dfs();
     ctx.objs.geo_begin();
     let active = {
@@ -628,11 +626,6 @@ fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
     ctx.objs.geo_begin();
 
     let active = layers_sync(ctx);
-
-    // Graphs whose samples only moved along: their pixels follow.
-    if <P::LcdB as LcdBackend>::CAN_MOVE {
-        scroll_graphs(ctx, settled, active);
-    }
 
     // A board that repaints whole areas (a GPU) takes the render over.
     if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.plain && compose_dirty(ctx, false) {
@@ -895,14 +888,6 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
             if gauge && si == di {
                 if let Some((rects, n)) = gauge_changed_rects::<P>(&ctx.objs, sid, &sabs) {
                     clip.restrict(&rects[..n]);
-                }
-            }
-
-            // A graph whose pixels were moved along with its samples
-            // (`scroll_graphs`): only the two ends are drawn.
-            if si == di {
-                if let Some(&(_, strips, n)) = ctx.objs.render.scrolled.iter().find(|s| s.0 == sid) {
-                    clip.restrict(&strips[..n as usize]);
                 }
             }
 
@@ -1225,13 +1210,6 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
         if !w.is_dirty() || !mine(&ctx.objs, di) {
             continue;
         }
-        // A scrolled graph: only the strips its pixels were not moved into.
-        if let Some(&(_, strips, n)) = ctx.objs.render.scrolled.iter().find(|s| s.0 == id) {
-            for r in &strips[..n as usize] {
-                areas.add(*r, &screen);
-            }
-            continue;
-        }
         if ctx.objs.vis_at(di) || ctx.objs.rendered(id) {
             areas.add(ctx.objs.abs_at(di), &screen);
         }
@@ -1273,201 +1251,6 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
 
 /// Most rects one shift moves (they come from two clip regions).
 const SHIFT_MAX: usize = crate::clip::MAX_CLIP_RECTS;
-
-/// Graphs whose last drawing is remembered for [`scroll_graphs`].
-const GRAPHS_MAX: usize = 16;
-/// Pixels either side of a segment its neighbours' strokes may reach.
-const SCROLL_MARGIN: i16 = 3;
-/// Most samples a graph is scrolled by in one render.
-const SCROLL_MAX: usize = 8;
-
-/// Everything that shapes a graph's pixels except its samples.
-fn graph_key<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> u32 {
-    let e = objs.ext(id);
-    gauge_key::<P>(objs, id, abs) ^ ((e.max_length as u32) << 8) ^ (e.value as u32).wrapping_mul(0x9E37_79B1)
-}
-
-/// The samples graph `id` draws (`graph_points`: the first `max_length`).
-fn graph_samples(objs: &ObjPool, id: WidgetId) -> Option<&[i32]> {
-    let e = objs.ext(id);
-    let s = objs.render_graph(id, e.value as crate::pool::ObjPtr)?;
-    let cap = e.max_length as usize;
-    Some(if cap == 0 { s } else { &s[..cap.min(s.len())] })
-}
-
-/// `id` paints `rect` in one colour: an opaque plain box without a gradient
-/// or a picture, `rect` inside its border and clear of its rounded corners.
-fn flat_behind(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
-    let Some(r) = opaque_radius(tree, id, abs) else { return false };
-    let w = tree.get(id);
-    let e = tree.ext(id);
-    if !matches!(w.kind, crate::widget::KIND_BASE | crate::widget::KIND_BUTTON) || e.gradient_dir != 0 || e.image_id != 0 {
-        return false;
-    }
-    if !contains(&inner_rect(abs, &e.border), rect) {
-        return false;
-    }
-    let r = r as i16;
-    (rect.x >= abs.x + r && rect.right() <= abs.right() - r) || (rect.y >= abs.y + r && rect.bottom() <= abs.bottom() - r)
-}
-
-/// How graph `id` (DFS index `di`, box `abs`), last drawn with `old`, gets
-/// to `new` by moving its pixels: the source rect, the (negative) x offset
-/// and the strips to draw after; no source = nothing changed. None = draw it
-/// whole. See [`scroll_graphs`].
-fn graph_scroll<P: Platform>(ctx: &Ctx<P>, di: usize, id: WidgetId, abs: &Rect, old: &[i32], new: &[i32]) -> Option<(Option<Rect>, i16, [Rect; 2], u8)> {
-    let objs = &ctx.objs;
-    let none = Rect::new(0, 0, 0, 0);
-    let w = objs.get(id);
-    let e = objs.ext(id);
-    let count = new.len();
-    if old.len() != count || count < 4 || !objs.rendered(id) || !objs.prev_rect(id).is_empty() {
-        return None;
-    }
-    if !w.first_child.is_none() || w.parent.is_none() || objs.get(w.parent).is_dirty() || objs.scroll_parent_at(di).is_some() {
-        return None;
-    }
-    if w.flags & FLAG_HAS_ON_PAINT != 0 || e.border_radius != 0 || e.gradient_dir != 0 {
-        return None;
-    }
-    if !contains(&screen_rect(&ctx.lcd), abs) || objs.overlay.is_some_and(|o| o.intersects(abs)) {
-        return None;
-    }
-    if old == new {
-        return Some((None, 0, [none; 2], 0));
-    }
-    // The samples moved along by k, and the auto-range stayed.
-    let range = |s: &[i32]| (s.iter().copied().min(), s.iter().copied().max());
-    if range(old) != range(new) {
-        return None;
-    }
-    let k = (1..=SCROLL_MAX.min(count - 3)).find(|&k| new[..count - k] == old[k..])?;
-    // Samples a whole number of pixels apart (`graph_points`' plot_x).
-    let inner = inner_rect(abs, &e.border);
-    if inner.w < 2 || inner.h < 2 {
-        return None;
-    }
-    let (inner_w, denom) = (inner.w as i32 - 1, count as i32 - 1);
-    if inner_w % denom != 0 {
-        return None;
-    }
-    let step = inner_w / denom;
-    // Segments 1 ..= count - 3 - k are the old ones k further on (the same
-    // four samples each); the first has no sample before it, the last two
-    // have the new samples next to them.
-    let xs = inner.x as i32 + step + SCROLL_MARGIN as i32;
-    let xe = inner.x as i32 + (count as i32 - 2 - k as i32) * step - SCROLL_MARGIN as i32;
-    if xe - xs < 8 {
-        return None;
-    }
-    // Nothing in front of it, where it is or was, and nothing hidden or
-    // moved away this render where the box is (their restores would draw
-    // over the moved pixels, or the pixels moved would be theirs).
-    for j in 0..objs.dfs_len() {
-        if j == di || !objs.in_scope(j) {
-            continue;
-        }
-        let jid = objs.dfs_at(j);
-        let vis = objs.vis_at(j);
-        if objs.prev_rect(jid).intersects(abs) {
-            return None;
-        }
-        if (!vis && objs.rendered(jid) || vis && j > di) && objs.abs_at(j).intersects(abs) {
-            return None;
-        }
-    }
-    // What shows through it is one colour across: its own opaque
-    // background, or the widget right behind.
-    if opaque_radius(objs, id, abs).is_none() {
-        let mut j = di;
-        let mut flat = false;
-        while j > 0 {
-            j -= 1;
-            if !objs.vis_at(j) || !objs.in_scope(j) {
-                continue;
-            }
-            let (jid, jabs) = (objs.dfs_at(j), objs.abs_at(j));
-            if !jabs.intersects(abs) || paints_nothing(objs, jid) {
-                continue;
-            }
-            flat = !objs.get(jid).is_dirty() && flat_behind(objs, jid, &jabs, abs);
-            break;
-        }
-        if !flat {
-            return None;
-        }
-    }
-    let dx = k as i32 * step;
-    let src = Rect::new((xs + dx) as i16, abs.y, (xe - xs) as u16, abs.h);
-    let left = Rect::new(inner.x, abs.y, (xs - inner.x as i32) as u16, abs.h);
-    let right = Rect::new(xe as i16, abs.y, (inner.right() as i32 - xe) as u16, abs.h);
-    Some((Some(src), -(dx as i16), [left, right], 2))
-}
-
-/// Before the passes (or the compositor): a dirty graph whose samples are
-/// the ones it was last drawn with, moved along by a few (a history that
-/// drops its oldest value and appends one), gets its pixels moved by as many
-/// sample widths (`LcdImpl::move_rects`); only a strip at either end is
-/// drawn (`RenderState::scrolled`: the passes' clip, the compositor's
-/// areas). A monitor's two graphs were most of a once-a-second render.
-///
-/// Taken only when the result is the same as the whole drawing
-/// ([`graph_scroll`]): the screen is `settled` and shows the samples
-/// remembered (`RenderState::graphs`, kept for the graphs drawn while that
-/// held; forgotten when a graph's samples change without it being drawn);
-/// the same appearance, vertical range and sample count; samples a whole
-/// number of pixels apart; one colour behind it; nothing in front. No
-/// layers, no plain drawing (the move is not a recorded command).
-#[inline(never)]
-fn scroll_graphs<P: Platform>(ctx: &mut Ctx<P>, settled: bool, active: usize) {
-    ctx.objs.render.scrolled.clear();
-    if !settled || active != 0 || ctx.objs.render.plain || ctx.lcd.is_portrait() {
-        ctx.objs.render.graphs.clear();
-        return;
-    }
-    let mut recs = core::mem::take(&mut ctx.objs.render.graphs);
-    // A graph not drawn this render must still show its samples.
-    recs.retain(|(id, _, s)| {
-        let w = ctx.objs.get(*id);
-        w.kind == KIND_GRAPH && ctx.objs.rendered(*id) && (w.is_dirty() || graph_samples(&ctx.objs, *id) == Some(&s[..]))
-    });
-    for di in 0..ctx.objs.dfs_len() {
-        let id = ctx.objs.dfs_at(di);
-        let w = ctx.objs.get(id);
-        if !w.is_dirty() || w.kind != KIND_GRAPH || !ctx.objs.in_scope(di) {
-            continue;
-        }
-        let at = recs.iter().position(|r| r.0 == id);
-        let samples = if ctx.objs.vis_at(di) { graph_samples(&ctx.objs, id).map(|s| s.to_vec()) } else { None };
-        let Some(samples) = samples else {
-            if let Some(at) = at {
-                recs.swap_remove(at);
-            }
-            continue;
-        };
-        let abs = ctx.objs.abs_at(di);
-        let key = graph_key::<P>(&ctx.objs, id, &abs);
-        if let Some(at) = at
-            && recs[at].1 == key
-            && let Some((src, dx, strips, n)) = graph_scroll(ctx, di, id, &abs, &recs[at].2, &samples)
-            && src.is_none_or(|src| ctx.lcd.move_rects(&[src], dx, 0))
-        {
-            if let Some(src) = src {
-                use crate::perf::{add_count, count};
-                add_count(count::SHIFTS, 1);
-                add_count(count::SHIFT_KPX, src.w as u32 * src.h as u32 / 1000);
-            }
-            ctx.objs.render.scrolled.push((id, strips, n));
-        }
-        // This render draws it (whole, or the strips) with these samples.
-        match at {
-            Some(at) => recs[at] = (id, key, samples),
-            None if recs.len() < GRAPHS_MAX => recs.push((id, key, samples)),
-            None => {}
-        }
-    }
-    ctx.objs.render.graphs = recs;
-}
 
 /// Dirty mode, pass 0 (before the restores): a widget that only moved since
 /// the last render, and paints its box opaquely, still shows its last
@@ -4661,101 +4444,6 @@ mod shift_tests {
                     pb[i]
                 );
             }
-        }
-    }
-
-    /// A history graph (the oldest sample dropped, one appended) over a flat
-    /// card: its pixels are moved along and the ends drawn; the screen must
-    /// be the one a full redraw gives. Not moved when the range changes or
-    /// the samples are not the old ones moved along.
-    #[test]
-    fn a_graph_whose_samples_move_along_is_scrolled() {
-        const N: usize = 12;
-        let build = |c: &mut Ctx<Plat<true>>, spline: bool| {
-            let o = &mut c.objs;
-            let root = o.alloc_widget().unwrap();
-            o.root = root;
-            o.get_mut(root).size = Size { w: S as u16, h: S as u16 };
-            o.get_mut(root).background_color = 0x1082;
-            let card = rect(o, root, Rect::new(8, 10, 110, 100), 0x2124, 12, 255);
-            let arr = o.arr_from(&[0; N]).unwrap();
-            let g = o.alloc_widget().unwrap();
-            o.add_child(card, g);
-            let w = o.get_mut(g);
-            w.kind = crate::widget::KIND_GRAPH;
-            w.location = Offset { x: 12, y: 14 };
-            // Samples 6 px apart: (67 - 1) / (12 - 1).
-            w.size = Size { w: 67, h: 70 };
-            o.update_ext(g, |e| {
-                e.value = arr as _;
-                e.alpha = 0;
-                e.text_color = 0x07E0;
-                e.gradient_color = 0x0320;
-                e.image_id = if spline { 2 } else { 3 };
-            });
-            // A label over the card, clear of the graph.
-            rect(o, card, Rect::new(12, 88, 60, 8), 0xFFFF, 0, 255);
-            (g, arr)
-        };
-        for spline in [true, false] {
-            let mut a = ctx::<true>();
-            let mut b = ctx::<true>();
-            let (ga, aa) = build(&mut a, spline);
-            let (gb, ab) = build(&mut b, spline);
-            let mut hist = [50i32; N];
-            let mut seed = 7u32;
-            let mut moves = 0;
-            // (the value appended, or None: every sample changes), scrolled?
-            let steps: [(Option<i32>, bool); 14] = [
-                (Some(50), false), // the first dirty render: nothing remembered yet
-                (Some(50), true),  // nothing changed at all
-                (Some(90), false), // the range grows
-                (Some(10), false),
-                (Some(70), true),
-                (Some(35), true),
-                (Some(62), true),
-                (None, false),
-                (Some(44), false), // 90 or 10 may leave: checked below by pixels only
-                (Some(58), false),
-                (Some(58), false),
-                (Some(31), false),
-                (Some(77), false),
-                (Some(52), false),
-            ];
-            render_all(&mut a);
-            for (step, (value, scrolled)) in steps.into_iter().enumerate() {
-                match value {
-                    Some(v) => {
-                        hist.copy_within(1.., 0);
-                        hist[N - 1] = v;
-                    }
-                    None => {
-                        for h in hist.iter_mut() {
-                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
-                            *h = 10 + (seed >> 16) as i32 % 81;
-                        }
-                        hist[3] = 10;
-                        hist[8] = 90;
-                    }
-                }
-                for (c, g, arr) in [(&mut a.objs, ga, aa), (&mut b.objs, gb, ab)] {
-                    c.arr_mut(arr).unwrap().copy_from_slice(&hist);
-                    c.mark_dirty(g);
-                }
-                let before = a.lcd.backend().moved.get();
-                render_dirty(&mut a);
-                render_all(&mut b);
-                let moved = a.lcd.backend().moved.get() != before;
-                moves += moved as usize;
-                if step < 8 {
-                    assert_eq!(moved, scrolled && value != Some(50), "step {step}");
-                }
-                let (pa, pb) = (a.lcd.backend().px.borrow(), b.lcd.backend().px.borrow());
-                for i in 0..S * S {
-                    assert!(pa[i] == pb[i], "spline {spline} step {step}: pixel ({}, {}) {:04x} vs {:04x}", i % S, i / S, pa[i], pb[i]);
-                }
-            }
-            assert!(moves >= 5, "{moves} moves");
         }
     }
 

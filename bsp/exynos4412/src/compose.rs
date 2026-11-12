@@ -1287,7 +1287,7 @@ impl State {
         let mut pts = core::mem::take(&mut self.gpts);
         pts.clear();
         render::graph_points(ctx, id, &inner, &e, |x, y| pts.push((x as i32, y as i32)));
-        // Only where the areas are (a scrolled graph: a strip at either end): the columns
+        // Only where the areas are (an area may cover one end of the graph): the columns
         // of x the areas span, a few pixels more for the curve's width.
         let mut spans: [(i32, i32); 8] = [(0, 0); 8];
         let mut n = 0;

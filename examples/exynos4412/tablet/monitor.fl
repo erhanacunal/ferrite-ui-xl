@@ -64,9 +64,8 @@ fn build() {
     parent(c1);
     fps_graph = alloc();
     target(fps_graph);
-    // 60 samples 9 px apart (59 * 9 + 1): the renderer scrolls the history.
-    set(location, 34, 124);
-    set(size, 532, 156);
+    set(location, 24, 124);
+    set(size, 552, 156);
     style_graph(ACCENT, 0x2A4F);
     set(graph_arr, fps_hist);
     parent(c1);
@@ -81,9 +80,8 @@ fn build() {
     parent(c2);
     pps_graph = alloc();
     target(pps_graph);
-    // 60 samples 9 px apart (59 * 9 + 1): the renderer scrolls the history.
-    set(location, 34, 124);
-    set(size, 532, 156);
+    set(location, 24, 124);
+    set(size, 552, 156);
     style_graph(0x47EA, 0x1265);
     set(graph_arr, pps_hist);
     parent(c2);

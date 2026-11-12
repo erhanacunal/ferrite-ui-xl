@@ -61,7 +61,7 @@ static DONE_AT: AtomicU32 = AtomicU32::new(0);
 static PICKUP_TICKS: AtomicU64 = AtomicU64::new(0);
 static PICKUP_MAX: AtomicU32 = AtomicU32::new(0);
 /// `render::JOB_TICKS` and the compositor's `TIMES` at the last `take_stats`.
-static LAST_JOB: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static LAST_JOB: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static LAST_COMPOSE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
 /// A render core's wait for a present copy (`lcd::wait_rows`, not on CPU0).
@@ -159,8 +159,10 @@ pub struct Stats {
     pub jobs: u32,
     pub busy_us: u32,
     pub max_us: u32,
-    /// Inside the jobs (`render::run_job`, on whichever core): the VM's
-    /// lists before the render, the render, the `on_paint` lists after it.
+    /// Inside the jobs (`render::run_job`, on whichever core): taking in the
+    /// commit the VM core packed (`view::Commit`), the VM's lists before the
+    /// render, the render, the `on_paint` lists after it.
+    pub apply_us: u32,
     pub lists_us: u32,
     pub render_us: u32,
     pub paints_us: u32,
@@ -199,6 +201,7 @@ pub fn take_stats() -> Stats {
         jobs: JOBS.swap(0, Ordering::Relaxed),
         busy_us: take(&BUSY_TICKS),
         max_us: us(MAX_TICKS.swap(0, Ordering::Relaxed) as u64),
+        apply_us: job(render::JOB_APPLY),
         lists_us: job(render::JOB_LISTS),
         render_us: job(render::JOB_RENDER),
         paints_us: job(render::JOB_PAINTS),

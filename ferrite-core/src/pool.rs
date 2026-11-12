@@ -177,6 +177,10 @@ pub(crate) struct RenderState {
     /// VM pool: what the render pool must hear at the next sync, in order
     /// (`view.rs`). Empty in the render pool.
     pub(crate) msgs: Vec<crate::view::RenderMsg>,
+    /// A sync's data (`view::Commit`). Render pool: the one its next job
+    /// applies (`Commit::pending`), then the applied one, kept for its
+    /// buffers; VM pool: a spare one to build the next sync in.
+    pub(crate) commit: Option<alloc::boxed::Box<crate::view::Commit>>,
     /// VM pool: the tree's shape (links, objects) changed since the last
     /// sync: the render pool's DFS order is stale.
     pub(crate) shape_changed: bool,
@@ -204,6 +208,7 @@ impl RenderState {
             scene: crate::scene::RenderSnapshot::new(),
             recs: Vec::new(),
             msgs: Vec::new(),
+            commit: None,
             shape_changed: true,
             geo: Vec::new(),
             geo_stack: Vec::new(),
@@ -285,6 +290,11 @@ pub struct ObjPool {
     touched_bits: Vec<u32>,
     touched: Vec<ObjPtr>,
     touched_over: bool,
+    /// VM pool: the strings / arrays the render pool's scene holds a packed
+    /// copy of (a bit per pointer): a sync sends their data again when they
+    /// were touched, and that of the others when a widget first shows them.
+    pub(crate) text_sent: Vec<u32>,
+    pub(crate) graph_sent: Vec<u32>,
     /// VM pool: syncs so far. A render pool's scene can be updated only if
     /// it took the last one (`RenderSnapshot::generation`).
     pub(crate) sync_gen: u32,
@@ -359,6 +369,8 @@ impl ObjPool {
             touched_bits: Vec::new(),
             touched: Vec::new(),
             touched_over: false,
+            text_sent: Vec::new(),
+            graph_sent: Vec::new(),
             sync_gen: 0,
         }
     }
@@ -422,17 +434,17 @@ impl ObjPool {
     /// Copy live widget blocks into `view`. Text and graph data live in the
     /// renderer snapshot; unrelated VM strings/arrays and arena holes are
     /// omitted while widget pointer ids remain stable.
-    pub(crate) fn sync_view_metadata(&self, view: &mut ObjPool) {
+    pub(crate) fn set_view_metadata(&mut self, hwm: usize, root: WidgetId, overlay: Option<crate::types::Rect>) {
         // Widget data now lives in `RenderSnapshot`; this context keeps only
         // render-owned state and stable widget ID bounds.
-        view.top = 0;
-        view.hwm = self.hwm;
-        view.free_head = PTR_NONE;
-        view.free_tail = PTR_NONE;
-        view.garbage = 0;
-        view.live = [0; 4];
-        view.root = self.root;
-        view.overlay = self.overlay;
+        self.top = 0;
+        self.hwm = hwm as ObjPtr;
+        self.free_head = PTR_NONE;
+        self.free_tail = PTR_NONE;
+        self.garbage = 0;
+        self.live = [0; 4];
+        self.root = root;
+        self.overlay = overlay;
     }
 
     /// Resize to `arena_bytes` / `max_objects` (0 = compile-time default),
@@ -481,6 +493,8 @@ impl ObjPool {
         self.table = table;
         self.dfs_cache = dfs;
         self.touched_bits = alloc::vec![0; objects / 32 + 1];
+        self.text_sent = alloc::vec![0; objects / 32 + 1];
+        self.graph_sent = alloc::vec![0; objects / 32 + 1];
         self.touched = Vec::with_capacity(TOUCHED_MAX);
         self.touched_over = false;
         true

@@ -4322,6 +4322,75 @@ mod anim_tests {
         crate::mock::render_elsewhere(false);
     }
 
+    /// Stage 2: a render handed to the other core gets a commit, data only.
+    /// What the VM pool does to the same objects while the job has not taken
+    /// it in yet (strings edited, freed, widgets written) does not reach
+    /// that job: it shows the tree as it was at the hand-over.
+    #[test]
+    fn a_posted_commit_holds_the_tree_as_it_was_handed_over() {
+        crate::mock::render_elsewhere(true);
+        let mut ctx = mock_ctx();
+        let mut r = mock_ctx();
+        r.objs = ObjPool::view();
+        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        let root = one_widget(&mut ctx);
+        ctx.objs.root = root;
+        ctx.objs.get_mut(root).size = crate::types::Size { w: 800, h: 480 };
+        let (label, other, graph) = (one_widget(&mut ctx), one_widget(&mut ctx), one_widget(&mut ctx));
+        for w in [label, other, graph] {
+            ctx.objs.add_child(root, w);
+            ctx.objs.get_mut(w).size = crate::types::Size { w: 40, h: 30 };
+        }
+        let text = ctx.objs.str_alloc(b"abc").unwrap();
+        ctx.objs.set_text_id(label, text);
+        let samples = ctx.objs.arr_from(&[1, 2, 3]).unwrap();
+        ctx.objs.get_mut(graph).kind = crate::widget::KIND_GRAPH;
+        ctx.objs.get_mut(graph).value = samples as _;
+        // The first job: the whole tree.
+        crate::render::render_dirty(&mut ctx);
+        assert!(ctx.render_away && crate::mock::render_pending());
+        crate::mock::finish_render();
+        crate::render::wait_idle(&mut ctx);
+
+        // The second: a delta (a string edited in place, shown by a second
+        // widget from now on; samples written; a colour).
+        let updates = crate::scene::UPDATES.load(core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ctx.objs.str_delete_byte(text, 0), Some(text));
+        ctx.objs.set_text_id(other, text);
+        ctx.objs.arr_mut(samples).unwrap()[1] = 9;
+        ctx.objs.get_mut(label).background_color = 0x0F0F;
+        ctx.objs.mark_dirty(label);
+        crate::render::render_dirty(&mut ctx);
+        assert!(ctx.render_away && crate::mock::render_pending());
+        assert!(!ctx.objs.get(label).is_dirty(), "handed over");
+        // Meanwhile, on the VM's side.
+        ctx.objs.str_free(text);
+        ctx.objs.arr_mut(samples).unwrap()[1] = 77;
+        ctx.objs.get_mut(label).background_color = 0x1111;
+        ctx.objs.mark_dirty(label);
+        crate::mock::finish_render();
+        crate::render::wait_idle(&mut ctx);
+        {
+            let r = ctx.render_ctx.as_ref().expect("back");
+            assert!(crate::scene::UPDATES.load(core::sync::atomic::Ordering::Relaxed) > updates, "an update");
+            assert_eq!(r.objs.render_scene().text_for(label), Some(&b"bc"[..]));
+            assert_eq!(r.objs.render_scene().text_for(other), Some(&b"bc"[..]));
+            assert_eq!(r.objs.render_scene().graph_for(graph), Some(&[1, 9, 3][..]));
+            assert_eq!(r.objs.get(label).background_color, 0x0F0F);
+            assert!(r.objs.rendered(label) && !r.objs.get(label).is_dirty());
+        }
+        // The next job gets the rest.
+        crate::render::render_dirty(&mut ctx);
+        crate::mock::finish_render();
+        crate::render::wait_idle(&mut ctx);
+        let r = ctx.render_ctx.as_ref().expect("back");
+        assert_eq!(r.objs.render_scene().text_for(label), None);
+        assert_eq!(r.objs.render_scene().text_for(other), None);
+        assert_eq!(r.objs.render_scene().graph_for(graph), Some(&[1, 77, 3][..]));
+        assert_eq!(r.objs.get(label).background_color, 0x1111);
+        crate::mock::render_elsewhere(false);
+    }
+
     #[test]
     fn get_text_reads_the_widgets_own_string() {
         // text_input demo: get(text) on an input after strClear() returned

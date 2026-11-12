@@ -929,8 +929,8 @@ fn status_json() -> String {
         );
         let _ = write!(
             s,
-            ",\"lists_us\":{},\"render_us\":{},\"paints_us\":{},\"compose_us\":{},\"collect_us\":{},\"frames\":{},\"frame_us\":{},\"gp_us\":{},\"pp_us\":{}",
-            t.lists_us, t.render_us, t.paints_us, t.compose_us, t.collect_us, t.frames, t.frame_us, t.gp_us, t.pp_us
+            ",\"apply_us\":{},\"lists_us\":{},\"render_us\":{},\"paints_us\":{},\"compose_us\":{},\"collect_us\":{},\"frames\":{},\"frame_us\":{},\"gp_us\":{},\"pp_us\":{}",
+            t.apply_us, t.lists_us, t.render_us, t.paints_us, t.compose_us, t.collect_us, t.frames, t.frame_us, t.gp_us, t.pp_us
         );
         let _ = write!(
             s,

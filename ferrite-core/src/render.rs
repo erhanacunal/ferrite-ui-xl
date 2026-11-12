@@ -235,6 +235,9 @@ pub enum RenderJob {
 /// drawing and captured `on_paint` before the render, the other `on_paint`
 /// lists on the screen after it.
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
+    let ta = crate::perf::now();
+    // What the VM side packed for this job (`submit`).
+    r.objs.apply_pending();
     let t0 = crate::perf::now();
     let draws = core::mem::take(&mut r.objs.render.draws);
     let mut later = alloc::vec::Vec::new();
@@ -265,6 +268,7 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     }
     let t3 = crate::perf::now();
     use core::sync::atomic::Ordering::Relaxed;
+    JOB_TICKS[JOB_APPLY].fetch_add(t0.wrapping_sub(ta) as u64, Relaxed);
     JOB_TICKS[JOB_LISTS].fetch_add(t1.wrapping_sub(t0) as u64, Relaxed);
     JOB_TICKS[JOB_RENDER].fetch_add(t2.wrapping_sub(t1) as u64, Relaxed);
     JOB_TICKS[JOB_PAINTS].fetch_add(t3.wrapping_sub(t2) as u64, Relaxed);
@@ -273,11 +277,13 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
 /// Where the render jobs' time went ([`run_job`], profiler clock ticks since
 /// boot, whichever core ran them): the VM's recorded drawing replayed before
 /// the render (screen lists, captured `on_paint` lists), the render itself,
-/// the `on_paint` lists replayed on the screen after it.
-pub static JOB_TICKS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+/// the `on_paint` lists replayed on the screen after it; and before all of
+/// them, taking in the commit the VM side posted (`view::Commit`).
+pub static JOB_TICKS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 pub const JOB_LISTS: usize = 0;
 pub const JOB_RENDER: usize = 1;
 pub const JOB_PAINTS: usize = 2;
+pub const JOB_APPLY: usize = 3;
 
 /// The VM's drawing is recorded for the render side (`view::Draw`): there
 /// is a render context, here or away.
@@ -345,15 +351,16 @@ pub fn wait_idle<P: Platform>(ctx: &mut Ctx<P>) {
     }
 }
 
-/// Sync and start `job`: on the render side (another core) if the board
-/// takes it, else here.
+/// Start `job` with what changed since the last one: on the render side
+/// (another core) if the board takes it, else here. Only a commit is built
+/// here (`ObjPool::post_commit`); the job takes it in where it runs.
 fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
     let Some(mut r) = ctx.render_ctx.take() else {
         with_view(ctx, |c| run_job(c, job));
         return;
     };
     let t0 = crate::perf::now();
-    sync_render_ctx(ctx, &mut r);
+    sync_render_ctx(ctx, &mut r, true);
     match P::render_start(r, job) {
         Ok(()) => {
             crate::perf::add_sub(
@@ -384,7 +391,7 @@ pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -
     if let Some(mut r) = ctx.render_ctx.take() {
         // The render side's own context (step 3c).
         let t0 = crate::perf::now();
-        sync_render_ctx(ctx, &mut r);
+        sync_render_ctx(ctx, &mut r, false);
         crate::perf::add_sub(
             crate::perf::phase::SCENE_HANDOFF,
             crate::perf::now().wrapping_sub(t0),
@@ -404,9 +411,14 @@ pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -
 
 /// Hand the VM context's state over to the render context `r`: the pool
 /// (`ObjPool::sync_view`), the fonts and images the VM loaded, the
-/// filesystem, the orientation, the cursor blink.
-fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>) {
-    ctx.objs.sync_view(&mut r.objs);
+/// filesystem, the orientation, the cursor blink. `post` = the pool's part
+/// is only packed here, for `r`'s next job to take in (`run_job`).
+fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>, post: bool) {
+    if post {
+        ctx.objs.post_commit(&mut r.objs);
+    } else {
+        ctx.objs.sync_view(&mut r.objs);
+    }
     r.fonts.sync_from(&ctx.fonts);
     r.images.sync_from(&ctx.images);
     if r.fs.is_none() != ctx.fs.is_none() {

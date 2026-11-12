@@ -5,13 +5,15 @@
 //! widgets from it. Render-owned bookkeeping remains outside it.
 //!
 //! The first sync captures the whole tree ([`RenderSnapshot::capture`]);
-//! later ones only repack what the VM pool touched since
-//! ([`RenderSnapshot::update`], `ObjPool::touched`: every mutable access to
-//! an object goes through `ObjPool::payload_mut`, which notes its pointer).
-//! A full capture again whenever the tree's shape changed (the widgets are
-//! packed in paint order), after a program switch, when too many objects were
-//! touched, or when the packed text / graph data holds too much garbage.
-//! [`VERIFY`] compares every update with a full capture.
+//! later ones only repack what the VM pool touched since (`ObjPool::touched`:
+//! every mutable access to an object goes through `ObjPool::payload_mut`,
+//! which notes its pointer). The VM side packs those into a [`Delta`]
+//! (`view::Commit`), which owns its data too; the render side applies it
+//! ([`RenderSnapshot::apply`]) without reading the VM pool, so it may do so
+//! on another core. A full capture again whenever the tree's shape changed
+//! (the widgets are packed in paint order), after a program switch, when too
+//! many objects were touched, or when the packed text / graph data holds too
+//! much garbage. [`VERIFY`] compares every update with a full capture.
 
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -32,8 +34,64 @@ pub static FULLS: AtomicU32 = AtomicU32::new(0);
 pub static UPDATES: AtomicU32 = AtomicU32::new(0);
 pub static UPDATED: AtomicU32 = AtomicU32::new(0);
 
+/// A string's / array's packed copy: start, end, and whether the object is
+/// one (a freed or retyped object packs as nothing).
+type Packed = (usize, usize, bool);
+
 /// No packed copy of this object.
-const NOWHERE: (usize, usize) = (usize::MAX, 0);
+const NOWHERE: Packed = (usize::MAX, 0, false);
+
+/// What changed in a tree of unchanged shape, packed on the VM side
+/// (`ObjPool::build_commit`) for [`RenderSnapshot::apply`]: the touched
+/// widgets, and the data of the strings / arrays the render side keeps a
+/// copy of that were touched or are shown for the first time.
+#[derive(Default)]
+pub(crate) struct Delta {
+    /// Touched widgets as packed by `pack_raw` (their ranges are filled in
+    /// by `apply`).
+    widgets: Vec<SceneWidget>,
+    /// Object, whether it is a string, its bytes in `bytes`.
+    texts: Vec<(ObjPtr, bool, Range<usize>)>,
+    /// Object, whether it is an array, its samples in `samples`.
+    graphs: Vec<(ObjPtr, bool, Range<usize>)>,
+    bytes: Vec<u8>,
+    samples: Vec<i32>,
+}
+
+impl Delta {
+    pub(crate) fn clear(&mut self) {
+        self.widgets.clear();
+        self.texts.clear();
+        self.graphs.clear();
+        self.bytes.clear();
+        self.samples.clear();
+    }
+
+    /// Packs widget `id`; returns the string and the array it shows.
+    pub(crate) fn widget(&mut self, pool: &ObjPool, id: WidgetId) -> (ObjPtr, ObjPtr) {
+        let w = RenderSnapshot::pack_raw(pool, id);
+        let src = (w.text_src, w.graph_src);
+        self.widgets.push(w);
+        src
+    }
+
+    /// Packs string `p`'s bytes (none if it is no string any more).
+    pub(crate) fn text(&mut self, pool: &ObjPool, p: ObjPtr) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(pool.str_get(p));
+        self.texts.push((p, pool.type_of(p) == T_STRING, start..self.bytes.len()));
+    }
+
+    /// Packs array `p`'s samples (none if it is no array any more).
+    pub(crate) fn graph(&mut self, pool: &ObjPool, p: ObjPtr) {
+        let start = self.samples.len();
+        let values = pool.arr(p);
+        if let Some(values) = values {
+            self.samples.extend_from_slice(values);
+        }
+        self.graphs.push((p, values.is_some(), start..self.samples.len()));
+    }
+}
 
 /// One widget in depth-first paint order. Text and graph data refer to the
 /// snapshot's packed buffers rather than VM object pointers.
@@ -59,8 +117,8 @@ pub struct RenderSnapshot {
     graph: Vec<i32>,
     /// Where each string / array is packed, by object pointer (shared by the
     /// widgets that show it; dropped when the object is touched).
-    text_by_id: Vec<(usize, usize)>,
-    graph_by_id: Vec<(usize, usize)>,
+    text_by_id: Vec<Packed>,
+    graph_by_id: Vec<Packed>,
     by_id: Vec<u32>,
     pub root: WidgetId,
     pub overlay: Option<crate::types::Rect>,
@@ -104,76 +162,103 @@ impl RenderSnapshot {
         self.graph_full = self.graph.len();
     }
 
-    /// Repack what `pool` touched since the last sync (`ObjPool::touched`):
-    /// the touched widgets, and the text / graph data of the widgets showing
-    /// a touched string / array. The tree's shape must be the captured one.
-    /// A widget keeps the dirty bit the render side still holds for it.
-    /// Returns the widgets repacked.
-    pub fn update(&mut self, pool: &ObjPool) -> usize {
-        let n = pool.ptr_count();
-        if self.by_id.len() < n {
-            self.by_id.resize(n, 0);
+    /// Apply what the VM side packed since the last sync (`delta`): the
+    /// touched widgets, and the text / graph data of the widgets showing a
+    /// string / array that came with it. The tree's shape must be the
+    /// captured one. A widget keeps the dirty bit the render side still
+    /// holds for it. `ptrs` = the VM pool's pointer count. Returns the
+    /// widgets repacked.
+    pub(crate) fn apply(
+        &mut self,
+        delta: &Delta,
+        ptrs: usize,
+        root: WidgetId,
+        overlay: Option<crate::types::Rect>,
+    ) -> usize {
+        if self.by_id.len() < ptrs {
+            self.by_id.resize(ptrs, 0);
         }
-        if self.text_by_id.len() < n {
-            self.text_by_id.resize(n, NOWHERE);
+        if self.text_by_id.len() < ptrs {
+            self.text_by_id.resize(ptrs, NOWHERE);
         }
-        if self.graph_by_id.len() < n {
-            self.graph_by_id.resize(n, NOWHERE);
+        if self.graph_by_id.len() < ptrs {
+            self.graph_by_id.resize(ptrs, NOWHERE);
         }
-        // The packed copies of touched strings and arrays are stale.
-        let mut data = false;
-        for &p in pool.touched() {
-            let slot = p as usize;
-            if self.by_id.get(slot).is_none_or(|&at| at == 0) {
-                data = true;
+        for (p, has, r) in &delta.texts {
+            let start = self.text.len();
+            self.text.extend_from_slice(&delta.bytes[r.clone()]);
+            if let Some(slot) = self.text_by_id.get_mut(*p as usize) {
+                *slot = (start, self.text.len(), *has);
             }
-            if let Some(r) = self.text_by_id.get_mut(slot) {
-                *r = NOWHERE;
-            }
-            if let Some(r) = self.graph_by_id.get_mut(slot) {
-                *r = NOWHERE;
+        }
+        for (p, has, r) in &delta.graphs {
+            let start = self.graph.len();
+            self.graph.extend_from_slice(&delta.samples[r.clone()]);
+            if let Some(slot) = self.graph_by_id.get_mut(*p as usize) {
+                *slot = (start, self.graph.len(), *has);
             }
         }
         let mut repacked = 0;
-        for &p in pool.touched() {
-            let at = self.by_id.get(p as usize).copied().unwrap_or(0);
+        for packed in &delta.widgets {
+            let at = self.by_id.get(packed.id.index()).copied().unwrap_or(0);
             if at == 0 {
+                // Not in the tree (not under the root).
                 continue;
             }
             let i = at as usize - 1;
-            let dirty = self.widgets[i].widget.flags & FLAG_DIRTY;
-            let mut packed = self.pack(pool, WidgetId(p));
-            packed.widget.flags |= dirty;
+            let mut packed = packed.clone();
+            packed.widget.flags |= self.widgets[i].widget.flags & FLAG_DIRTY;
+            self.place(&mut packed);
             self.widgets[i] = packed;
             repacked += 1;
         }
-        if data {
-            // Untouched widgets showing a touched string / array.
+        if !delta.texts.is_empty() || !delta.graphs.is_empty() {
+            // Untouched widgets showing a string / array that came anew.
             for i in 0..self.widgets.len() {
                 let w = &self.widgets[i];
-                if pool.is_touched(w.id.0) {
-                    continue;
-                }
-                let (text_src, graph_src) = (w.text_src, w.graph_src);
-                if text_src != PTR_NONE && pool.is_touched(text_src) {
-                    let (start, end) = self.text_range(pool, text_src);
-                    let w = &mut self.widgets[i];
-                    w.text = start..end;
-                    w.has_text = pool.type_of(text_src) == T_STRING;
-                    repacked += 1;
-                }
-                if graph_src != PTR_NONE && pool.is_touched(graph_src) {
-                    let (start, end) = self.graph_range(pool, graph_src);
-                    let w = &mut self.widgets[i];
-                    w.graph = start..end;
-                    w.has_graph = pool.arr(graph_src).is_some();
+                let text = self.text_by_id.get(w.text_src as usize).copied().filter(|r| r.0 != usize::MAX);
+                let graph = self.graph_by_id.get(w.graph_src as usize).copied().filter(|r| r.0 != usize::MAX);
+                let stale = |now: Option<Packed>, r: &Range<usize>, has: bool| {
+                    now.is_some_and(|(start, end, h)| start != r.start || end != r.end || h != has)
+                };
+                if stale(text, &w.text, w.has_text) || stale(graph, &w.graph, w.has_graph) {
+                    let mut w = w.clone();
+                    self.place(&mut w);
+                    self.widgets[i] = w;
                     repacked += 1;
                 }
             }
         }
-        self.root = pool.root;
-        self.overlay = pool.overlay;
+        self.root = root;
+        self.overlay = overlay;
         repacked
+    }
+
+    /// Point `w` at the packed copies of the string and the array it shows.
+    fn place(&self, w: &mut SceneWidget) {
+        if w.text_src != PTR_NONE {
+            let (start, end, has) = self.text_by_id.get(w.text_src as usize).copied().unwrap_or(NOWHERE);
+            debug_assert!(start != usize::MAX, "scene delta: text of widget {} not sent", w.id.0);
+            let (start, end) = if start == usize::MAX { (0, 0) } else { (start, end) };
+            w.text = start..end;
+            w.has_text = has;
+        }
+        if w.graph_src != PTR_NONE {
+            let (start, end, has) = self.graph_by_id.get(w.graph_src as usize).copied().unwrap_or(NOWHERE);
+            debug_assert!(start != usize::MAX, "scene delta: samples of widget {} not sent", w.id.0);
+            let (start, end) = if start == usize::MAX { (0, 0) } else { (start, end) };
+            w.graph = start..end;
+            w.has_graph = has;
+        }
+    }
+
+    /// The strings and the arrays this scene holds a packed copy of.
+    pub(crate) fn packed_texts(&self) -> impl Iterator<Item = ObjPtr> + '_ {
+        self.text_by_id.iter().enumerate().filter(|(_, r)| r.0 != usize::MAX).map(|(p, _)| p as ObjPtr)
+    }
+
+    pub(crate) fn packed_graphs(&self) -> impl Iterator<Item = ObjPtr> + '_ {
+        self.graph_by_id.iter().enumerate().filter(|(_, r)| r.0 != usize::MAX).map(|(p, _)| p as ObjPtr)
     }
 
     /// The packed text / graph data has grown to more than twice what the
@@ -185,32 +270,33 @@ impl RenderSnapshot {
     /// `id` as the renderer reads it: its header and optional fields, its
     /// text and graph samples packed (or found packed already).
     fn pack(&mut self, pool: &ObjPool, id: WidgetId) -> SceneWidget {
+        let mut w = Self::pack_raw(pool, id);
+        let (start, end) = self.text_range(pool, w.text_src);
+        w.text = start..end;
+        if w.graph_src != PTR_NONE {
+            let (start, end) = self.graph_range(pool, w.graph_src);
+            w.graph = start..end;
+        }
+        w
+    }
+
+    /// `id`'s header and optional fields, and which string and array it
+    /// shows; the ranges of their packed copies are not set.
+    fn pack_raw(pool: &ObjPool, id: WidgetId) -> SceneWidget {
         let mut widget = *pool.get(id);
         let mut ext = pool.ext(id);
         let text_src = ext.text_id;
         let has_text = text_src != PTR_NONE && pool.type_of(text_src) == T_STRING;
-        let (text_start, text_end) = self.text_range(pool, text_src);
         ext.text_id = PTR_NONE;
 
         let is_graph = widget.kind == KIND_GRAPH;
         let graph_src = if is_graph { widget.value as ObjPtr } else { PTR_NONE };
-        let (graph_start, graph_end) = if is_graph { self.graph_range(pool, graph_src) } else { (0, 0) };
         let has_graph = is_graph && pool.arr(graph_src).is_some();
         if is_graph {
             widget.value = 0;
             ext.value = 0;
         }
-        SceneWidget {
-            id,
-            widget,
-            ext,
-            has_text,
-            has_graph,
-            text: text_start..text_end,
-            graph: graph_start..graph_end,
-            text_src,
-            graph_src,
-        }
+        SceneWidget { id, widget, ext, has_text, has_graph, text: 0..0, graph: 0..0, text_src, graph_src }
     }
 
     /// Where string `text_id`'s bytes are packed, packing them if they are
@@ -220,14 +306,14 @@ impl RenderSnapshot {
             return (0, 0);
         }
         let slot = text_id as usize;
-        if let Some(&(start, end)) = self.text_by_id.get(slot).filter(|r| r.0 != usize::MAX) {
+        if let Some(&(start, end, _)) = self.text_by_id.get(slot).filter(|r| r.0 != usize::MAX) {
             return (start, end);
         }
         let start = self.text.len();
         self.text.extend_from_slice(pool.str_get(text_id));
         let end = self.text.len();
         if let Some(range) = self.text_by_id.get_mut(slot) {
-            *range = (start, end);
+            *range = (start, end, pool.type_of(text_id) == T_STRING);
         }
         (start, end)
     }
@@ -235,16 +321,17 @@ impl RenderSnapshot {
     /// As [`Self::text_range`], for the samples of array `array_id`.
     fn graph_range(&mut self, pool: &ObjPool, array_id: ObjPtr) -> (usize, usize) {
         let slot = array_id as usize;
-        if let Some(&(start, end)) = self.graph_by_id.get(slot).filter(|r| r.0 != usize::MAX) {
+        if let Some(&(start, end, _)) = self.graph_by_id.get(slot).filter(|r| r.0 != usize::MAX) {
             return (start, end);
         }
         let start = self.graph.len();
-        if let Some(values) = pool.arr(array_id) {
+        let values = pool.arr(array_id);
+        if let Some(values) = values {
             self.graph.extend_from_slice(values);
         }
         let end = self.graph.len();
         if let Some(range) = self.graph_by_id.get_mut(slot) {
-            *range = (start, end);
+            *range = (start, end, values.is_some());
         }
         (start, end)
     }
@@ -335,8 +422,8 @@ impl RenderSnapshot {
         self.widgets.capacity() * size_of::<SceneWidget>()
             + self.text.capacity()
             + self.graph.capacity() * size_of::<i32>()
-            + self.text_by_id.capacity() * size_of::<(usize, usize)>()
-            + self.graph_by_id.capacity() * size_of::<(usize, usize)>()
+            + self.text_by_id.capacity() * size_of::<Packed>()
+            + self.graph_by_id.capacity() * size_of::<Packed>()
             + self.by_id.capacity() * size_of::<u32>()
     }
 }

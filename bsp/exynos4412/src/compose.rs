@@ -268,6 +268,9 @@ struct State {
     glyphs: bool,
     /// A graph's curve points, and triangles cut to a box (`tess_in`), kept for their room.
     gpts: Vec<(i32, i32)>,
+    gcols: Vec<(i32, i32)>,
+    /// The areas being gathered (`collect`): a graph makes pieces only where they are.
+    areas: Vec<R>,
     cov_tris: Vec<tess::Vtx>,
     /// Images that aren't raw opaque RGB565, decoded into textures.
     images: Images,
@@ -300,6 +303,8 @@ static mut STATE: State = State {
     cov: Vec::new(),
     glyphs: false,
     gpts: Vec::new(),
+    gcols: Vec::new(),
+    areas: Vec::new(),
     cov_tris: Vec::new(),
     images: Images { entries: Vec::new(), bytes: 0, render: 0 },
     any_565: false,
@@ -555,6 +560,15 @@ pub static MERGE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 /// draws the straight parts like the solids, at under half the vertices, for a dearer shader
 /// over the box's inside. For the many small boxes of the Monitor stress test's tiles. 0 =
 /// always nine pieces; HTTP `POST /api/compose?round_px=N`.
+/// Pixels either side of an area a graph's pieces are made for (the curve's width).
+const GRAPH_PAD: i32 = 4;
+/// How far (1/100 px) a graph's curve may pass from a point it drops (`tess::polyline_within`);
+/// HTTP `POST /api/compose?line_within=N`. Vertices of the curves since boot.
+pub static LINE_WITHIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(50);
+pub static LINE_VERTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Time gathering graphs' pieces, us, and triangle vertices put into frames, since boot.
+pub static GRAPH_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static TRI_VERTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static ROUND_WHOLE_PX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2048);
 const MERGE_BACK: usize = 12;
 /// Rounded boxes as anti-aliased triangles (`ferrite_core::lcd::tess`: coverage per vertex,
@@ -794,6 +808,8 @@ impl State {
     fn collect(&mut self, ctx: &Ctx<P>, ui: &Ui, gpu: &mut Gpu, areas: &[Rect]) -> Result<(), usize> {
         let objs = &ctx.objs;
         let areas: Vec<R> = areas.iter().map(R::of).collect();
+        self.areas.clear();
+        self.areas.extend_from_slice(&areas);
         let keep_after = renderer::cache().tick();
         let n = objs.dfs_len();
         // Scroll containers whose subtree is being walked: (its end, the container). Their
@@ -1248,11 +1264,13 @@ impl State {
         }
     }
 
-    /// A graph (`render::draw_graph`): its box, the fill under the curve as solid columns
-    /// (`fill_under_segment`'s, runs of equal ones merged), then the curve as a 1 px
+    /// A graph (`render::draw_graph`): its box, the fill under the curve (`fill_under_segment`'s
+    /// columns as the few quads covering the same pixels, `tess::columns`: one solid a column
+    /// was ~550 pieces a graph in every frame it met), then the curve as a 1 px
     /// anti-aliased polyline (`tess::polyline`), both cut to the box. The CPU interleaves fill
     /// and line per segment; here the line goes over all of the fill. Its opaque rect.
     fn graph(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> Option<R> {
+        let started = now_us();
         let objs = &ctx.objs;
         let e = objs.ext(id);
         let r = R::of(abs);
@@ -1263,46 +1281,73 @@ impl State {
         let mut pts = core::mem::take(&mut self.gpts);
         pts.clear();
         render::graph_points(ctx, id, &inner, &e, |x, y| pts.push((x as i32, y as i32)));
+        // Only where the areas are (a scrolled graph: a strip at either end): the columns
+        // of x the areas span, a few pixels more for the curve's width.
+        let mut spans: [(i32, i32); 8] = [(0, 0); 8];
+        let mut n = 0;
+        for a in self.areas.iter().filter(|a| a.meets(&r)) {
+            let (mut lo, mut hi) = (a.x0 - GRAPH_PAD, a.x1 + GRAPH_PAD);
+            // Joined with the spans it meets.
+            let mut i = 0;
+            while i < n {
+                if spans[i].0 <= hi && lo <= spans[i].1 {
+                    (lo, hi) = (lo.min(spans[i].0), hi.max(spans[i].1));
+                    n -= 1;
+                    spans[i] = spans[n];
+                    i = 0;
+                } else {
+                    i += 1;
+                }
+            }
+            if n == spans.len() {
+                (spans[0], n) = ((i32::MIN, i32::MAX), 1);
+                break;
+            }
+            spans[n] = (lo, hi);
+            n += 1;
+        }
+        // The points of a span: from the last one before it to the first one after.
+        let part = |pts: &[(i32, i32)], lo: i32, hi: i32| {
+            let from = pts.partition_point(|p| p.0 < lo).saturating_sub(1);
+            let to = (pts.partition_point(|p| p.0 <= hi) + 1).min(pts.len());
+            (to > from + 1).then_some((from, to))
+        };
         if let Some(fill) = style.fill {
             let fill = Lin::flat(rgb(fill, 1.0));
             let base = style.baseline as i32;
-            // The column at x from `fill_under_segment`: rows top..bottom.
-            let mut run: Option<(i32, i32, i32, i32)> = None; // x0, x1, top, bottom
-            let mut column = |this: &mut Self, x: i32, y: i32| {
-                let (top, bot) = (y.min(base), y.max(base));
-                if bot <= top {
-                    return;
-                }
-                match run {
-                    Some((x0, x1, t, b)) if x1 == x && t == top && b == bot => run = Some((x0, x + 1, t, b)),
-                    _ => {
-                        if let Some((x0, x1, t, b)) = run {
-                            this.solid(R { x0, y0: t, x1, y1: b }.meet(&r), fill);
-                        }
-                        run = Some((x, x + 1, top, bot));
+            let mut cols = core::mem::take(&mut self.gcols);
+            for &(lo, hi) in &spans[..n] {
+                let Some((from, to)) = part(&pts, lo, hi) else { continue };
+                // `fill_under_segment`'s columns: (x, the curve's row there).
+                cols.clear();
+                for w in pts[from..to].windows(2) {
+                    let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+                    if x1 == x0 {
+                        cols.push((x0, y0));
+                        continue;
+                    }
+                    let (dx, dy) = (x1 - x0, y1 - y0);
+                    let step = if dx > 0 { 1 } else { -1 };
+                    let mut x = x0;
+                    while x != x1 {
+                        cols.push((x, y0 + dy * (x - x0) / dx));
+                        x += step;
                     }
                 }
-            };
-            for w in pts.windows(2) {
-                let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-                if x1 == x0 {
-                    column(self, x0, y0);
-                    continue;
-                }
-                let (dx, dy) = (x1 - x0, y1 - y0);
-                let step = if dx > 0 { 1 } else { -1 };
-                let mut x = x0;
-                while x != x1 {
-                    column(self, x, y0 + dy * (x - x0) / dx);
-                    x += step;
-                }
+                self.tess_in(fill, Some(r), |m| tess::columns(m, &cols, base));
             }
-            if let Some((x0, x1, t, b)) = run {
-                self.solid(R { x0, y0: t, x1, y1: b }.meet(&r), fill);
-            }
+            self.gcols = cols;
         }
-        self.tess_in(Lin::flat(rgb(style.line, 1.0)), Some(r), |m| tess::polyline(m, &pts));
+        // The line over all of the fill.
+        let within = LINE_WITHIN.load(core::sync::atomic::Ordering::Relaxed) as f32 / 100.0;
+        for &(lo, hi) in &spans[..n] {
+            let Some((from, to)) = part(&pts, lo, hi) else { continue };
+            let before = self.tverts.len();
+            self.tess_in(Lin::flat(rgb(style.line, 1.0)), Some(r), |m| tess::polyline_within(m, &pts[from..to], within));
+            LINE_VERTS.fetch_add((self.tverts.len() - before) as u32, core::sync::atomic::Ordering::Relaxed);
+        }
         self.gpts = pts;
+        GRAPH_US.fetch_add((now_us() - started) as u32, core::sync::atomic::Ordering::Relaxed);
         opaque
     }
 
@@ -1709,6 +1754,7 @@ impl State {
     fn push(&mut self, p: &Prim, rect: &R, c: &R) {
         if let Prim::Tris { start, len, color, .. } = *p {
             let (start, len) = (start as usize, len as usize);
+            TRI_VERTS.fetch_add(len as u32, core::sync::atomic::Ordering::Relaxed);
             let (ox, oy) = (c.x0 as f32, c.y0 as f32);
             for v in &self.tverts[start..start + len] {
                 self.pos.push([v.x - ox, v.y - oy]);

@@ -284,6 +284,11 @@ const DISK: [(f32, f32); 8] = [
 /// fold over on a curve sampled every pixel, where a turn's offset reaches past the 1 px
 /// segment next to it (27 % of the ink off).
 pub fn polyline(m: &mut Mesh<'_>, pts: &[(i32, i32)]) {
+    polyline_within(m, pts, SIMPLIFY)
+}
+
+/// [`polyline`] with the simplification's distance `within` (px) given.
+pub fn polyline_within(m: &mut Mesh<'_>, pts: &[(i32, i32)], within: f32) {
     let v = |(x, y): (f32, f32), a: f32| Vtx { x, y, a };
     let mut q: Vec<(f32, f32)> = Vec::with_capacity(pts.len());
     for &(x, y) in pts {
@@ -299,12 +304,14 @@ pub fn polyline(m: &mut Mesh<'_>, pts: &[(i32, i32)]) {
     while i < q.len() {
         p.push(q[i]);
         let mut j = i + 1;
-        while j + 1 < q.len() {
+        // At most SIMPLIFY_RUN points a chord: the test is quadratic in the run (a flat
+        // graph 532 points long took 1.5 ms).
+        while j + 1 < q.len() && j - i < SIMPLIFY_RUN {
             let (a, c) = (q[i], q[j + 1]);
             let (dx, dy) = (c.0 - a.0, c.1 - a.1);
             let l = libm::sqrtf(dx * dx + dy * dy);
             let fits = q[i + 1..=j].iter().all(|b| {
-                ((b.0 - a.0) * dy - (b.1 - a.1) * dx).abs() <= SIMPLIFY * l && (b.0 - a.0) * dx + (b.1 - a.1) * dy >= 0.0
+                ((b.0 - a.0) * dy - (b.1 - a.1) * dx).abs() <= within * l && (b.0 - a.0) * dx + (b.1 - a.1) * dy >= 0.0
             });
             if !fits {
                 break;
@@ -339,6 +346,60 @@ pub fn polyline(m: &mut Mesh<'_>, pts: &[(i32, i32)]) {
 /// Points closer than this (px) to the chord that skips them are dropped: 0.1 changed no
 /// pixel in the tests, 0.2 put the peaks' mean error from 2 % to 8 %.
 const SIMPLIFY: f32 = 0.1;
+const SIMPLIFY_RUN: usize = 48;
+
+/// Pixel columns `(x, y)` against the row `base` (column x covers rows `min(y, base)` up to,
+/// not including, `max(y, base)`: the fill under a graph's curve) as solid trapezoids
+/// covering exactly those pixels (a pixel = its centre, as a GPU samples): a run of columns
+/// next to each other, on one side of `base`, whose ends stay within a quarter pixel of one
+/// straight edge is one quad, that edge drawn through the columns' centres. At most
+/// [`COLUMN_RUN`] columns a quad (the search is quadratic in the run), [`POLY_CHUNK`] quads
+/// a chunk.
+pub fn columns(m: &mut Mesh<'_>, cols: &[(i32, i32)], base: i32) {
+    let v = |x: f32, y: f32| Vtx { x, y, a: 1.0 };
+    let mut s = m.begin();
+    let mut quads = 0;
+    let mut i = 0;
+    while i < cols.len() {
+        let (xa, ya) = cols[i];
+        if ya == base {
+            i += 1;
+            continue;
+        }
+        let above = ya < base;
+        let mut j = i;
+        while j + 1 < cols.len() && j + 1 - i < COLUMN_RUN {
+            let (xn, yn) = cols[j + 1];
+            if xn != cols[j].0 + 1 || yn == base || (yn < base) != above {
+                break;
+            }
+            // Every column's end within 1/4 px of the edge from the first's to this one's.
+            let (n, dy) = ((j + 1 - i) as i64, (yn - ya) as i64);
+            let fits = (i + 1..=j).all(|k| 4 * (((cols[k].1 - ya) as i64) * n - dy * (k - i) as i64).abs() <= n);
+            if !fits {
+                break;
+            }
+            j += 1;
+        }
+        let (xb, yb) = cols[j];
+        // The edge passes through the first and last columns' centres; half a column more
+        // at either end.
+        let half = if j > i { (yb - ya) as f32 / (j - i) as f32 / 2.0 } else { 0.0 };
+        let (x0, x1) = (xa as f32, xb as f32 + 1.0);
+        let (y0, y1) = (ya as f32 - half, yb as f32 + half);
+        m.quad(v(x0, y0), v(x1, y1), v(x1, base as f32), v(x0, base as f32));
+        quads += 1;
+        if quads % POLY_CHUNK == 0 {
+            m.end(s);
+            s = m.begin();
+        }
+        i = j + 1;
+    }
+    m.end(s);
+}
+
+/// The most columns [`columns`] puts into one quad.
+const COLUMN_RUN: usize = 128;
 
 /// Triangles `tris` (three vertices each) cut to the rect `x0..x1` × `y0..y1`, appended to
 /// `out` as triangles (coverage interpolated along the cut edges): what a scissor would leave
@@ -936,6 +997,48 @@ mod tests {
 
     /// A filled oval's chunks are horizontal bands, so a frame strip takes only the few it
     /// meets (a fan from the centre made every chunk reach the middle).
+    /// The fill under a graph: the quads cover the columns' pixels, no other, each once.
+    #[test]
+    fn columns_as_quads_cover_the_same_pixels() {
+        const N: usize = 256;
+        let base = 200;
+        // Slopes, a spike, plateaus, a noisy stretch, a dip below the base, a gap.
+        let cols: Vec<(i32, i32)> = (0..230)
+            .filter(|i| !(120..124).contains(i))
+            .map(|i: i32| {
+                let y = match i {
+                    0..=39 => 180 - i * 3 / 2,
+                    40..=44 => 120 - (i - 40) * 25,
+                    45..=49 => 20 + (i - 45) * 25,
+                    50..=99 => 150,
+                    100..=139 => 150 + ((i * 7) % 11) - 5,
+                    140..=169 => 150 + (i - 140) * 3,
+                    170..=199 => 240 - (i - 170) * 3,
+                    _ => 150 + (i - 200) * (i - 200) / 12,
+                };
+                (10 + i, y)
+            })
+            .collect();
+        let (verts, chunks) = mesh_of(|m| columns(m, &cols, base));
+        let mut want = vec![0.0f32; N * N];
+        for &(x, y) in &cols {
+            for row in y.min(base)..y.max(base) {
+                want[row as usize * N + x as usize] = 1.0;
+            }
+        }
+        let got = raster::coverage(&verts, N);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() < 1e-3, "pixel {},{}: {} for {}", i % N, i / N, g, w);
+        }
+        // Far fewer quads than columns, in chunks that hold them all.
+        assert!(verts.len() / 6 < cols.len() / 2, "{} quads", verts.len() / 6);
+        assert_eq!(chunks.iter().map(|c| c.len).sum::<usize>(), verts.len());
+        // One flat stretch longer than a run.
+        let flat: Vec<(i32, i32)> = (0..200).map(|i| (i, 50)).collect();
+        let (verts, _) = mesh_of(|m| columns(m, &flat, base));
+        assert_eq!(verts.len(), 2 * 6);
+    }
+
     #[test]
     fn filled_ovals_chunk_into_bands() {
         let (_, chunks) = mesh_of(|m| oval(m, 300.0, 300.0, 250.0, 250.0, None, None));

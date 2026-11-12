@@ -1167,13 +1167,23 @@ impl LcdBackend for FimdLcd {
         let (dx, dy) = (dx as isize, dy as isize);
         let to = |x: usize, y: usize| (x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
         #[cfg(feature = "g2d_render")]
-        for way in [Moved::Bands, Moved::Buffered] {
-            match g2d_move(way, rects, dx as i16, dy as i16) {
-                Moved::Done => return true,
-                // Sources may be overwritten already: no other way can
-                // finish it (the caller redraws instead).
-                Moved::Partly => return false,
-                _ => {}
+        {
+            let started = exynos_4412_rs::drivers::timer::Mct::new().count();
+            let mut done = None;
+            for way in [Moved::Bands, Moved::Buffered] {
+                match g2d_move(way, rects, dx as i16, dy as i16) {
+                    Moved::Done => done = Some(true),
+                    // Sources may be overwritten already: no other way can
+                    // finish it (the caller redraws instead).
+                    Moved::Partly => done = Some(false),
+                    _ => continue,
+                }
+                break;
+            }
+            let us = (exynos_4412_rs::drivers::timer::Mct::new().count() - started) / 24;
+            MOVE_US.fetch_add(us as u32, Ordering::Relaxed);
+            if let Some(done) = done {
+                return done;
             }
         }
         cpu_move(rs, to)
@@ -2048,6 +2058,11 @@ fn g2d_argb_matches() -> bool {
 /// instead).
 #[cfg(feature = "g2d_render")]
 const MOVE_BANDS_MAX: usize = 64;
+/// The most bands tried before the scratch surface (HTTP `?move_bands=N`, at most
+/// [`MOVE_BANDS_MAX`]), and the time in `move_rects` since boot, us.
+// Board, a graph's 490 x 156 px moved by 9 px: 55 bands 0.9 ms, the scratch surface 0.28 ms.
+pub static MOVE_BANDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(8);
+pub static MOVE_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// How [`g2d_move`] moves (`Bands`, `Buffered`) and how it went.
 #[cfg(feature = "g2d_render")]
@@ -2087,7 +2102,8 @@ fn g2d_move(way: Moved, rects: &[UiRect], dx: i16, dy: i16) -> Moved {
     let dest = |r: &UiRect| ((r.x + dx) as usize, (r.y + dy) as usize);
     match way {
         Moved::Bands => {
-            let Some(bands) = ferrite_core::lcd::move_bands(rects, dx, dy, MOVE_BANDS_MAX) else {
+            let max = (MOVE_BANDS.load(Ordering::Relaxed) as usize).min(MOVE_BANDS_MAX);
+            let Some(bands) = ferrite_core::lcd::move_bands(rects, dx, dy, max) else {
                 return Moved::NotTried;
             };
             for (i, b) in bands.iter().enumerate() {

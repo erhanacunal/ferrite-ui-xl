@@ -142,6 +142,12 @@ pub(crate) struct RenderState {
     pub(crate) shifted: Vec<(usize, crate::types::Rect)>,
     /// Scratch for pass 2: the part of a shifted subtree's box still to draw.
     pub(crate) shift_keep: Vec<crate::types::Rect>,
+    /// Graphs as the screen shows them (`render::scroll_graphs`): the widget,
+    /// its appearance key and the samples it was last drawn with.
+    pub(crate) graphs: Vec<(WidgetId, u32, Vec<i32>)>,
+    /// This render's scrolled graphs: the widget and the strips of its box
+    /// still to draw (the rest was moved into place).
+    pub(crate) scrolled: Vec<(WidgetId, [crate::types::Rect; 2], u8)>,
     /// Geometry by DFS index for the current render pass (`geo.rs`).
     pub(crate) geo: Vec<crate::geo::Geo>,
     pub(crate) geo_stack: Vec<u32>,
@@ -206,6 +212,8 @@ impl RenderState {
             settled_epoch: u32::MAX,
             shifted: Vec::new(),
             shift_keep: Vec::new(),
+            graphs: Vec::new(),
+            scrolled: Vec::new(),
             dl: crate::dl::Recorder::new(),
             dl_cache: core::cell::RefCell::new(crate::dl::Cache::new()),
             paint_rec: crate::dl::Recorder::new(),

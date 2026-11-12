@@ -318,6 +318,12 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
 ").await?;
                 return Ok(false);
             }
+            if let Some(n) = number(b"move_bands").filter(|&n| n <= 64) {
+                crate::lcd::MOVE_BANDS.store(n, Ordering::Relaxed);
+            }
+            if let Some(n) = number(b"line_within").filter(|&n| n <= 200) {
+                crate::compose::LINE_WITHIN.store(n, Ordering::Relaxed);
+            }
             if let Some(n) = number(b"round_px").filter(|&n| n <= 1 << 20) {
                 crate::compose::ROUND_WHOLE_PX.store(n, Ordering::Relaxed);
                 crate::compose::REPAINT.store(true, Ordering::Release);
@@ -842,8 +848,14 @@ fn status_json() -> String {
     );
     let _ = write!(
         s,
-        ",\"merge\":{},\"round_px\":{},\"tess_min\":{},\"free_frames\":{},\"min_kpx\":{}",
+        ",\"merge\":{},\"line_within\":{},\"line_verts\":{},\"graph_us\":{},\"move_us\":{},\"move_bands\":{},\"tri_verts\":{},\"round_px\":{},\"tess_min\":{},\"free_frames\":{},\"min_kpx\":{}",
         crate::compose::MERGE.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::LINE_WITHIN.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::LINE_VERTS.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::GRAPH_US.load(core::sync::atomic::Ordering::Relaxed),
+        crate::lcd::MOVE_US.load(core::sync::atomic::Ordering::Relaxed),
+        crate::lcd::MOVE_BANDS.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::TRI_VERTS.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::ROUND_WHOLE_PX.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::TESS_MIN_RADIUS.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::FREE_FRAMES.load(core::sync::atomic::Ordering::Relaxed),

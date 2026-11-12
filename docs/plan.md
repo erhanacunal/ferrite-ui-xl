@@ -154,31 +154,56 @@ Bulgular (2026-11-11):
   CPU pass'lerinde (katmanlar, compositor'un reddettiği alanlar) oluşur (2e dump'ı: tablette yalnız pager'ın
   listesi vardı).
 
-Seçenekler:
-- **A, ağaç kopyası:** VM çekirdeği her frame sonunda arena'nın kullanılan kısmını + işaretçi tablosunun canlı
-  kısmını render çekirdeğine kopyalar (~20 KB, onlarca µs). Render çekirdeği bugünkü `render_dirty` /
-  `compose` / katman kodunu kopya üzerinde çalıştırır; compositor, katmanlar, capture'lar birlikte taşınır.
-  İş: render'ın ağaca yazdıkları (dirty temizleme, `FLAG_RENDERED`, `SEC_PREV`, `SEC_DRAWN`, katman durumu,
-  `render.*`) render'a ait yan tablolara ayrılır; dirty/moved/changed bilgisi VM'den olay olarak gelir.
-- **B, liste:** render yürüyüşü (DFS, occluder, clip, restore) VM çekirdeğinde kalır, render çekirdeği yalnız
-  listeleri rasterize eder. Compositor'un da listelerden beslenmesi gerekir (GPU liste op'larını
-  tessellate eder ya da liste sprite'a çizilir). VM çekirdeği yürüyüşü ödemeye devam eder.
+Options:
+- **A, tree copy:** the VM core copies the used arena and live pointer table to the render core each frame
+  (~20 KB, tens of microseconds). The render core runs `render_dirty`, `compose`, and layer code against its
+  copy, moving the compositor, layers, and captures together. Render writes (dirty clearing, `FLAG_RENDERED`,
+  `SEC_PREV`, `SEC_DRAWN`, layer state, and `render.*`) must live in render-owned side tables; dirty/moved/changed
+  data arrives from the VM as messages.
+- **B, display lists:** the VM core keeps the render walk (DFS, occlusion, clipping, restoration), while the
+  render core only rasterizes lists. The compositor must also consume lists (GPU tessellation or rasterization
+  to sprites), and the VM core continues paying for the tree walk.
 
-**Seçilen: A** (kullanıcı, 2026-11-11). Kopya ucuz, compositor/katman yolları olduğu gibi taşınır, VM çekirdeğinde render işi kalmaz. Display
-list'ler render çekirdeğinin içinde (CPU pass'leri, `on_paint` listeleri) kalır. `on_paint` VM çekirdeğinde
-kaydedilip liste olarak gönderilir (2d).
+**Initial implementation: A** (user, 2026-11-11). Copying was considered cheap, and this let the compositor and layer paths move intact while keeping render work off the VM core. Display lists remain on the render core (CPU passes and `on_paint` lists); `on_paint` is recorded on the VM core and sent as a list (2d). This was the first implementation, not the target data-transfer design.
 
-| | İş | Doğrulama |
+### Render data between the two cores (redesign)
+
+Target: the VM CPU is the sole owner of the widget tree; the render CPU reads a renderer-specific immutable snapshot and never accesses `ObjPool`. The VM produces a compact, contiguous `RenderSnapshot` with widget properties, depth-first paint order, required text/graph data, and dirty regions. Allocator state, ownership tables, and unrelated VM strings/arrays are excluded.
+
+Snapshot buffers cross a single-producer/single-consumer ownership channel. A published buffer stays immutable until rendering finishes and returns it to the VM. The VM prepares the other buffer while rendering runs. If rendering falls behind, intermediate unconsumed states are replaced with the newest snapshot instead of accumulating in a queue. Render-owned records (previous rects, cache, layers, and dirty tracking) stay on the render CPU. Resources use render-side handles with defined lifetimes instead of VM pointers.
+
+Migrate incrementally: first separate render reads from `ObjPool` through the `RenderSnapshot` read API and keep mutable render state render-owned; next replace `sync_view` with snapshot production; finally add snapshot-buffer ownership to the `render_start`/`render_poll` handoff. Keep the tree-copy implementation as a reference until simulator golden output confirms equivalent behavior. Snapshot construction adds work on the VM CPU; the goal is to stop transferring unrelated allocator/object data and let the VM prepare the next scene while rendering continues.
+
+| | Work | Verification |
 |---|---|---|
-| 3a | Render'a ait widget durumu ağaçtan çıkar: `FLAG_RENDERED`, `FLAG_PAINTED`, `SEC_PREV`, `SEC_DRAWN` → `RenderState` içinde işaretçiye göre dizili tablo (`RenderRec`). Dirty bitleri ağaçta kalır (VM → render mesajı) | Tek çekirdek, testler + golden iki modda aynı |
-| 3a+ | Buffered render modu kaldırıldı (yalnız dirty): tek `FLAG_DIRTY`, widget başına tek önceki rect; taşınacak durum azaldı | Testler, golden iki modda aynı |
-| 3b ✓ | Tek çekirdekte iki havuz (`view.rs`, `Ctx::view`, `render::with_view`; mesajlar `RenderMsg`): VM havuzu + render havuzu. Render fazında senkron: arena'nın kullanılan kısmı + işaretçi tablosu kopyalanır, VM'in dirty/changed bilgisi devredilip VM'de temizlenir; `will_move` render tarafında (kopyadan önce eski mutlak rect'ler). Render yalnız kendi havuzunu okur | Golden aynı; kopya maliyeti (perf) |
-| 3c | Render havuzu + render fazı ayrı çekirdekte (exynos CPU2; LCD/G2D/GPU sahipliği ve kesmeleri oraya). Dokunma girişi (`FullInput`: basma geri bildirimi, kaydırma çubuğu, slider) bugün `render_dirty`'yi doğrudan çağırıyor: mesaja dönmeli. VM çekirdeği frame sonunda kopyayı bırakır, beklemez | Kartta perf A/B, golden (sim tek çekirdek kalır) |
+| 3a | Move render-owned widget state out of the tree: `FLAG_RENDERED`, `FLAG_PAINTED`, `SEC_PREV`, `SEC_DRAWN` become pointer-indexed `RenderRec` entries in `RenderState`. Dirty bits stay in the tree and arrive as VM-to-render messages. | Same output in single-core tests and both golden modes |
+| 3a+ | Remove buffered rendering; keep dirty rendering with one `FLAG_DIRTY` bit and one previous rect per widget, reducing transferred state. | Tests and golden output match in both modes |
+| 3b ✓ | Two contexts on one core (`view.rs`, `Ctx::view`, `render::with_view`; `RenderMsg`): the render context keeps render-owned state and a packed `RenderSnapshot`. At sync, capture reachable widget records plus referenced text and graph samples into reusable buffers; do not copy the VM arena or pointer table. Transfer dirty/changed data and clear it on the VM; record `will_move` using old absolute rects before updating the scene. Render accessors read the scene facade, never the VM pool. | Golden output matches; measure capture cost |
+| 3c | Move the render pool and render phase to a second core (Exynos CPU2, including LCD/G2D/GPU ownership and interrupts). Route touch input (`FullInput`: press feedback, scrollbar, slider) through messages instead of direct `render_dirty` calls. The VM publishes and continues without waiting. | Device A/B performance; golden output (sim remains single-core) |
+| 3c-4 | Prepare the packed scene on CPU0 before polling the in-flight render. If CPU2 is still busy, keep the VM-owned buffer private and continue VM work; once the render context returns, publish the scene by swapping buffer ownership. Reuse the returned buffer for the next capture. Render messages and dirty-state transfer remain at the context handoff. | Core and Exynos cross-target checks; measure VM capture time and render overlap |
 
-3c alt adımları:
-- **3c-1 ✓** Render tarafının kendi `Ctx`'i (`Ctx::render_ctx`): render havuzu + aynı donanıma ulaşan lcd/flash + kopyalanan font/resim/fs. Tek çekirdekte, eşzamanlı (sim + kart: golden aynı, perf gürültü içinde).
-- **3c-2 ✓** Devir el sıkışması: render bağlamı bir sahiplik bayrağı arkasında (IDLE: VM çekirdeği senkronlar / BUSY: render tarafı çalışır); `render_dirty` = "teslim et, meşgulse sonraki pass'e bırak". Render sonrası işler (`flush_dirty`, katman yerleşimi) render tarafına; VM'in ekrana doğrudan çizimi (`on_paint`, çizim builtin'leri, klavye overlay'i, hata ekranı) render tarafı IDLE iken. Tek çekirdekte hâlâ eşzamanlı çalıştırılır.
-- **3c-3 ✓ (kısmi)** exynos CPU2 (`rcore.rs`): render işleri CPU2'de, sunum (flush + G2D kesmesi) CPU0'da kaldı; her çekirdek devirde kendi L1'ini temizler; `on_paint` olan pass CPU0'da render eder. Kart: tablet en uzun pass 11.3 → 1.2 ms, scroll CPU0 render 685 → 62 ms/s (sunum 57.9 → 53.4/s: tempo ayarı açık). Scroll'daki sunum farkı ölçüm gürültüsüydü (10 s pencerelerde CPU2 52.7, CPU0 52.65/s); CPU2'den sürülen GPU karesi ~0.3 ms daha pahalı (`show` temizlikleri). Açık: G2D kesmesi/GPU sahipliğinin CPU2'ye geçmesi. İlk plan: render döngüsü CPU2'de (executor yok, `wfe`/`sev`); G2D kesmesi CPU2'ye, GPU/G2D/katman sahipliği CPU2'de; L1 temizlikleri (set/way yereldir) çizen çekirdekte. Standby'da CPU2 park. Kartta perf A/B.
+3c substeps:
+- **3c-1 ✓** A render-side `Ctx` (`Ctx::render_ctx`) owns the render pool and reaches the same LCD/flash hardware; fonts, images, and filesystem state are copied. Single-core behavior matches golden output on sim and device; performance is within measurement noise.
+- **3c-2 ✓** Ownership handshake: IDLE lets the VM sync; BUSY means rendering is running. `render_dirty` submits work or leaves it for the next pass when busy. Render-side follow-up work (`flush_dirty`, layer placement) stays there. VM direct drawing (`on_paint`, drawing builtins, keyboard overlay, error screens) waits until render is IDLE. Single-core mode remains synchronous.
+- **3c-3 ✓ (partial)** Exynos CPU2 (`rcore.rs`) runs render jobs while CPU0 retains presentation (flush and G2D interrupt); each core cleans its own L1 at handoff. Passes with `on_paint` still render on CPU0. Device measurements: tablet longest pass 11.3 → 1.2 ms; scrolling CPU0 render 685 → 62 ms/s (presentation 57.9 → 53.4/s with pacing enabled). Presentation difference was measurement noise over 10-second windows (CPU2 52.7/s, CPU0 52.65/s); a GPU frame driven from CPU2 costs about 0.3 ms more (`show` cache cleans). Remaining: move G2D interrupt/GPU ownership to CPU2 and A/B on device.
+
+### Continuation checkpoint (2026-11-11)
+
+- Implemented `RenderSnapshot` scene capture with packed widget/text/graph data; the render-side pool no longer copies or reads the VM arena or pointer table. Snapshot buffers alternate ownership between CPU0 and the render context.
+- `render_dirty` captures on CPU0 before polling the in-flight render. When the render context is still away, CPU0 keeps the latest scene private and continues VM work. Once the context returns, the scene is handed over with the render messages and dirty state. The reusable buffer returns to CPU0 for the next capture.
+- Core mock and Exynos ARM cross-target `cargo check` both passed. No tests were run in this continuation.
+- The tablet monitor stress test was active for the latest five-window capture (`python ..\\ferrite-ui\\tools\\ferrite_cli.py -p tcp://192.168.88.120 perf --interval 2 --count 5`). The five windows were stable: about 2,034–2,036 passes per 2 s, `render` 6.3–6.8 us/pass, animations 13.4–13.6 us/pass, 116–117 presents per window, and G2D/GPU drawing about 1.94–2.13 ms/present.
+- `draw_widget calls: 0` does not mean the stress test had no dirty widgets: Exynos uses the GPU compositor for widget rendering, outside that CPU widget-draw counter. G2D operation and present counts confirm active rendering. The CLI's `render` phase is CPU0-side time and does not isolate `RenderSnapshot::capture`; `render walk` is not a reliable measure of CPU2 work when the cores overlap.
+- Added profiler sub-phases `scene capture` and `scene handoff` (CPU0 microseconds per window/pass and longest pass). The standard perf response remains within its 255-byte payload limit; the longest-pass breakdown omits audio, animation, miscellaneous tasks, and frame-end time to make room.
+- The first instrumented five-window run stalled presentation after its first sample. Code review found the runtime and CPU2 renderer both update profiler sub-phase counters; those counters were unsynchronized. Changed the cycle and event counters to atomics, rebuilt, and repeated the run. The screen remained live in both modes; the stalled batch is retained separately.
+- Matched device A/B (five 2-second windows per mode, tablet Monitor stress, 1000 MHz): CPU2 on averaged 2,031 passes, 12.4 ms CPU0 render time, 7.50 ms scene capture, 3.65 ms handoff, 116 presents, and 216.5 ms G2D/GPU time per window. CPU2 off averaged 1,792 passes, 256.2 ms CPU0 render time, 4.29 ms scene capture, 1.95 ms handoff, 116 presents, and 225.1 ms G2D/GPU time per window. The monitor held 57–58 FPS in both modes and screenshots showed the same stress scene. Raw windows: `perf/3c4-scene/rcore-on.json`, `perf/3c4-scene/rcore-off.json`; stalled first attempt: `perf/3c4-scene/rcore-on-stalled.json`.
+- Re-enabling CPU2 after the off-mode windows first caused a render stall in the RAM-only build. A later run of the saved firmware also stopped changing the display during Monitor stress, while touch input still worked; no panic line appeared on UART. This points to a present-path stall rather than a halted render core.
+- `lcd::flush` previously returned immediately whenever a G2D present was in `COPY`. If a completion interrupt was missed, no code polled the band or timed out unless a later CPU drawing operation fenced overlapping rows. It now polls G2D completion and falls back to a CPU copy after 250 ms. The fallback disables G2D drawing/present for the rest of the boot and switches the display buffer.
+- Exynos release `cargo check` passed after the present-path change; saved firmware was not modified.
+- RAM-only release image initially ran Monitor stress for 129 s, with the present counter advancing 42 → 1,708 → 4,004 (about 57 fps). It froze again after about 6 minutes. During the freeze, `/api/status` still responded and `passes` advanced 417,528 → 431,210, but compositor frames stayed at 20,240 and presents at 18,488; `/api/screen` timed out. This indicates `render_away` remained true while CPU2 was waiting on the present path.
+- Root cause in the handoff: `frame_end` skips `lcd::flush()` while CPU2 owns the render context, while CPU2's `wait_rows()` intentionally leaves the CPU0-owned G2D present to CPU0's interrupt. The timeout added above therefore could not run in this state. `frame_end` now calls `lcd::service_present()` while rendering is away, so CPU0 polls or times out the G2D job and CPU2 can continue.
+- The follow-up RAM-only image was sent through `uart_boot` HTTP (CRC OK, 0.4 s; not saved). With Monitor stress active, status at uptime 242 s showed 12,077 presents; at uptime 501 s it showed 26,637 presents and 14,560 CPU2 jobs since the prior sample. The user confirmed the display stayed live beyond the previous ~6-minute failure window.
+- No tests were run.
 
 | 3d ✓ (kısmi) | VM'in ekrana doğrudan çizimi (`on_paint` dışı `fillRect`…) ve `on_paint` listeleri render çekirdeğine liste olarak; C okumaları (`snapshot.rs`) seqlock'lu snapshot'tan | `paint` örneği, `--stale` |
 

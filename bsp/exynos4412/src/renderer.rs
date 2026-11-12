@@ -421,7 +421,7 @@ pub(crate) fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
     }
     if w.kind == KIND_POLYGON {
         // The points.
-        for &byte in objs.str_get(e.text_id) {
+        for &byte in objs.render_scene().text_for(id).unwrap_or(&[]) {
             h.byte(byte);
         }
     }
@@ -429,7 +429,7 @@ pub(crate) fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
         // `render::draw_graph`: the samples (array id in `value`), the count cap, the line
         // colour; flags (`image_id`) and the fill colour (`gradient_color`) are hashed above.
         h.u32(e.max_length as u32 | (e.text_color as u32) << 16);
-        match objs.arr(e.value as ferrite_core::pool::ObjPtr) {
+        match objs.render_scene().graph_for(id) {
             Some(samples) => {
                 h.u32(samples.len() as u32);
                 for &v in samples {
@@ -449,7 +449,7 @@ pub(crate) fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
             // No text drawn.
             _ => h.u32(0xFFFF_FFFF),
         }
-        let text = objs.str_get(e.text_id);
+        let text = objs.render_scene().text_for(id).unwrap_or(&[]);
         h.u32(text.len() as u32);
         for &byte in text {
             h.byte(byte);

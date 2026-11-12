@@ -10,6 +10,8 @@
 //! A report covers everything since the previous one (or since boot) and
 //! resets the counters.
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 /// Phase ids, in the order `step` runs them. Mirrored in
 /// `tools/ferrite_cli.py` (`PERF_PHASES`) — keep in sync.
 pub mod phase {
@@ -57,8 +59,12 @@ pub mod phase {
     /// Time drawing new sprites (exynos4412 renderer: a widget drawn into
     /// its sprite, plus the cache clean), inside `DRAW`.
     pub const SPRITE: u8 = 16;
+    /// CPU0 time packing the renderer-facing scene before handoff.
+    pub const SCENE_CAPTURE: u8 = 17;
+    /// CPU0 time syncing messages/resources and transferring scene ownership.
+    pub const SCENE_HANDOFF: u8 = 18;
     /// Number of slots (ids 1..COUNT).
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 18;
 }
 
 /// Event counts, reported as plain numbers (ids from 0x80). Mirrored in
@@ -109,17 +115,18 @@ pub const MAX_PASS: u8 = 0x40;
 
 /// Phases reported for the longest pass (`MAX_PASS + id`): the step phases,
 /// display wait, and the sub-phases that run on this core and say where a
-/// long pass went. (PRESENT runs on another core; TIMER is left out to keep
-/// the report within 255 bytes: it is 251.)
-pub const MAX_PASS_PHASES: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16];
+/// long pass went. PRESENT runs on another core; less diagnostic phases are
+/// omitted to keep the report within 255 bytes (payload: 251).
+pub const MAX_PASS_PHASES: [u8; 12] = [1, 2, 3, 6, 7, 10, 11, 12, 15, 16, 17, 18];
 
 /// Step phases (ids 1..=`phase::VSYNC_WAIT`) tracked per pass.
 const PASS_PHASES: usize = phase::VSYNC_WAIT as usize;
 
-/// A value only the runtime's own thread touches (the runtime and the
-/// renderer run on one core; the profiler is a diagnostic).
+/// The clock callback is installed during single-core startup and only read
+/// after the render core starts.
 struct Local<T>(core::cell::UnsafeCell<T>);
-// SAFETY: see the type's doc: never accessed from two threads.
+// SAFETY: this wrapper is used only for CLOCK, whose writes finish before
+// another core can read it.
 unsafe impl<T> Sync for Local<T> {}
 
 fn no_clock() -> u32 {
@@ -127,14 +134,15 @@ fn no_clock() -> u32 {
 }
 
 static CLOCK: Local<fn() -> u32> = Local(core::cell::UnsafeCell::new(no_clock));
-/// Number of sub-phases (`DRAW` ..= `SPRITE`).
-pub const SUBS: usize = 6;
+/// Number of sub-phases (`DRAW` ..= `SCENE_HANDOFF`).
+pub const SUBS: usize = 8;
 
 type Sub = ([u64; SUBS], [u32; count::COUNT]);
 
-/// Cycles of the sub-phases (index id - `DRAW`) and the counts (index
-/// id - 0x81; a sub-phase call counts in its count, `sub_count`).
-static SUB: Local<Sub> = Local(core::cell::UnsafeCell::new(([0; SUBS], [0; count::COUNT])));
+/// The render phase is measured on CPU0 and CPU2. Use atomics because both
+/// cores can report sub-phases while a frame is in flight.
+static SUB_CYCLES: [AtomicU64; SUBS] = [const { AtomicU64::new(0) }; SUBS];
+static SUB_COUNTS: [AtomicU32; count::COUNT] = [const { AtomicU32::new(0) }; count::COUNT];
 
 /// Sets the clock `now` reads (`PlatformRuntime::cycles`); the runtime does
 /// it at startup.
@@ -159,15 +167,15 @@ pub fn add_sub(id: u8, cycles: u32) {
 #[inline]
 pub fn add_sub_n(id: u8, cycles: u64, calls: u32) {
     let i = (id - phase::DRAW) as usize;
-    let s = unsafe { &mut *SUB.0.get() };
-    s.0[i] += cycles;
-    let c = &mut s.1[sub_count(i)];
-    *c = c.wrapping_add(calls);
+    SUB_CYCLES[i].fetch_add(cycles, Ordering::Relaxed);
+    if i < SUB_COUNT.len() {
+        SUB_COUNTS[SUB_COUNT[i]].fetch_add(calls, Ordering::Relaxed);
+    }
 }
 
 /// Count index (id - 0x81) of sub-phase index `i` (id - `DRAW`): each
 /// sub-phase call counts one in its count.
-const SUB_COUNT: [usize; SUBS] = [
+const SUB_COUNT: [usize; 6] = [
     (count::DRAWS - 0x81) as usize,
     (count::PIXEL_CALLS - 0x81) as usize,
     (count::PRESENTS - 0x81) as usize,
@@ -176,27 +184,23 @@ const SUB_COUNT: [usize; SUBS] = [
     (count::SPRITES_MADE - 0x81) as usize,
 ];
 
-#[inline]
-const fn sub_count(i: usize) -> usize {
-    SUB_COUNT[i]
-}
-
 /// Adds `n` to count `id` (`count::*`).
 #[inline]
 pub fn add_count(id: u8, n: u32) {
-    let s = unsafe { &mut *SUB.0.get() };
-    let c = &mut s.1[(id - 0x81) as usize];
-    *c = c.wrapping_add(n);
+    SUB_COUNTS[(id - 0x81) as usize].fetch_add(n, Ordering::Relaxed);
 }
 
 /// Sub-phase cycles accumulated so far (not reset).
 fn sub_totals() -> [u64; SUBS] {
-    unsafe { (*SUB.0.get()).0 }
+    core::array::from_fn(|i| SUB_CYCLES[i].load(Ordering::Relaxed))
 }
 
 /// Sub-phase cycles and the counts since the last call, then 0.
 pub fn take_sub() -> Sub {
-    unsafe { core::mem::replace(&mut *SUB.0.get(), ([0; SUBS], [0; count::COUNT])) }
+    (
+        core::array::from_fn(|i| SUB_CYCLES[i].swap(0, Ordering::Relaxed)),
+        core::array::from_fn(|i| SUB_COUNTS[i].swap(0, Ordering::Relaxed)),
+    )
 }
 
 /// Accumulated cycles since the last report.

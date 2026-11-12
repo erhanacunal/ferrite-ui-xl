@@ -875,7 +875,7 @@ impl State {
                 return Some(None);
             }
             if w.kind == KIND_GRAPH && GRAPHS.load(core::sync::atomic::Ordering::Relaxed) {
-                return Some(self.graph(objs, id, abs));
+                return Some(self.graph(ctx, id, abs));
             }
             if matches!(w.kind, KIND_CIRCLE | KIND_ELLIPSE | KIND_GAUGE | KIND_POLYGON)
                 && SHAPES.load(core::sync::atomic::Ordering::Relaxed)
@@ -903,7 +903,7 @@ impl State {
                 if w.kind != KIND_POLYGON {
                     return Some(self.round(objs, id, abs));
                 }
-                if self.polygon(objs, id, abs) {
+                if self.polygon(ctx, id, abs) {
                     return Some(None);
                 }
                 // Not convex (or too thin to shrink): the CPU's sprite.
@@ -1038,7 +1038,7 @@ impl State {
         let tex = self.atlas.tex();
         let a = ATLAS as f32;
         let mut ok = true;
-        render::label_lines(ctx, w, abs, &e, |font, line, x, y| {
+        render::label_lines(ctx, id, w, abs, &e, |font, line, x, y| {
             font.for_each_glyph(line, x, y, |cp, g, gx, gy| {
                 let (gx, gy) = (gx as i32, gy as i32);
                 let at = R { x0: gx, y0: gy, x1: gx + g.width as i32, y1: gy + g.height as i32 };
@@ -1228,7 +1228,8 @@ impl State {
     /// (`fill_under_segment`'s, runs of equal ones merged), then the curve as a 1 px
     /// anti-aliased polyline (`tess::polyline`), both cut to the box. The CPU interleaves fill
     /// and line per segment; here the line goes over all of the fill. Its opaque rect.
-    fn graph(&mut self, objs: &ObjPool, id: WidgetId, abs: &Rect) -> Option<R> {
+    fn graph(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> Option<R> {
+        let objs = &ctx.objs;
         let e = objs.ext(id);
         let r = R::of(abs);
         self.boxes(objs, id, &r);
@@ -1237,7 +1238,7 @@ impl State {
         let style = render::graph_style(&inner, &e);
         let mut pts = core::mem::take(&mut self.gpts);
         pts.clear();
-        render::graph_points(objs, &inner, &e, |x, y| pts.push((x as i32, y as i32)));
+        render::graph_points(ctx, id, &inner, &e, |x, y| pts.push((x as i32, y as i32)));
         if let Some(fill) = style.fill {
             let fill = Lin::flat(rgb(fill, 1.0));
             let base = style.baseline as i32;
@@ -1333,7 +1334,7 @@ impl State {
         let tex = self.atlas.tex();
         let a = ATLAS as f32;
         let mut ok = true;
-        render::field_contents(ctx, w, abs, &e, |item| match item {
+        render::field_contents(ctx, id, w, abs, &e, |item| match item {
             render::FieldItem::Text { font, line, x, y, bg } => {
                 font.for_each_glyph(line, x, y, |cp, g, gx, gy| {
                     let (gx, gy) = (gx as i32, gy as i32);
@@ -1418,12 +1419,13 @@ impl State {
     /// A polygon shape (`render::polygon_shape`): its fill as a convex polygon with mitered
     /// edge ramps (`tess::convex_fill`), then its outline (`tess::outline`), cut to the box.
     /// False (nothing added) when the fill isn't convex or can't be shrunk.
-    fn polygon(&mut self, objs: &ObjPool, id: WidgetId, abs: &Rect) -> bool {
+    fn polygon(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> bool {
+        let objs = &ctx.objs;
         let w = objs.get(id);
         let e = objs.ext(id);
         let r = R::of(abs);
         let mut pts = [ferrite_core::types::Offset { x: 0, y: 0 }; ferrite_core::lcd::MAX_POLY_POINTS];
-        let Some((n, fill, stroke, t)) = render::polygon_shape(objs, w, abs, &e, &mut pts) else { return true };
+        let Some((n, fill, stroke, t)) = render::polygon_shape(ctx, id, w, abs, &e, &mut pts) else { return true };
         let mut f = [(0.0f32, 0.0f32); ferrite_core::lcd::MAX_POLY_POINTS];
         for (q, p) in f.iter_mut().zip(&pts[..n]) {
             *q = (p.x as f32 + 0.5, p.y as f32 + 0.5);
@@ -1752,5 +1754,5 @@ fn is_empty_label(objs: &ObjPool, id: WidgetId) -> bool {
     render::effective_bg(objs, w, &e) == 0
         && e.border == Edges::ZERO
         && e.image_id == 0
-        && (e.font_id == 0xFF || objs.str_get(e.text_id).is_empty())
+        && (e.font_id == 0xFF || objs.render_text(id, e.text_id).is_none_or(|text| text.is_empty()))
 }

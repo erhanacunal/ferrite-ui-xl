@@ -335,10 +335,21 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
         with_view(ctx, |c| run_job(c, job));
         return;
     };
+    let t0 = crate::perf::now();
     sync_render_ctx(ctx, &mut r);
     match P::render_start(r, job) {
-        Ok(()) => ctx.render_away = true,
+        Ok(()) => {
+            crate::perf::add_sub(
+                crate::perf::phase::SCENE_HANDOFF,
+                crate::perf::now().wrapping_sub(t0),
+            );
+            ctx.render_away = true;
+        }
         Err(mut r) => {
+            crate::perf::add_sub(
+                crate::perf::phase::SCENE_HANDOFF,
+                crate::perf::now().wrapping_sub(t0),
+            );
             run_job(&mut r, job);
             ctx.objs.mirror_layers(&r.objs);
             ctx.render_ctx = Some(r);
@@ -355,7 +366,13 @@ pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -
     crate::vm::flex_flush(ctx);
     if let Some(mut r) = ctx.render_ctx.take() {
         // The render side's own context (step 3c).
+        ctx.objs.prepare_scene();
+        let t0 = crate::perf::now();
         sync_render_ctx(ctx, &mut r);
+        crate::perf::add_sub(
+            crate::perf::phase::SCENE_HANDOFF,
+            crate::perf::now().wrapping_sub(t0),
+        );
         let out = f(&mut r);
         ctx.objs.mirror_layers(&r.objs);
         ctx.render_ctx = Some(r);
@@ -373,7 +390,11 @@ pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -
 /// (`ObjPool::sync_view`), the fonts and images the VM loaded, the
 /// filesystem, the orientation, the cursor blink.
 fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>) {
-    ctx.objs.sync_view(&mut r.objs);
+    if ctx.objs.render.scene_ready {
+        ctx.objs.sync_view_prepared(&mut r.objs);
+    } else {
+        ctx.objs.sync_view(&mut r.objs);
+    }
     r.fonts.sync_from(&ctx.fonts);
     r.images.sync_from(&ctx.images);
     if r.fs.is_none() != ctx.fs.is_none() {
@@ -477,12 +498,14 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     crate::vm::flex_flush(ctx);
-    // Still drawing the last one elsewhere: the next pass hands this over
-    // (dirty bits and messages wait in the VM pool).
-    if !reclaim(ctx) {
+    if !ctx.objs.needs_sync() && !ctx.render_pool().render.maybe_dirty {
         return;
     }
-    if !ctx.objs.needs_sync() && !ctx.render_pool().render.maybe_dirty {
+    // Prepare the immutable input while the previous render may still be
+    // running on the other core. Keep render-owned messages and dirty state
+    // in the VM pool until the render context has returned.
+    ctx.objs.prepare_scene();
+    if !reclaim(ctx) {
         return;
     }
     submit(ctx, RenderJob::Dirty);
@@ -1423,7 +1446,7 @@ fn paints_nothing(tree: &ObjPool, id: WidgetId) -> bool {
     }
     let ext = tree.ext(id);
     let b = ext.border;
-    let no_text = ext.text_id == crate::pool::PTR_NONE || tree.str_get(ext.text_id).is_empty();
+    let no_text = tree.render_text(id, ext.text_id).is_none_or(|text| text.is_empty());
     no_text
         && ext.image_id == 0
         && (b.top | b.bottom | b.left | b.right) == 0
@@ -1877,8 +1900,7 @@ fn dl_key<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
     h.u16(effective_bg(objs, w, &e));
     h.u16(resolved_text_bg(objs, w, &e, P::DEFAULT_BG_COLOR));
     // Text (labels, inputs, dropdowns, polygon points), by content.
-    if e.text_id != crate::pool::PTR_NONE {
-        let t = objs.str_get(e.text_id);
+    if let Some(t) = objs.render_text(id, e.text_id) {
         h.u32(t.len() as u32);
         h.bytes(t);
     } else {
@@ -1905,7 +1927,7 @@ fn dl_key<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
     }
     // Graph samples.
     if w.kind == KIND_GRAPH {
-        match objs.arr(e.value as crate::pool::ObjPtr) {
+        match objs.render_graph(id, e.value as crate::pool::ObjPtr) {
             Some(a) => {
                 h.u32(a.len() as u32);
                 for &v in a {
@@ -1928,8 +1950,11 @@ fn draw_widget_body<P: Platform, C: Canvas>(
     abs: &Rect,
     clip: &ClipRegion,
 ) {
-    let widget = ctx.objs.get(id);
-    let ext = &ctx.objs.ext(id);
+    let scene_widget = ctx.objs.render_scene().widget(id);
+    let widget_value = scene_widget.map(|w| w.widget).unwrap_or(*ctx.objs.get(id));
+    let widget = &widget_value;
+    let ext_value = scene_widget.map(|w| w.ext).unwrap_or_else(|| ctx.objs.ext(id));
+    let ext = &ext_value;
     let b = ext.border;
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.objs, widget, ext);
@@ -1943,16 +1968,8 @@ fn draw_widget_body<P: Platform, C: Canvas>(
         !freeform && (bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE));
     // See draw_widget — background opacity, blending-capable backends only.
     let alpha = if c.has_alpha() { ext.alpha } else { 255 };
-    let gdir = if bg_color == widget.background_color {
-        ctx.objs.gradient_dir(id)
-    } else {
-        0
-    };
-    let gcol = if gdir != 0 {
-        ctx.objs.gradient_color(id)
-    } else {
-        0
-    };
+    let gdir = if bg_color == widget.background_color { ext.gradient_dir } else { 0 };
+    let gcol = if gdir != 0 { ext.gradient_color } else { 0 };
     if r > 0 {
         // The rounded primitives take no clip, so confine them to the clip
         // region via the LCD scissor, once per (disjoint) clip rect. Without
@@ -2107,13 +2124,13 @@ fn draw_widget_body<P: Platform, C: Canvas>(
             for cr in clip.iter() {
                 if let Some(r) = cr.intersection(abs) {
                     c.set_scissor(Some(r));
-                    draw_label_text(ctx, c, widget, abs, ext, None);
+                    draw_label_text(ctx, c, id, widget, abs, ext, None);
                 }
             }
         } else {
             let bg = resolved_text_bg(&ctx.objs, widget, ext, P::DEFAULT_BG_COLOR);
             c.set_scissor(Some(*abs));
-            draw_label_text(ctx, c, widget, abs, ext, Some(bg));
+            draw_label_text(ctx, c, id, widget, abs, ext, Some(bg));
         }
         c.set_scissor(None);
     }
@@ -2134,7 +2151,7 @@ fn draw_widget_body<P: Platform, C: Canvas>(
             match widget.kind {
                 KIND_PROGRESS | KIND_SLIDER => draw_value_fill(c, widget, &inner, ext),
                 KIND_CHECKBOX | KIND_RADIO => draw_check_indicator(c, widget, &inner, ext),
-                _ => draw_field(ctx, c, widget, abs, ext),
+                _ => draw_field(ctx, c, id, widget, abs, ext),
             }
         }
         c.set_scissor(None);
@@ -2162,7 +2179,8 @@ fn draw_widget_body<P: Platform, C: Canvas>(
         for cr in clip.iter() {
             if let Some(r) = cr.intersection(abs) {
                 c.set_scissor(Some(r));
-                draw_graph(c, &ctx.objs, widget, &inner, ext);
+                let samples = ctx.objs.render_graph(id, ext.value as crate::pool::ObjPtr).unwrap_or(&[]);
+                draw_graph(c, samples, widget, &inner, ext);
             }
         }
         c.set_scissor(None);
@@ -2190,7 +2208,7 @@ fn draw_widget_body<P: Platform, C: Canvas>(
             match widget.kind {
                 KIND_CIRCLE => draw_circle_shape(c, widget, abs, ext),
                 KIND_ELLIPSE => draw_ellipse_shape(c, widget, abs, ext),
-                KIND_POLYGON => draw_polygon_shape(ctx, c, widget, abs, ext),
+                KIND_POLYGON => draw_polygon_shape(ctx, c, id, &widget, abs, ext),
                 KIND_LINE => draw_line_shape(c, widget, abs, ext),
                 _ => {}
             }
@@ -2530,17 +2548,29 @@ fn draw_line_shape<B: Canvas>(lcd: &B, widget: &Widget, abs: &Rect, ext: &Widget
 /// many, its fill colour (0 = none; only with 3 points or more) and its outline's colour (0 =
 /// none) and thickness. None when it has under 2 points. Shared by `draw_polygon_shape` and
 /// renderers that draw polygons another way.
-pub fn polygon_shape(
-    objs: &ObjPool,
+pub fn polygon_shape<P: Platform>(
+    ctx: &Ctx<P>,
+    id: WidgetId,
     widget: &Widget,
     abs: &Rect,
     ext: &WidgetExt,
     out: &mut [Offset; lcd::MAX_POLY_POINTS],
 ) -> Option<(usize, Color, Color, u16)> {
-    if ext.text_id == crate::pool::PTR_NONE {
+    let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
+    if text.is_empty() && ext.text_id == crate::pool::PTR_NONE {
         return None;
     }
-    let n = parse_points(objs.str_get(ext.text_id), out);
+    polygon_shape_text(text, widget, abs, ext, out)
+}
+
+fn polygon_shape_text(
+    text: &[u8],
+    widget: &Widget,
+    abs: &Rect,
+    ext: &WidgetExt,
+    out: &mut [Offset; lcd::MAX_POLY_POINTS],
+) -> Option<(usize, Color, Color, u16)> {
+    let n = parse_points(text, out);
     if n < 2 {
         return None;
     }
@@ -2553,9 +2583,10 @@ pub fn polygon_shape(
     Some((n, fill, widget.border_color, shape_stroke(ext)))
 }
 
-fn draw_polygon_shape<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+fn draw_polygon_shape<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, id: WidgetId, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
     let mut pts = [Offset { x: 0, y: 0 }; lcd::MAX_POLY_POINTS];
-    let Some((n, fill, stroke, t)) = polygon_shape(&ctx.objs, widget, abs, ext, &mut pts) else { return };
+    let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
+    let Some((n, fill, stroke, t)) = polygon_shape_text(text, widget, abs, ext, &mut pts) else { return };
     let poly = &pts[..n];
     if fill != 0 {
         c.fill_polygon(poly, fill);
@@ -2658,12 +2689,14 @@ fn draw_widget_image<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, abs: &Rect, ex
 fn draw_label_text<P: Platform, C: Canvas>(
     ctx: &Ctx<P>,
     c: &C,
+    id: WidgetId,
     widget: &Widget,
     abs: &Rect,
     ext: &WidgetExt,
     bg: Option<Color>,
 ) {
-    label_lines(ctx, widget, abs, ext, |font, line, x, y| {
+    let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
+    label_lines_text(ctx, widget, abs, ext, text, |font, line, x, y| {
         font.draw_str(c, &ctx.flash, line, x, y, ext.text_color, bg);
     });
 }
@@ -2673,15 +2706,30 @@ fn draw_label_text<P: Platform, C: Canvas>(
 /// Public for board renderers that draw text their own way (exynos4412's GPU compositor).
 pub fn label_lines<P: Platform>(
     ctx: &Ctx<P>,
+    id: WidgetId,
     widget: &Widget,
     abs: &Rect,
     ext: &WidgetExt,
-    mut f: impl FnMut(&crate::font::Font, &[u8], i16, i16),
+    f: impl FnMut(&crate::font::Font, &[u8], i16, i16),
 ) {
-    if ext.text_id == crate::pool::PTR_NONE || ext.font_id == 0xFF {
+    if ctx.objs.render_text(id, ext.text_id).is_none() || ext.font_id == 0xFF {
         return;
     }
-    let text = ctx.objs.str_get(ext.text_id);
+    let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
+    label_lines_text(ctx, widget, abs, ext, text, f);
+}
+
+fn label_lines_text<P: Platform>(
+    ctx: &Ctx<P>,
+    widget: &Widget,
+    abs: &Rect,
+    ext: &WidgetExt,
+    text: &[u8],
+    mut f: impl FnMut(&crate::font::Font, &[u8], i16, i16),
+) {
+    if ext.font_id == 0xFF {
+        return;
+    }
     if text.is_empty() {
         return;
     }
@@ -2799,8 +2847,9 @@ fn draw_round_part<B: Canvas>(lcd: &B, p: RoundPart) {
 }
 
 /// Draw input text with cursor, or a dropdown's text and arrow, in the content area.
-fn draw_field<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
-    field_contents(ctx, widget, abs, ext, |item| match item {
+fn draw_field<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, id: WidgetId, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
+    field_contents_text(ctx, widget, abs, ext, text, |item| match item {
         FieldItem::Text { font, line, x, y, bg } => {
             font.draw_str(c, &ctx.flash, line, x, y, ext.text_color, bg);
         }
@@ -2814,9 +2863,22 @@ fn draw_field<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, widget: &Widget, abs:
 /// that draw it another way (exynos4412's GPU compositor).
 pub fn field_contents<'a, P: Platform>(
     ctx: &'a Ctx<P>,
+    id: WidgetId,
     widget: &Widget,
     abs: &Rect,
     ext: &WidgetExt,
+    f: impl FnMut(FieldItem<'a>),
+) {
+    let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
+    field_contents_text(ctx, widget, abs, ext, text, f);
+}
+
+fn field_contents_text<'a, P: Platform>(
+    ctx: &'a Ctx<P>,
+    widget: &Widget,
+    abs: &Rect,
+    ext: &WidgetExt,
+    text: &'a [u8],
     mut f: impl FnMut(FieldItem<'a>),
 ) {
     let Some(font) = ctx.fonts.resolve(ext.font_id) else { return };
@@ -2833,14 +2895,12 @@ pub fn field_contents<'a, P: Platform>(
     let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
     let bg_color = effective_bg(&ctx.objs, widget, ext);
     let bg = if bg_color == 0 { None } else { Some(bg_color) };
-    let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
-    let text: &'a [u8] = if has_text { ctx.objs.str_get(ext.text_id) } else { &[] };
+    let text: &'a [u8] = if ext.font_id != 0xFF { text } else { &[] };
 
     if widget.kind == KIND_DROPDOWN {
         let arrow_w: u16 = 18;
         let text_w = cw.saturating_sub(arrow_w + 4);
         // The selected text whatever `font_id` says (a missing font was handled above).
-        let text: &'a [u8] = if ext.text_id != crate::pool::PTR_NONE { ctx.objs.str_get(ext.text_id) } else { &[] };
         if text_w > 0 && !text.is_empty() {
             f(FieldItem::Text { font, line: text, x: cx, y: ty, bg });
         }
@@ -3170,7 +3230,7 @@ const GRAPH_FLAG_FILL: u8 = 1 << 1;
 
 fn draw_graph<B: Canvas>(
     lcd: &B,
-    objs: &ObjPool,
+    samples: &[i32],
     _widget: &Widget,
     inner: &Rect,
     ext: &WidgetExt,
@@ -3180,7 +3240,7 @@ fn draw_graph<B: Canvas>(
     // instead of drawing them twice.
     let mut pen = lcd.pen(style.line, 1);
     let mut prev: Option<(i16, i16)> = None;
-    graph_points(objs, inner, ext, |x, y| {
+    graph_points_from_samples(samples, inner, ext, |x, y| {
         if let (Some((px, py)), Some(fill)) = (prev, style.fill) {
             fill_under_segment(lcd, px, py, x, y, style.baseline, fill);
         }
@@ -3209,16 +3269,23 @@ pub fn graph_style(inner: &Rect, ext: &WidgetExt) -> GraphStyle {
 /// `(x0, y0) → (x1, y1)` filled as `fill_under_segment` does). Nothing if there are fewer than
 /// two samples or the rect is too small. Public for board renderers that draw graphs their
 /// own way (exynos4412's GPU compositor).
-pub fn graph_points(objs: &ObjPool, inner: &Rect, ext: &WidgetExt, mut f: impl FnMut(i16, i16)) {
-    if inner.is_empty() || inner.w < 2 || inner.h < 2 {
-        return;
-    }
-
-    let arr_id = ext.value as crate::pool::ObjPtr;
-    let samples = match objs.arr(arr_id) {
+pub fn graph_points<P: Platform>(ctx: &Ctx<P>, id: WidgetId, inner: &Rect, ext: &WidgetExt, mut f: impl FnMut(i16, i16)) {
+    let samples = match ctx.objs.render_graph(id, ext.value as crate::pool::ObjPtr) {
         Some(s) if !s.is_empty() => s,
         _ => return,
     };
+    graph_points_from_samples(samples, inner, ext, &mut f);
+}
+
+fn graph_points_from_samples(
+    samples: &[i32],
+    inner: &Rect,
+    ext: &WidgetExt,
+    mut f: impl FnMut(i16, i16),
+) {
+    if inner.is_empty() || inner.w < 2 || inner.h < 2 || samples.is_empty() {
+        return;
+    }
 
     let cap = ext.max_length as usize;
     let count = if cap == 0 {

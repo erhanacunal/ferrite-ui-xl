@@ -242,9 +242,13 @@ impl PlatformRuntime for Exynos4412Platform {
             ferrite_core::render::wait_idle(ctx);
             draw_diag(ctx);
         }
-        // Show what this pass drew (shadow -> scanned buffer, at a vsync),
-        // unless the render core is drawing (it is presented after).
-        if !ctx.render_away {
+        // Keep a CPU0-owned G2D present moving even while CPU2 draws. In
+        // particular, CPU2 may be waiting for the present's rows in `fence`
+        // and cannot poll or abort CPU0's G2D job itself.
+        if ctx.render_away {
+            lcd::service_present();
+        } else {
+            // Show what this pass drew (shadow -> scanned buffer, at a vsync).
             lcd::flush();
         }
         // The compositor switched on/off over HTTP: repaint everything.

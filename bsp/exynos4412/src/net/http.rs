@@ -684,6 +684,8 @@ fn phase_name(id: u8) -> &'static str {
         14 => "timer reads",
         15 => "G2D/GPU drawing",
         16 => "sprite drawing",
+        17 => "scene capture",
+        18 => "scene handoff",
         0x81 => "draw_widget calls",
         0x82 => "pixel primitive calls",
         0x83 => "presents",
@@ -699,13 +701,13 @@ fn phase_name(id: u8) -> &'static str {
         0x8D => "shifted kpx",
         0x8E => "G2D picture copies",
         0x8F => "G2D move copies",
-        0x41..=0x50 => "longest pass",
+        0x41..=0x52 => "longest pass",
         _ => "?",
     }
 }
 
 /// Perf payload (`protocol::send_perf`) → JSON. Ids ≥ 0x80 are counts, the
-/// rest microseconds; 10–16 are sub-phases (not part of the step sum).
+/// rest microseconds; 10–18 are sub-phases (not part of the step sum).
 fn perf_json(p: &[u8]) -> String {
     let count = p.get(1).copied().unwrap_or(0) as usize;
     let instr = p.get(18..26).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
@@ -737,7 +739,7 @@ fn perf_json(p: &[u8]) -> String {
                 id,
                 phase_name(id),
                 v,
-                (10..=16).contains(&id)
+                (10..=18).contains(&id)
             );
             first = false;
         }

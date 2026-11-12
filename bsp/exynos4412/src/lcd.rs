@@ -345,6 +345,11 @@ const BAND: usize = 32;
 /// Polls of a band's end by [`wait_rows`] before giving up on the G2D (far
 /// more than a band takes).
 const G2D_POLLS: u32 = 5_000_000;
+/// A present band should finish in well under a millisecond. If its interrupt
+/// is lost, keep making progress from `flush`; if the engine itself is stuck,
+/// abandon it and finish the copy on the CPU.
+const G2D_PRESENT_TIMEOUT_MS: u32 = 250;
+static G2D_PRESENT_AT: AtomicU32 = AtomicU32::new(0);
 /// After the switch (FLIP), how long [`flush`] waits for the FIMD to scan
 /// the new buffer before going on anyway (FIMD off).
 const FLIP_MS: u32 = 100;
@@ -505,7 +510,10 @@ pub fn flush() {
     if !PRESENTER.load(Ordering::Acquire) {
         match STATE.load(Ordering::Acquire) {
             FLIP => g2d_flipped(),
-            COPY => return,
+            COPY => {
+                service_present();
+                return;
+            }
             _ => {}
         }
     }
@@ -548,6 +556,24 @@ pub fn flush() {
     STATE.store(COPY, Ordering::Release);
     // SAFETY: wakes CPU2 from its `wfe`.
     unsafe { core::arch::asm!("dsb", "sev", options(nostack, preserves_flags)) };
+}
+
+/// CPU0, once per pass while CPU2 owns the render context: advances the G2D
+/// present even though [`flush`] is skipped. CPU2 can wait for rows copied by
+/// the G2D, but only CPU0 owns the present job and may poll or abort it.
+pub fn service_present() {
+    if PRESENTER.load(Ordering::Acquire) || STATE.load(Ordering::Acquire) != COPY {
+        return;
+    }
+    // Normally the G2D IRQ advances the bands. Poll too, so a missed
+    // completion interrupt cannot strand a render job in `wait_rows`.
+    g2d_poll();
+    if STATE.load(Ordering::Acquire) == COPY
+        && systick::millis().wrapping_sub(G2D_PRESENT_AT.load(Ordering::Relaxed))
+            >= G2D_PRESENT_TIMEOUT_MS
+    {
+        g2d_abort();
+    }
 }
 
 /// Waits until a present handed over by [`flush`] is on screen (boot and
@@ -626,6 +652,7 @@ fn g2d_start(d: &mut Rect) {
     }
     COPY_LO.store(r[1], Ordering::Relaxed);
     COPY_HI.store(r[3], Ordering::Relaxed);
+    G2D_PRESENT_AT.store(systick::millis(), Ordering::Relaxed);
     STATE.store(COPY, Ordering::Release);
     let masked = cpu::mask_irq();
     let j = job();

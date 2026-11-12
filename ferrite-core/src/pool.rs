@@ -168,6 +168,10 @@ pub(crate) struct RenderState {
     pub(crate) drawn_keys: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, u64>>,
     /// Render-owned values as of the last render pass (`snapshot.rs`).
     pub(crate) snapshot: crate::snapshot::Snapshot,
+    /// Packed renderer input captured on the VM core before handoff.
+    pub(crate) scene: crate::scene::RenderSnapshot,
+    /// The VM pool has captured a scene that has not been handed off yet.
+    pub(crate) scene_ready: bool,
     /// What the renderer knows of each widget, by object pointer
     /// (`widget::RenderRec`).
     pub(crate) recs: Vec<crate::widget::RenderRec>,
@@ -198,6 +202,8 @@ impl RenderState {
             paints: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             drawn_keys: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             snapshot: crate::snapshot::Snapshot::new(),
+            scene: crate::scene::RenderSnapshot::new(),
+            scene_ready: false,
             recs: Vec::new(),
             msgs: Vec::new(),
             shape_changed: true,
@@ -222,6 +228,7 @@ impl RenderState {
         self.paints.get_mut().clear();
         self.drawn_keys.get_mut().clear();
         self.snapshot.clear();
+        self.scene_ready = false;
         self.recs.clear();
     }
 }
@@ -276,6 +283,36 @@ pub struct ObjPool {
 }
 
 impl ObjPool {
+    /// Renderer-only snapshot for this pool. On the render pool this is the
+    /// compact scene captured at the latest VM-to-render synchronization.
+    pub fn render_scene(&self) -> &crate::scene::RenderSnapshot {
+        &self.render.scene
+    }
+
+    /// Read a widget's text from the render snapshot. On the VM pool, fall
+    /// back to its object id for single-core utilities and pre-sync callers.
+    pub fn render_text(&self, id: WidgetId, source_id: ObjPtr) -> Option<&[u8]> {
+        if let Some(widget) = self.render.scene.widget(id) {
+            return self.render.scene.text_for(widget.id);
+        }
+        if self.is_view || source_id == PTR_NONE {
+            return None;
+        }
+        Some(self.str_get(source_id))
+    }
+
+    /// Read a widget's graph samples from the render snapshot. The VM pool
+    /// fallback supports single-core utilities and pre-sync callers.
+    pub fn render_graph(&self, id: WidgetId, source_id: ObjPtr) -> Option<&[i32]> {
+        if let Some(widget) = self.render.scene.widget(id) {
+            return self.render.scene.graph_for(widget.id);
+        }
+        if self.is_view {
+            return None;
+        }
+        self.arr(source_id)
+    }
+
     /// Pool with the compile-time default capacity.
     pub fn new() -> Self {
         let mut pool = Self::empty();
@@ -318,26 +355,18 @@ impl ObjPool {
         p
     }
 
-    /// Copy the tree (used arena words, live table entries, allocator
-    /// state, root, overlay) into the render pool `view`.
-    pub(crate) fn copy_tree_into(&self, view: &mut ObjPool) {
-        if view.arena.len() < self.top {
-            let words = (self.top * 2).max(1024).min(self.arena.len());
-            view.arena = try_alloc_slice(words, 0u32).expect("render pool arena");
-        }
-        let hwm = self.hwm as usize;
-        if view.table.len() < hwm {
-            let n = (hwm * 2).max(256).min(self.table.len());
-            view.table = try_alloc_slice(n, FREE_TAG).expect("render pool table");
-        }
-        view.arena[..self.top].copy_from_slice(&self.arena[..self.top]);
-        view.table[..hwm].copy_from_slice(&self.table[..hwm]);
-        view.top = self.top;
+    /// Copy live widget blocks into `view`. Text and graph data live in the
+    /// renderer snapshot; unrelated VM strings/arrays and arena holes are
+    /// omitted while widget pointer ids remain stable.
+    pub(crate) fn sync_view_metadata(&self, view: &mut ObjPool) {
+        // Widget data now lives in `RenderSnapshot`; this context keeps only
+        // render-owned state and stable widget ID bounds.
+        view.top = 0;
         view.hwm = self.hwm;
-        view.free_head = self.free_head;
-        view.free_tail = self.free_tail;
-        view.garbage = self.garbage;
-        view.live = self.live;
+        view.free_head = PTR_NONE;
+        view.free_tail = PTR_NONE;
+        view.garbage = 0;
+        view.live = [0; 4];
         view.root = self.root;
         view.overlay = self.overlay;
     }
@@ -434,6 +463,9 @@ impl ObjPool {
     }
     /// Live objects of type `ty`, or all types for `T_FREE`.
     pub fn live_objects(&self, ty: u8) -> usize {
+        if self.is_view {
+            return if ty == T_WIDGET || ty == T_FREE { self.render.scene.len() } else { 0 };
+        }
         if ty == T_FREE {
             self.live.iter().map(|&n| n as usize).sum()
         } else {
@@ -463,6 +495,7 @@ impl ObjPool {
             + self.dfs_cache.capacity() * size_of::<WidgetId>()
             + tasks
             + geo
+            + self.render.scene.heap_bytes()
     }
     /// Pointers handed out so far: every live pointer is below this. Used as
     /// the iteration bound and as a loop guard for tree walks.
@@ -500,6 +533,9 @@ impl ObjPool {
 
     /// Type of the object `ptr` names, or `T_FREE` for none.
     pub fn type_of(&self, ptr: ObjPtr) -> u8 {
+        if self.is_view {
+            return if self.render.scene.widget(WidgetId(ptr)).is_some() { T_WIDGET } else { T_FREE };
+        }
         match self.table.get(ptr as usize) {
             Some(&e) if (ptr as usize) < self.hwm as usize && e & FREE_TAG == 0 => {
                 hdr_type(self.arena[e as usize])

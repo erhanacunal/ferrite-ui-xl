@@ -46,6 +46,7 @@ pub mod render;
 pub mod snapshot;
 pub mod renderer;
 pub mod runtime;
+pub mod scene;
 pub mod pool;
 pub mod perf;
 pub mod strpool;

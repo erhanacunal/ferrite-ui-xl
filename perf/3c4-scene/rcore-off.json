@@ -1,0 +1,1277 @@
+{
+  "mode": "rcore-off",
+  "captured_at": "2026-11-12T09:34:37.6803789+03:00",
+  "workload": "tablet Monitor stress",
+  "windows": [
+    {
+      "hz": 24000000,
+      "window_us": 2000601,
+      "passes": 1794,
+      "max_pass_us": 15656,
+      "vm_instructions": 5697,
+      "phases": [
+        {
+          "id": 1,
+          "name": "vm",
+          "us": 3912,
+          "sub": false
+        },
+        {
+          "id": 2,
+          "name": "usart",
+          "us": 539,
+          "sub": false
+        },
+        {
+          "id": 3,
+          "name": "input",
+          "us": 1272,
+          "sub": false
+        },
+        {
+          "id": 4,
+          "name": "animations",
+          "us": 24327,
+          "sub": false
+        },
+        {
+          "id": 5,
+          "name": "audio",
+          "us": 400,
+          "sub": false
+        },
+        {
+          "id": 6,
+          "name": "render",
+          "us": 253100,
+          "sub": false
+        },
+        {
+          "id": 7,
+          "name": "callbacks",
+          "us": 617,
+          "sub": false
+        },
+        {
+          "id": 8,
+          "name": "tasks/misc",
+          "us": 2095,
+          "sub": false
+        },
+        {
+          "id": 9,
+          "name": "frame_end",
+          "us": 8393,
+          "sub": false
+        },
+        {
+          "id": 10,
+          "name": "display wait",
+          "us": 12,
+          "sub": true
+        },
+        {
+          "id": 11,
+          "name": "widget draws",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 12,
+          "name": "pixel writes",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 13,
+          "name": "present copy",
+          "us": 25699,
+          "sub": true
+        },
+        {
+          "id": 14,
+          "name": "timer reads",
+          "us": 2387,
+          "sub": true
+        },
+        {
+          "id": 15,
+          "name": "G2D/GPU drawing",
+          "us": 222455,
+          "sub": true
+        },
+        {
+          "id": 16,
+          "name": "sprite drawing",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 17,
+          "name": "scene capture",
+          "us": 4251,
+          "sub": true
+        },
+        {
+          "id": 18,
+          "name": "scene handoff",
+          "us": 1940,
+          "sub": true
+        }
+      ],
+      "counts": [
+        {
+          "id": 129,
+          "name": "draw_widget calls",
+          "n": 0
+        },
+        {
+          "id": 130,
+          "name": "pixel primitive calls",
+          "n": 0
+        },
+        {
+          "id": 131,
+          "name": "presents",
+          "n": 116
+        },
+        {
+          "id": 132,
+          "name": "present KiB",
+          "n": 52339
+        },
+        {
+          "id": 133,
+          "name": "timer reads",
+          "n": 9384
+        },
+        {
+          "id": 134,
+          "name": "G2D draw ops",
+          "n": 129
+        },
+        {
+          "id": 135,
+          "name": "G2D draw kpx",
+          "n": 0
+        },
+        {
+          "id": 136,
+          "name": "sprites made",
+          "n": 0
+        },
+        {
+          "id": 137,
+          "name": "sprite blits",
+          "n": 0
+        },
+        {
+          "id": 138,
+          "name": "sprite first sightings",
+          "n": 0
+        },
+        {
+          "id": 139,
+          "name": "CPU blended kpx",
+          "n": 0
+        },
+        {
+          "id": 140,
+          "name": "subtrees shifted",
+          "n": 0
+        },
+        {
+          "id": 141,
+          "name": "shifted kpx",
+          "n": 0
+        },
+        {
+          "id": 142,
+          "name": "G2D picture copies",
+          "n": 0
+        },
+        {
+          "id": 143,
+          "name": "G2D move copies",
+          "n": 0
+        },
+        {
+          "id": 65,
+          "name": "longest pass",
+          "n": 221
+        },
+        {
+          "id": 66,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 67,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 70,
+          "name": "longest pass",
+          "n": 15412
+        },
+        {
+          "id": 71,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 74,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 75,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 76,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 79,
+          "name": "longest pass",
+          "n": 13024
+        },
+        {
+          "id": 80,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 81,
+          "name": "longest pass",
+          "n": 37
+        },
+        {
+          "id": 82,
+          "name": "longest pass",
+          "n": 17
+        }
+      ]
+    },
+    {
+      "hz": 24000000,
+      "window_us": 2001289,
+      "passes": 1791,
+      "max_pass_us": 15950,
+      "vm_instructions": 5697,
+      "phases": [
+        {
+          "id": 1,
+          "name": "vm",
+          "us": 3861,
+          "sub": false
+        },
+        {
+          "id": 2,
+          "name": "usart",
+          "us": 536,
+          "sub": false
+        },
+        {
+          "id": 3,
+          "name": "input",
+          "us": 1278,
+          "sub": false
+        },
+        {
+          "id": 4,
+          "name": "animations",
+          "us": 24351,
+          "sub": false
+        },
+        {
+          "id": 5,
+          "name": "audio",
+          "us": 398,
+          "sub": false
+        },
+        {
+          "id": 6,
+          "name": "render",
+          "us": 256781,
+          "sub": false
+        },
+        {
+          "id": 7,
+          "name": "callbacks",
+          "us": 615,
+          "sub": false
+        },
+        {
+          "id": 8,
+          "name": "tasks/misc",
+          "us": 2093,
+          "sub": false
+        },
+        {
+          "id": 9,
+          "name": "frame_end",
+          "us": 8385,
+          "sub": false
+        },
+        {
+          "id": 10,
+          "name": "display wait",
+          "us": 1000,
+          "sub": true
+        },
+        {
+          "id": 11,
+          "name": "widget draws",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 12,
+          "name": "pixel writes",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 13,
+          "name": "present copy",
+          "us": 25804,
+          "sub": true
+        },
+        {
+          "id": 14,
+          "name": "timer reads",
+          "us": 2379,
+          "sub": true
+        },
+        {
+          "id": 15,
+          "name": "G2D/GPU drawing",
+          "us": 224740,
+          "sub": true
+        },
+        {
+          "id": 16,
+          "name": "sprite drawing",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 17,
+          "name": "scene capture",
+          "us": 4362,
+          "sub": true
+        },
+        {
+          "id": 18,
+          "name": "scene handoff",
+          "us": 1943,
+          "sub": true
+        }
+      ],
+      "counts": [
+        {
+          "id": 129,
+          "name": "draw_widget calls",
+          "n": 0
+        },
+        {
+          "id": 130,
+          "name": "pixel primitive calls",
+          "n": 0
+        },
+        {
+          "id": 131,
+          "name": "presents",
+          "n": 116
+        },
+        {
+          "id": 132,
+          "name": "present KiB",
+          "n": 52689
+        },
+        {
+          "id": 133,
+          "name": "timer reads",
+          "n": 9369
+        },
+        {
+          "id": 134,
+          "name": "G2D draw ops",
+          "n": 126
+        },
+        {
+          "id": 135,
+          "name": "G2D draw kpx",
+          "n": 0
+        },
+        {
+          "id": 136,
+          "name": "sprites made",
+          "n": 0
+        },
+        {
+          "id": 137,
+          "name": "sprite blits",
+          "n": 0
+        },
+        {
+          "id": 138,
+          "name": "sprite first sightings",
+          "n": 0
+        },
+        {
+          "id": 139,
+          "name": "CPU blended kpx",
+          "n": 0
+        },
+        {
+          "id": 140,
+          "name": "subtrees shifted",
+          "n": 0
+        },
+        {
+          "id": 141,
+          "name": "shifted kpx",
+          "n": 0
+        },
+        {
+          "id": 142,
+          "name": "G2D picture copies",
+          "n": 0
+        },
+        {
+          "id": 143,
+          "name": "G2D move copies",
+          "n": 0
+        },
+        {
+          "id": 65,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 66,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 67,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 70,
+          "name": "longest pass",
+          "n": 15916
+        },
+        {
+          "id": 71,
+          "name": "longest pass",
+          "n": 1
+        },
+        {
+          "id": 74,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 75,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 76,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 79,
+          "name": "longest pass",
+          "n": 13569
+        },
+        {
+          "id": 80,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 81,
+          "name": "longest pass",
+          "n": 37
+        },
+        {
+          "id": 82,
+          "name": "longest pass",
+          "n": 18
+        }
+      ]
+    },
+    {
+      "hz": 24000000,
+      "window_us": 2001015,
+      "passes": 1792,
+      "max_pass_us": 16687,
+      "vm_instructions": 5672,
+      "phases": [
+        {
+          "id": 1,
+          "name": "vm",
+          "us": 2873,
+          "sub": false
+        },
+        {
+          "id": 2,
+          "name": "usart",
+          "us": 533,
+          "sub": false
+        },
+        {
+          "id": 3,
+          "name": "input",
+          "us": 1276,
+          "sub": false
+        },
+        {
+          "id": 4,
+          "name": "animations",
+          "us": 24514,
+          "sub": false
+        },
+        {
+          "id": 5,
+          "name": "audio",
+          "us": 398,
+          "sub": false
+        },
+        {
+          "id": 6,
+          "name": "render",
+          "us": 256355,
+          "sub": false
+        },
+        {
+          "id": 7,
+          "name": "callbacks",
+          "us": 615,
+          "sub": false
+        },
+        {
+          "id": 8,
+          "name": "tasks/misc",
+          "us": 2098,
+          "sub": false
+        },
+        {
+          "id": 9,
+          "name": "frame_end",
+          "us": 8395,
+          "sub": false
+        },
+        {
+          "id": 10,
+          "name": "display wait",
+          "us": 35,
+          "sub": true
+        },
+        {
+          "id": 11,
+          "name": "widget draws",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 12,
+          "name": "pixel writes",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 13,
+          "name": "present copy",
+          "us": 25742,
+          "sub": true
+        },
+        {
+          "id": 14,
+          "name": "timer reads",
+          "us": 2379,
+          "sub": true
+        },
+        {
+          "id": 15,
+          "name": "G2D/GPU drawing",
+          "us": 225463,
+          "sub": true
+        },
+        {
+          "id": 16,
+          "name": "sprite drawing",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 17,
+          "name": "scene capture",
+          "us": 4288,
+          "sub": true
+        },
+        {
+          "id": 18,
+          "name": "scene handoff",
+          "us": 1960,
+          "sub": true
+        }
+      ],
+      "counts": [
+        {
+          "id": 129,
+          "name": "draw_widget calls",
+          "n": 0
+        },
+        {
+          "id": 130,
+          "name": "pixel primitive calls",
+          "n": 0
+        },
+        {
+          "id": 131,
+          "name": "presents",
+          "n": 116
+        },
+        {
+          "id": 132,
+          "name": "present KiB",
+          "n": 52707
+        },
+        {
+          "id": 133,
+          "name": "timer reads",
+          "n": 9373
+        },
+        {
+          "id": 134,
+          "name": "G2D draw ops",
+          "n": 126
+        },
+        {
+          "id": 135,
+          "name": "G2D draw kpx",
+          "n": 0
+        },
+        {
+          "id": 136,
+          "name": "sprites made",
+          "n": 0
+        },
+        {
+          "id": 137,
+          "name": "sprite blits",
+          "n": 0
+        },
+        {
+          "id": 138,
+          "name": "sprite first sightings",
+          "n": 0
+        },
+        {
+          "id": 139,
+          "name": "CPU blended kpx",
+          "n": 0
+        },
+        {
+          "id": 140,
+          "name": "subtrees shifted",
+          "n": 0
+        },
+        {
+          "id": 141,
+          "name": "shifted kpx",
+          "n": 0
+        },
+        {
+          "id": 142,
+          "name": "G2D picture copies",
+          "n": 0
+        },
+        {
+          "id": 143,
+          "name": "G2D move copies",
+          "n": 0
+        },
+        {
+          "id": 65,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 66,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 67,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 70,
+          "name": "longest pass",
+          "n": 16653
+        },
+        {
+          "id": 71,
+          "name": "longest pass",
+          "n": 1
+        },
+        {
+          "id": 74,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 75,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 76,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 79,
+          "name": "longest pass",
+          "n": 14315
+        },
+        {
+          "id": 80,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 81,
+          "name": "longest pass",
+          "n": 37
+        },
+        {
+          "id": 82,
+          "name": "longest pass",
+          "n": 16
+        }
+      ]
+    },
+    {
+      "hz": 24000000,
+      "window_us": 2001064,
+      "passes": 1790,
+      "max_pass_us": 16250,
+      "vm_instructions": 5697,
+      "phases": [
+        {
+          "id": 1,
+          "name": "vm",
+          "us": 3892,
+          "sub": false
+        },
+        {
+          "id": 2,
+          "name": "usart",
+          "us": 541,
+          "sub": false
+        },
+        {
+          "id": 3,
+          "name": "input",
+          "us": 1268,
+          "sub": false
+        },
+        {
+          "id": 4,
+          "name": "animations",
+          "us": 24455,
+          "sub": false
+        },
+        {
+          "id": 5,
+          "name": "audio",
+          "us": 397,
+          "sub": false
+        },
+        {
+          "id": 6,
+          "name": "render",
+          "us": 257357,
+          "sub": false
+        },
+        {
+          "id": 7,
+          "name": "callbacks",
+          "us": 616,
+          "sub": false
+        },
+        {
+          "id": 8,
+          "name": "tasks/misc",
+          "us": 2088,
+          "sub": false
+        },
+        {
+          "id": 9,
+          "name": "frame_end",
+          "us": 8379,
+          "sub": false
+        },
+        {
+          "id": 10,
+          "name": "display wait",
+          "us": 10,
+          "sub": true
+        },
+        {
+          "id": 11,
+          "name": "widget draws",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 12,
+          "name": "pixel writes",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 13,
+          "name": "present copy",
+          "us": 25881,
+          "sub": true
+        },
+        {
+          "id": 14,
+          "name": "timer reads",
+          "us": 2380,
+          "sub": true
+        },
+        {
+          "id": 15,
+          "name": "G2D/GPU drawing",
+          "us": 226386,
+          "sub": true
+        },
+        {
+          "id": 16,
+          "name": "sprite drawing",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 17,
+          "name": "scene capture",
+          "us": 4280,
+          "sub": true
+        },
+        {
+          "id": 18,
+          "name": "scene handoff",
+          "us": 1950,
+          "sub": true
+        }
+      ],
+      "counts": [
+        {
+          "id": 129,
+          "name": "draw_widget calls",
+          "n": 0
+        },
+        {
+          "id": 130,
+          "name": "pixel primitive calls",
+          "n": 0
+        },
+        {
+          "id": 131,
+          "name": "presents",
+          "n": 116
+        },
+        {
+          "id": 132,
+          "name": "present KiB",
+          "n": 52847
+        },
+        {
+          "id": 133,
+          "name": "timer reads",
+          "n": 9364
+        },
+        {
+          "id": 134,
+          "name": "G2D draw ops",
+          "n": 126
+        },
+        {
+          "id": 135,
+          "name": "G2D draw kpx",
+          "n": 0
+        },
+        {
+          "id": 136,
+          "name": "sprites made",
+          "n": 0
+        },
+        {
+          "id": 137,
+          "name": "sprite blits",
+          "n": 0
+        },
+        {
+          "id": 138,
+          "name": "sprite first sightings",
+          "n": 0
+        },
+        {
+          "id": 139,
+          "name": "CPU blended kpx",
+          "n": 0
+        },
+        {
+          "id": 140,
+          "name": "subtrees shifted",
+          "n": 0
+        },
+        {
+          "id": 141,
+          "name": "shifted kpx",
+          "n": 0
+        },
+        {
+          "id": 142,
+          "name": "G2D picture copies",
+          "n": 0
+        },
+        {
+          "id": 143,
+          "name": "G2D move copies",
+          "n": 0
+        },
+        {
+          "id": 65,
+          "name": "longest pass",
+          "n": 223
+        },
+        {
+          "id": 66,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 67,
+          "name": "longest pass",
+          "n": 1
+        },
+        {
+          "id": 70,
+          "name": "longest pass",
+          "n": 16002
+        },
+        {
+          "id": 71,
+          "name": "longest pass",
+          "n": 1
+        },
+        {
+          "id": 74,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 75,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 76,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 79,
+          "name": "longest pass",
+          "n": 13637
+        },
+        {
+          "id": 80,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 81,
+          "name": "longest pass",
+          "n": 36
+        },
+        {
+          "id": 82,
+          "name": "longest pass",
+          "n": 17
+        }
+      ]
+    },
+    {
+      "hz": 24000000,
+      "window_us": 2001262,
+      "passes": 1791,
+      "max_pass_us": 16040,
+      "vm_instructions": 5672,
+      "phases": [
+        {
+          "id": 1,
+          "name": "vm",
+          "us": 2857,
+          "sub": false
+        },
+        {
+          "id": 2,
+          "name": "usart",
+          "us": 536,
+          "sub": false
+        },
+        {
+          "id": 3,
+          "name": "input",
+          "us": 1274,
+          "sub": false
+        },
+        {
+          "id": 4,
+          "name": "animations",
+          "us": 24533,
+          "sub": false
+        },
+        {
+          "id": 5,
+          "name": "audio",
+          "us": 397,
+          "sub": false
+        },
+        {
+          "id": 6,
+          "name": "render",
+          "us": 257596,
+          "sub": false
+        },
+        {
+          "id": 7,
+          "name": "callbacks",
+          "us": 615,
+          "sub": false
+        },
+        {
+          "id": 8,
+          "name": "tasks/misc",
+          "us": 2091,
+          "sub": false
+        },
+        {
+          "id": 9,
+          "name": "frame_end",
+          "us": 8381,
+          "sub": false
+        },
+        {
+          "id": 10,
+          "name": "display wait",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 11,
+          "name": "widget draws",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 12,
+          "name": "pixel writes",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 13,
+          "name": "present copy",
+          "us": 25920,
+          "sub": true
+        },
+        {
+          "id": 14,
+          "name": "timer reads",
+          "us": 2379,
+          "sub": true
+        },
+        {
+          "id": 15,
+          "name": "G2D/GPU drawing",
+          "us": 226497,
+          "sub": true
+        },
+        {
+          "id": 16,
+          "name": "sprite drawing",
+          "us": 0,
+          "sub": true
+        },
+        {
+          "id": 17,
+          "name": "scene capture",
+          "us": 4290,
+          "sub": true
+        },
+        {
+          "id": 18,
+          "name": "scene handoff",
+          "us": 1958,
+          "sub": true
+        }
+      ],
+      "counts": [
+        {
+          "id": 129,
+          "name": "draw_widget calls",
+          "n": 0
+        },
+        {
+          "id": 130,
+          "name": "pixel primitive calls",
+          "n": 0
+        },
+        {
+          "id": 131,
+          "name": "presents",
+          "n": 116
+        },
+        {
+          "id": 132,
+          "name": "present KiB",
+          "n": 53057
+        },
+        {
+          "id": 133,
+          "name": "timer reads",
+          "n": 9368
+        },
+        {
+          "id": 134,
+          "name": "G2D draw ops",
+          "n": 127
+        },
+        {
+          "id": 135,
+          "name": "G2D draw kpx",
+          "n": 0
+        },
+        {
+          "id": 136,
+          "name": "sprites made",
+          "n": 0
+        },
+        {
+          "id": 137,
+          "name": "sprite blits",
+          "n": 0
+        },
+        {
+          "id": 138,
+          "name": "sprite first sightings",
+          "n": 0
+        },
+        {
+          "id": 139,
+          "name": "CPU blended kpx",
+          "n": 0
+        },
+        {
+          "id": 140,
+          "name": "subtrees shifted",
+          "n": 0
+        },
+        {
+          "id": 141,
+          "name": "shifted kpx",
+          "n": 0
+        },
+        {
+          "id": 142,
+          "name": "G2D picture copies",
+          "n": 0
+        },
+        {
+          "id": 143,
+          "name": "G2D move copies",
+          "n": 0
+        },
+        {
+          "id": 65,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 66,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 67,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 70,
+          "name": "longest pass",
+          "n": 16005
+        },
+        {
+          "id": 71,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 74,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 75,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 76,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 79,
+          "name": "longest pass",
+          "n": 13670
+        },
+        {
+          "id": 80,
+          "name": "longest pass",
+          "n": 0
+        },
+        {
+          "id": 81,
+          "name": "longest pass",
+          "n": 36
+        },
+        {
+          "id": 82,
+          "name": "longest pass",
+          "n": 17
+        }
+      ]
+    }
+  ]
+}

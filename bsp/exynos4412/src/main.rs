@@ -279,7 +279,11 @@ async fn ui_task(ctx: Box<Ctx<Exynos4412Platform>>, touch: TouchImpl<touch::MxtT
         match rt.idle_ms() {
             Some(ms) if ms > 0 && lcd::settled() => touch::sleep_until_touch(ms.min(cpuclock::IDLE_MAX_MS)).await,
             None if lcd::settled() => touch::sleep_until_touch(cpuclock::IDLE_MAX_MS).await,
-            _ => embassy_time::Timer::after_micros(cpuclock::IDLE_SLEEP_US).await,
+            _ => {
+                // Or as soon as CPU2 ends a render job: its picture is presented by this core.
+                let timer = embassy_time::Timer::after_micros(cpuclock::IDLE_SLEEP_US);
+                embassy_futures::select::select(timer, rcore::job_done()).await;
+            }
         }
     }
 }

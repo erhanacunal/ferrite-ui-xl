@@ -1,0 +1,47 @@
+[
+ {
+  "syncs": 12,
+  "full": 1,
+  "repacked_per_update": 57.8,
+  "build_us_per_sync": 43.8,
+  "handoff_rest_us_per_sync": 20.1,
+  "render_phase_ms_per_s": 1.116,
+  "jobs": 12,
+  "apply_us_per_job": 18.5,
+  "job_us": 4947,
+  "max_us": 10431,
+  "pickup_us": 9,
+  "presents_s": 1.0,
+  "gpu_error": 0
+ },
+ {
+  "syncs": 12,
+  "full": 1,
+  "repacked_per_update": 57.8,
+  "build_us_per_sync": 43.8,
+  "handoff_rest_us_per_sync": 20.1,
+  "render_phase_ms_per_s": 1.087,
+  "jobs": 12,
+  "apply_us_per_job": 18.7,
+  "job_us": 5387,
+  "max_us": 11276,
+  "pickup_us": 9,
+  "presents_s": 1.0,
+  "gpu_error": 0
+ },
+ {
+  "syncs": 12,
+  "full": 1,
+  "repacked_per_update": 57.8,
+  "build_us_per_sync": 43.8,
+  "handoff_rest_us_per_sync": 20.1,
+  "render_phase_ms_per_s": 1.113,
+  "jobs": 12,
+  "apply_us_per_job": 18.5,
+  "job_us": 6295,
+  "max_us": 13559,
+  "pickup_us": 9,
+  "presents_s": 1.0,
+  "gpu_error": 0
+ }
+]

@@ -496,6 +496,16 @@ fn wait_rows(y0: usize, y1: usize) {
     }
 }
 
+/// For `/api/status`: the G2D presents (`G2D_ON`), its interrupt is enabled
+/// at the GIC (it advances the present's bands), presents run on CPU2.
+pub fn g2d_state() -> (bool, bool, bool) {
+    (
+        G2D_ON.load(Ordering::Relaxed),
+        Gic::new().is_enabled(soc::G2D_IRQ),
+        PRESENTER.load(Ordering::Relaxed),
+    )
+}
+
 /// Whether drawing now would reach the screen any sooner
 /// (`PlatformRuntime::render_due`): false while something drawn since the
 /// last present is waiting for a present still in flight (copying, or
@@ -675,22 +685,29 @@ fn g2d_start(d: &mut Rect) {
 
 /// The G2D interrupt (CPU0): a band has ended.
 pub fn g2d_isr() {
-    g2d_step();
+    G2D_IRQS.fetch_add(1, Ordering::Relaxed);
+    g2d_step(0);
 }
+
+/// Diagnostics (`/api/status` `g2d`): G2D interrupts taken, and the present
+/// band ends taken by the interrupt / by a poll.
+pub static G2D_IRQS: AtomicU32 = AtomicU32::new(0);
+pub static G2D_BANDS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 
 /// Takes a band end if there is one, IRQs masked around it.
 fn g2d_poll() {
     let masked = cpu::mask_irq();
-    g2d_step();
+    g2d_step(1);
     cpu::restore_irq(masked);
 }
 
 /// IRQs masked: if the band in flight has ended, starts the next one (or
 /// switches the FIMD after the last).
-fn g2d_step() {
+fn g2d_step(by: usize) {
     let g = G2d::new();
     if STATE.load(Ordering::Acquire) == COPY && !PRESENTER.load(Ordering::Relaxed) {
         if g.ack() {
+            G2D_BANDS[by].fetch_add(1, Ordering::Relaxed);
             g2d_next(job());
         }
     } else if g.is_done() && !g.ack() {
@@ -1477,6 +1494,10 @@ fn g2d_op_inner(what: &str, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> 
         unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
         if irq_on && ok {
             gic.enable(soc::G2D_IRQ);
+            // `Gic::enable` routes an interrupt to the calling core: from the
+            // render core (CPU2, interrupts off) that left the present's
+            // band ends to CPU0's polls for good (6 ms copies, not 0.2 ms).
+            gic.set_target(soc::G2D_IRQ, 0);
         }
         ok
     })

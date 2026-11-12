@@ -68,7 +68,7 @@ def run(name, sc, img, env=None):
     if r.returncode != 0:
         raise RuntimeError(f"sim exited {r.returncode}: {r.stderr.strip()[-300:]}")
     for line in r.stderr.splitlines():
-        if line.startswith(("sim: dl ", "sim: scene ")) or (line.startswith("sim: snapshot ") and not line.startswith("sim: snapshot reads 0 ")):
+        if line.startswith(("sim: dl ", "sim: scene ", "sim: play ")) or (line.startswith("sim: snapshot ") and not line.startswith("sim: snapshot reads 0 ")):
             print(f"     {name}: {line[5:]}")
     frames = {}
     for t in sc["dump"]:
@@ -105,7 +105,17 @@ def main():
                     help="answer reads of render-owned values (animated props, scroll offsets) from the last "
                          "render's snapshot, as the render core will (FERRITE_SIM_STALE_READS=1); frames that "
                          "differ show programs depending on reading them live")
+    ap.add_argument("--plain", action="store_true",
+                    help="plain CPU drawing only: no layers, no pixel moves (FERRITE_SIM_PLAIN=1); frames of "
+                         "examples with layers differ from the golden ones (compare with --hashes)")
+    ap.add_argument("--play", action="store_true",
+                    help="the render side only plays each frame's display list, recorded by the VM's side "
+                         "(FERRITE_SIM_PLAY=1); must match --plain")
+    ap.add_argument("--hashes", help="check against / write (--update) this hash file instead of golden/hashes.json")
     a = ap.parse_args()
+    global HASHES
+    if a.hashes:
+        HASHES = Path(a.hashes)
 
     scenarios = json.loads(SCENARIOS.read_text(encoding="utf-8"))["scenarios"]
     if a.only:
@@ -131,6 +141,10 @@ def main():
             env.update(FERRITE_SIM_DL="1", FERRITE_SIM_DL_VERIFY="1")
         if a.stale:
             env.update(FERRITE_SIM_STALE_READS="1")
+        if a.play:
+            env.update(FERRITE_SIM_PLAY="1")
+        elif a.plain:
+            env.update(FERRITE_SIM_PLAIN="1")
         frames = run(name, sc, img, env)
         if a.update:
             golden[name] = frames

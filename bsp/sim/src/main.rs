@@ -168,6 +168,16 @@ fn main() {
         tasks: ferrite_core::task::TaskTable::new(),
     });
 
+    // `FERRITE_SIM_PLAY=1`: the render side only plays the display list of each frame, which
+    // the VM's side records (`render::MODE_PLAY`); `FERRITE_SIM_PLAIN=1`: its baseline, the
+    // same plain drawing rendered the normal way (`MODE_PLAIN`).
+    let mut ctx = ctx;
+    if std::env::var_os("FERRITE_SIM_PLAY").is_some() {
+        ctx.objs.set_render_mode(ferrite_core::render::MODE_PLAY);
+    } else if std::env::var_os("FERRITE_SIM_PLAIN").is_some() {
+        ctx.objs.set_render_mode(ferrite_core::render::MODE_PLAIN);
+    }
+
     platform::install_host(window, fb.clone(), mouse.clone(), taps, dump);
 
     #[cfg(all(windows, target_arch = "x86_64"))]

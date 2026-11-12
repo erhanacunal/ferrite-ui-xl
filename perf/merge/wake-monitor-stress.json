@@ -1,0 +1,62 @@
+[
+ {
+  "syncs": 355,
+  "full": 0,
+  "repacked_per_update": 22.1,
+  "build_us_per_sync": 12.3,
+  "handoff_rest_us_per_sync": 17.9,
+  "render_phase_ms_per_s": 2.39,
+  "jobs": 355,
+  "apply_us_per_job": 12.9,
+  "job_us": 1611,
+  "max_us": 12469,
+  "pickup_us": 20,
+  "presents_s": 50.7,
+  "gpu_error": 0
+ },
+ {
+  "syncs": 354,
+  "full": 1,
+  "repacked_per_update": 22.1,
+  "build_us_per_sync": 12.4,
+  "handoff_rest_us_per_sync": 17.9,
+  "render_phase_ms_per_s": 2.396,
+  "jobs": 355,
+  "apply_us_per_job": 12.6,
+  "job_us": 1592,
+  "max_us": 11487,
+  "pickup_us": 22,
+  "presents_s": 59.0,
+  "gpu_error": 0
+ },
+ {
+  "syncs": 355,
+  "full": 1,
+  "repacked_per_update": 22.1,
+  "build_us_per_sync": 12.4,
+  "handoff_rest_us_per_sync": 17.9,
+  "render_phase_ms_per_s": 2.399,
+  "jobs": 355,
+  "apply_us_per_job": 12.5,
+  "job_us": 1584,
+  "max_us": 10782,
+  "pickup_us": 20,
+  "presents_s": 59.2,
+  "gpu_error": 0
+ },
+ {
+  "syncs": 355,
+  "full": 0,
+  "repacked_per_update": 22.3,
+  "build_us_per_sync": 12.3,
+  "handoff_rest_us_per_sync": 18.0,
+  "render_phase_ms_per_s": 2.396,
+  "jobs": 355,
+  "apply_us_per_job": 12.9,
+  "job_us": 1613,
+  "max_us": 10916,
+  "pickup_us": 20,
+  "presents_s": 59.2,
+  "gpu_error": 0
+ }
+]

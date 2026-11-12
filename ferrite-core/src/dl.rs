@@ -156,6 +156,15 @@ impl List {
             .unwrap_or(start)
     }
 
+    /// Bytes of its calls and their data (length, not capacity).
+    pub fn used_bytes(&self) -> usize {
+        use core::mem::size_of;
+        self.ops.len() * size_of::<Op>()
+            + self.u8s.len()
+            + self.u16s.len() * 2
+            + self.pts.len() * size_of::<Offset>()
+    }
+
     /// Heap bytes held (capacity).
     pub fn heap_bytes(&self) -> usize {
         self.ops.capacity() * core::mem::size_of::<Op>()

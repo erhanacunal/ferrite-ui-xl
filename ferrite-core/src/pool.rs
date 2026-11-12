@@ -177,6 +177,16 @@ pub(crate) struct RenderState {
     /// VM pool: what the render pool must hear at the next sync, in order
     /// (`view.rs`). Empty in the render pool.
     pub(crate) msgs: Vec<crate::view::RenderMsg>,
+    /// VM pool: how the render side draws (`render::MODE_*`,
+    /// `ObjPool::set_render_mode`).
+    pub(crate) mode: u8,
+    /// Render pool: draw with the core's own CPU drawing only (no board
+    /// renderer, layers or pixel moves): `MODE_PLAIN`, `MODE_PLAY`.
+    pub(crate) plain: bool,
+    /// Render pool, `MODE_PLAY`: the frame being recorded (everything the
+    /// render draws goes here while it is busy, `render::screen!`), then the
+    /// list the render side plays.
+    pub(crate) frame: crate::dl::Recorder,
     /// A sync's data (`view::Commit`). Render pool: the one its next job
     /// applies (`Commit::pending`), then the applied one, kept for its
     /// buffers; VM pool: a spare one to build the next sync in.
@@ -208,6 +218,9 @@ impl RenderState {
             scene: crate::scene::RenderSnapshot::new(),
             recs: Vec::new(),
             msgs: Vec::new(),
+            mode: 0,
+            plain: false,
+            frame: crate::dl::Recorder::new(),
             commit: None,
             shape_changed: true,
             geo: Vec::new(),
@@ -375,6 +388,23 @@ impl ObjPool {
         }
     }
 
+    /// How the render side draws from the next render on (`render::MODE_*`);
+    /// a change repaints everything.
+    pub fn set_render_mode(&mut self, mode: u8) {
+        if self.render.mode == mode {
+            return;
+        }
+        self.render.mode = mode;
+        self.send(crate::view::RenderMsg::Touched);
+        if self.root.is_some() {
+            self.mark_dirty(self.root);
+        }
+    }
+
+    pub fn render_mode(&self) -> u8 {
+        self.render.mode
+    }
+
     /// Notes that object `p` may differ from what the render pool was last
     /// given: it is handed out for writing, was allocated or freed.
     #[inline]
@@ -461,7 +491,9 @@ impl ObjPool {
             return true;
         }
         // Release the old storage first so the allocator can reuse it.
+        let mode = self.render.mode;
         *self = Self::empty();
+        self.render.mode = mode;
         if self.alloc_storage(words * 4, objects) {
             return true;
         }

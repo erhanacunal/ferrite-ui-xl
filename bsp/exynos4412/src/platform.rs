@@ -253,6 +253,8 @@ impl PlatformRuntime for Exynos4412Platform {
         }
         // The compositor switched on/off over HTTP: repaint everything.
         crate::compose::service(ctx);
+        // A render mode asked for over HTTP.
+        crate::rcore::service(ctx);
         // A CPU clock asked for over HTTP.
         crate::cpuclock::service();
         // A backlight level asked for over HTTP.

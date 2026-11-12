@@ -411,8 +411,24 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             // `scene`: syncs update the render pool's scene, or capture it whole each time
             // (`ferrite_core::scene::INCREMENTAL`).
             let scene = query_param(query, b"scene");
+            // `mode`: 0 normal, 1 plain CPU drawing, 2 CPU2 only plays the display list CPU0
+            // records of each frame (`ferrite_core::render::MODE_*`).
+            let mode = query_param(query, b"mode");
+            // `wake`: CPU2 wakes CPU0's UI task when a job ends (`rcore::WAKE`).
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"wake") {
+                crate::rcore::WAKE.store(v == b"1", Ordering::Relaxed);
+            }
+            let mode_ok = matches!(mode, None | Some(b"0" | b"1" | b"2"));
             let bit = |v: Option<&[u8]>| matches!(v, None | Some(b"0" | b"1"));
-            if (on.is_some() || fence.is_some() || scene.is_some()) && bit(on) && bit(fence) && bit(scene) {
+            if (on.is_some() || fence.is_some() || scene.is_some() || mode.is_some())
+                && bit(on)
+                && bit(fence)
+                && bit(scene)
+                && mode_ok
+            {
+                if let Some(v) = mode {
+                    crate::rcore::MODE.store(v[0] - b'0', Ordering::Relaxed);
+                }
                 if let Some(v) = scene {
                     ferrite_core::scene::INCREMENTAL.store(v == b"1", Ordering::Relaxed);
                 }
@@ -424,7 +440,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 text(socket, "200 OK", "render core set\n").await?;
             } else {
-                text(socket, "400 Bad Request", "on=0|1, fence=0|1 and/or scene=0|1\n").await?;
+                text(socket, "400 Bad Request", "on=0|1, fence=0|1, scene=0|1 and/or mode=0|1|2\n").await?;
             }
         }
         (b"POST", b"/api/dl") => {
@@ -906,6 +922,21 @@ fn status_json() -> String {
         // longest time; where the jobs' time went (`rcore::Stats`).
         let t = crate::rcore::take_stats();
         {
+            let (present, irq, cpu2) = crate::lcd::g2d_state();
+            let _ = write!(
+                s,
+                ",\"g2d\":{{\"present\":{},\"irq\":{},\"draw\":{},\"cpu2_presenter\":{},\"irqs\":{},\"bands_irq\":{},\"bands_poll\":{},\"wake\":{}}}",
+                present,
+                irq,
+                crate::lcd::g2d_draw_ready(),
+                cpu2,
+                crate::lcd::G2D_IRQS.load(core::sync::atomic::Ordering::Relaxed),
+                crate::lcd::G2D_BANDS[0].load(core::sync::atomic::Ordering::Relaxed),
+                crate::lcd::G2D_BANDS[1].load(core::sync::atomic::Ordering::Relaxed),
+                crate::rcore::WAKE.load(core::sync::atomic::Ordering::Relaxed)
+            );
+        }
+        {
             // The render pool's scene (`scene.rs`): syncs since boot.
             use core::sync::atomic::Ordering::Relaxed;
             use ferrite_core::scene;
@@ -920,8 +951,12 @@ fn status_json() -> String {
         }
         let _ = write!(
             s,
-            ",\"rcore\":{{\"on\":{},\"fence_rows\":{},\"jobs\":{},\"busy_us\":{},\"max_us\":{}",
+            ",\"rcore\":{{\"on\":{},\"mode\":{},\"play_frames\":{},\"play_ops\":{},\"play_bytes\":{},\"fence_rows\":{},\"jobs\":{},\"busy_us\":{},\"max_us\":{}",
             crate::rcore::running(),
+            crate::rcore::MODE.load(core::sync::atomic::Ordering::Relaxed),
+            ferrite_core::render::PLAYS[0].load(core::sync::atomic::Ordering::Relaxed),
+            ferrite_core::render::PLAYS[1].load(core::sync::atomic::Ordering::Relaxed),
+            ferrite_core::render::PLAYS[2].load(core::sync::atomic::Ordering::Relaxed),
             crate::lcd::GPU_FENCE_ROWS.load(core::sync::atomic::Ordering::Relaxed),
             t.jobs,
             t.busy_us,

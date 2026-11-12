@@ -327,6 +327,17 @@ fn print_snapshot_stats() {
         snapshot::STALE_DIFF.load(Relaxed),
         if snapshot::stale() { " (stale reads on)" } else { "" }
     );
+    {
+        let p = &ferrite_core::render::PLAYS;
+        if p[0].load(Relaxed) != 0 {
+            eprintln!(
+                "sim: play frames {} commands {} bytes {}",
+                p[0].load(Relaxed),
+                p[1].load(Relaxed),
+                p[2].load(Relaxed)
+            );
+        }
+    }
     use ferrite_core::scene;
     eprintln!(
         "sim: scene syncs: {} full, {} updates ({} widgets repacked){}",

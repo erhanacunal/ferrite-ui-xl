@@ -43,6 +43,18 @@ static JOB: AtomicU8 = AtomicU8::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 /// Jobs go to CPU2 (`POST /api/rcore?on=`); off = CPU0 runs them.
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
+/// The render mode asked for (`POST /api/rcore?mode=0|1|2`:
+/// `render::MODE_NORMAL` / `MODE_PLAIN` / `MODE_PLAY`), applied by CPU0
+/// between passes ([`service`]).
+pub static MODE: AtomicU8 = AtomicU8::new(0);
+
+/// CPU0, `frame_end`: a render mode asked for over HTTP.
+pub fn service(ctx: &mut Ctx<P>) {
+    let mode = MODE.load(Ordering::Relaxed);
+    if ctx.objs.render_mode() != mode {
+        ctx.objs.set_render_mode(mode);
+    }
+}
 
 /// Jobs run on CPU2, and the time they took (profiler clock ticks).
 pub static JOBS: AtomicU32 = AtomicU32::new(0);
@@ -63,6 +75,36 @@ static PICKUP_MAX: AtomicU32 = AtomicU32::new(0);
 /// `render::JOB_TICKS` and the compositor's `TIMES` at the last `take_stats`.
 static LAST_JOB: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static LAST_COMPOSE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+/// [`job_done`] is used (`POST /api/rcore?wake=0|1`); off = CPU0 finds a
+/// finished job at its next pass, as before.
+pub static WAKE: AtomicBool = AtomicBool::new(true);
+
+/// CPU0's UI task, asleep until a job is done ([`job_done`]).
+static WAKER: critical_section::Mutex<core::cell::RefCell<Option<core::task::Waker>>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(None));
+
+/// Resolves once a finished job waits to be taken back (`render_poll`):
+/// CPU0's idle sleep races it with its timer, so a job's picture is
+/// presented when the job ends, not up to `IDLE_SLEEP_US` later. Never while
+/// no job is away.
+pub fn job_done() -> impl core::future::Future<Output = ()> {
+    core::future::poll_fn(|cx| {
+        if !WAKE.load(Ordering::Relaxed) {
+            return core::task::Poll::Pending;
+        }
+        if STATE.load(Ordering::Acquire) == DONE {
+            return core::task::Poll::Ready(());
+        }
+        critical_section::with(|cs| *WAKER.borrow_ref_mut(cs) = Some(cx.waker().clone()));
+        // It may have ended before the waker was there.
+        if STATE.load(Ordering::Acquire) == DONE {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    })
+}
 
 /// A render core's wait for a present copy (`lcd::wait_rows`, not on CPU0).
 pub fn add_wait(ticks: u32) {
@@ -94,7 +136,11 @@ fn render_core(_cpu: usize) -> ! {
         // SAFETY: CPU0 stored a live context before BUSY (Release) and does
         // not touch it until DONE.
         let r = unsafe { &mut *CTX.load(Ordering::Relaxed) };
-        let job = if JOB.load(Ordering::Relaxed) == 0 { RenderJob::Dirty } else { RenderJob::All };
+        let job = match JOB.load(Ordering::Relaxed) {
+            0 => RenderJob::Dirty,
+            1 => RenderJob::All,
+            _ => RenderJob::Play,
+        };
         render::run_job(r, job);
         // What this core drew in cached memory reaches L2/DRAM for the
         // devices CPU0 drives next (layer copies, present cleans).
@@ -110,6 +156,11 @@ fn render_core(_cpu: usize) -> ! {
         STATE.store(DONE, Ordering::Release);
         // SAFETY: wakes CPU0 if it waits in `wait`.
         unsafe { core::arch::asm!("dsb", "sev", options(nostack, preserves_flags)) };
+        // And its UI task, if it sleeps in the executor (`job_done`; the
+        // executor's pender is a `sev` too).
+        if let Some(w) = critical_section::with(|cs| WAKER.borrow_ref_mut(cs).take()) {
+            w.wake();
+        }
     }
 }
 
@@ -123,7 +174,14 @@ pub fn render_start(r: Box<Ctx<P>>, job: RenderJob) -> Result<(), Box<Ctx<P>>> {
     mmu::clean_l1_all();
     START_CLEAN_TICKS.fetch_add(crate::perf::cycles().wrapping_sub(t0) as u64, Ordering::Relaxed);
     CTX.store(Box::into_raw(r), Ordering::Relaxed);
-    JOB.store(if job == RenderJob::Dirty { 0 } else { 1 }, Ordering::Relaxed);
+    JOB.store(
+        match job {
+            RenderJob::Dirty => 0,
+            RenderJob::All => 1,
+            RenderJob::Play => 2,
+        },
+        Ordering::Relaxed,
+    );
     STATE.store(BUSY, Ordering::Release);
     // SAFETY: wakes CPU2 from its `wfe`.
     unsafe { core::arch::asm!("dsb", "sev", options(nostack, preserves_flags)) };

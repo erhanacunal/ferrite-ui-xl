@@ -14,6 +14,37 @@ use crate::widget::{
     KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
 };
 
+/// The canvas the render draws on: the screen, or the frame being recorded
+/// (`MODE_PLAY`, `RenderState::frame`).
+macro_rules! screen {
+    ($ctx:expr, |$c:ident| $body:expr) => {
+        if $ctx.objs.render.frame.busy() {
+            let $c = &$ctx.objs.render.frame;
+            $body
+        } else {
+            let $c = &$ctx.lcd;
+            $body
+        }
+    };
+}
+
+/// Render modes (`ObjPool::set_render_mode`; experiments, with a render
+/// context). Normal: the render side holds the widgets (`view.rs`) and
+/// renders them, with the board's renderer, layers and pixel moves.
+pub const MODE_NORMAL: u8 = 0;
+/// As normal, but only the core's own CPU drawing: what `MODE_PLAY` draws,
+/// rendered the normal way (its baseline).
+pub const MODE_PLAIN: u8 = 1;
+/// The render side only plays commands: the VM's core runs the whole render
+/// (sync, tree walk, clipping, restores) with every drawing call recorded
+/// into one display list a frame (`RenderState::frame`), and hands that to
+/// the render side (`RenderJob::Play`), which needs nothing of the widgets.
+pub const MODE_PLAY: u8 = 2;
+
+/// Frames recorded for the render side to play (`MODE_PLAY`), their
+/// commands and their bytes, since boot.
+pub static PLAYS: [core::sync::atomic::AtomicU32; 3] = [const { core::sync::atomic::AtomicU32::new(0) }; 3];
+
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
 /// swapped in portrait mode (`LcdImpl::width`/`height`).
 #[inline]
@@ -206,7 +237,7 @@ fn redraw_behind_region<P: Platform>(
             && let Some(parts) = scrollbar_parts(&ctx.objs, id)
         {
             for (rect, color) in parts {
-                fill_clipped(&ctx.lcd, &rect, color, clip);
+                screen!(ctx, |c| fill_clipped(c, &rect, color, clip));
             }
         }
     }
@@ -223,6 +254,8 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
 /// A render the render side runs (`Platform::render_start`, `run_job`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderJob {
+    /// Play the frame recorded on the VM's core (`MODE_PLAY`): no render.
+    Play,
     /// `render_dirty`.
     Dirty,
     /// `render_all`.
@@ -236,6 +269,11 @@ pub enum RenderJob {
 /// lists on the screen after it.
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let ta = crate::perf::now();
+    if job == RenderJob::Play {
+        r.objs.render.frame.list().replay(&r.lcd);
+        JOB_TICKS[JOB_RENDER].fetch_add(crate::perf::now().wrapping_sub(ta) as u64, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     // What the VM side packed for this job (`submit`).
     r.objs.apply_pending();
     let t0 = crate::perf::now();
@@ -243,7 +281,7 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let mut later = alloc::vec::Vec::new();
     for d in draws {
         match d {
-            crate::view::Draw::Screen(list) => list.replay(&r.lcd),
+            crate::view::Draw::Screen(list) => screen!(r, |c| list.replay(c)),
             crate::view::Draw::Paint(id, list) => {
                 if capture_list(r, id, &list) {
                     keep_paint(r, id, list);
@@ -257,11 +295,12 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     match job {
         RenderJob::Dirty => render_dirty_view(r),
         RenderJob::All => render_all_view(r),
+        RenderJob::Play => {}
     }
     let t2 = crate::perf::now();
     for (id, list) in later {
         if r.objs.is_tree_visible(id) {
-            list.replay(&r.lcd);
+            screen!(r, |c| list.replay(c));
             r.objs.screen_touched();
         }
         keep_paint(r, id, list);
@@ -295,7 +334,7 @@ pub fn records<P: Platform>(ctx: &Ctx<P>) -> bool {
 /// `capture_paint` for a recorded `on_paint` list: replayed into the board
 /// renderer's capture with the scissor on the widget's box, if it takes it.
 fn capture_list<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: &crate::dl::List) -> bool {
-    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || !r.objs.is_tree_visible(id) {
+    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || r.objs.render.plain || !r.objs.is_tree_visible(id) {
         return false;
     }
     let abs = r.objs.absolute_rect(id);
@@ -360,7 +399,32 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
         return;
     };
     let t0 = crate::perf::now();
-    sync_render_ctx(ctx, &mut r, true);
+    let mode = ctx.objs.render.mode;
+    r.objs.render.plain = mode != MODE_NORMAL;
+    let job = if mode == MODE_PLAY {
+        // The whole render here, into a list: the render side plays it.
+        sync_render_ctx(ctx, &mut r, false);
+        r.objs.render.frame.begin(&r.lcd);
+        run_job(&mut r, job);
+        r.objs.render.frame.end();
+        ctx.objs.mirror_layers(&r.objs);
+        let (ops, bytes) = {
+            let list = r.objs.render.frame.list();
+            (list.ops.len(), list.used_bytes())
+        };
+        if ops == 0 {
+            ctx.render_ctx = Some(r);
+            return;
+        }
+        use core::sync::atomic::Ordering::Relaxed;
+        PLAYS[0].fetch_add(1, Relaxed);
+        PLAYS[1].fetch_add(ops as u32, Relaxed);
+        PLAYS[2].fetch_add(bytes as u32, Relaxed);
+        RenderJob::Play
+    } else {
+        sync_render_ctx(ctx, &mut r, true);
+        job
+    };
     match P::render_start(r, job) {
         Ok(()) => {
             crate::perf::add_sub(
@@ -564,7 +628,7 @@ fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
     let active = layers_sync(ctx);
 
     // A board that repaints whole areas (a GPU) takes the render over.
-    if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && compose_dirty(ctx, false) {
+    if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.plain && compose_dirty(ctx, false) {
         ctx.objs.geo_end();
         return;
     }
@@ -591,7 +655,7 @@ fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
     // With layers: the screen's part (their subtrees left out; a composed
     // layer's root is its surface). The windowed layers' surfaces are drawn
     // by the passes after.
-    if active != 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES {
+    if active != 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.plain {
         ctx.objs.layers.scope = base_scope(&ctx.objs);
         let taken = compose_dirty(ctx, true);
         ctx.objs.layers.scope = crate::layer::Scope::All;
@@ -678,7 +742,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
                     // the restore starts from transparent instead.
                     let erase = !ctx.objs.in_layer_pass();
                     if erase {
-                        erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
+                        screen!(ctx, |c| erase_widget_area(&ctx.objs, c, id, abs));
                     }
                     restore_behind(ctx, di, abs);
                     restores.push(di, abs);
@@ -891,7 +955,8 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
             a.union(&b)
         }
     };
-    let count = ctx.lcd.layer_count();
+    // Plain drawing: no layers (dropped ones go back to the tree below).
+    let count = if ctx.objs.render.plain { 0 } else { ctx.lcd.layer_count() };
     let can_compose = ctx.lcd.can_compose();
     let mut active = 0;
     let mut composed = 0u8;
@@ -1213,7 +1278,7 @@ const SHIFT_MAX: usize = crate::clip::MAX_CLIP_RECTS;
 #[inline(never)]
 fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Restores) {
     ctx.objs.render.shifted.clear();
-    if !settled || ctx.lcd.is_portrait() {
+    if !settled || ctx.lcd.is_portrait() || ctx.objs.render.plain {
         return;
     }
     let screen = screen_rect(&ctx.lcd);
@@ -1673,7 +1738,7 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
         crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
         return;
     }
-    if !P::Renderer::draw(ctx, id, abs, clip) {
+    if ctx.objs.render.plain || !P::Renderer::draw(ctx, id, abs, clip) {
         draw_body(ctx, id, abs, clip);
     }
     crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
@@ -1695,15 +1760,14 @@ pub fn draw_default<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &
 /// rect (`List::replay_clipped`). A look met for the first time is drawn
 /// directly (one drawn once, like an animation's frames, costs no recording).
 fn draw_body<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
-    if crate::dl::enabled() {
-        draw_cached(ctx, id, abs, clip);
+    screen!(ctx, |c| if crate::dl::enabled() {
+        draw_cached(ctx, c, id, abs, clip);
     } else {
-        draw_widget_body(ctx, &ctx.lcd, id, abs, clip);
-    }
+        draw_widget_body(ctx, c, id, abs, clip);
+    })
 }
 
-fn draw_cached<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
-    let lcd = &ctx.lcd;
+fn draw_cached<P: Platform, C: Canvas>(ctx: &Ctx<P>, lcd: &C, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     let state = &ctx.objs.render;
     let key = dl_key(ctx, id, abs);
     let start = lcd.scissor();
@@ -3484,7 +3548,7 @@ pub fn scrollbar_parts(objs: &ObjPool, id: WidgetId) -> Option<[(Rect, Color); 2
 fn draw_scrollbar<P: Platform>(ctx: &Ctx<P>, id: WidgetId, _abs: &Rect) {
     if let Some(parts) = scrollbar_parts(&ctx.objs, id) {
         for (rect, color) in parts {
-            fill_rect_screen(&ctx.lcd, rect, color);
+            screen!(ctx, |c| fill_rect_screen(c, rect, color));
         }
     }
 }
@@ -4579,7 +4643,7 @@ mod shift_tests {
         fn walk(ctx: &Ctx<Plat<false>>, id: WidgetId, clip: &ClipRegion, record: bool) {
             let abs = ctx.objs.absolute_rect(id);
             if CACHED.with(|c| c.get()) {
-                draw_cached(ctx, id, &abs, clip);
+                draw_cached(ctx, &ctx.lcd, id, &abs, clip);
             } else if record {
                 let rec = crate::dl::Recorder::new();
                 assert!(rec.begin(&ctx.lcd));

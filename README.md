@@ -15,7 +15,7 @@ The language reference is in ferrite-ui: [ferrite-lang.md](https://github.com/er
 | CPU | Samsung Exynos 4412 | 4× Cortex-A9 up to 1.4 GHz, MMU + L1/L2 caches. CPU0: VM and UI; CPU1: UART receive; CPU2: render jobs; CPU3: Wi-Fi |
 | GPU | Mali-400 MP4 | Composites the screen (widgets as triangles, glyph atlas, textures) and draws 3D models |
 | 2D | G2D | Present copies, picture copies, pixel moves, layer copies |
-| RAM | 1 GB | 512 MB heap, framebuffers, the RAM-backed flash image |
+| RAM | 1 GB | 960 MiB heap (the RAM-backed flash image, object pool, decoded images, layers, GPU textures), framebuffers |
 | Display | LTN101AL03 | 10.1" 1280×800 LVDS, FIMD XRGB8888; hardware windows for retained layers |
 | Touch | Atmel mXT1664S | Capacitive, I2C (the first finger is the pointer) |
 | Storage | 16 GB eMMC | CACHE partition (FAT32): firmware, the filesystem image, programs' files, the EEPROM file |

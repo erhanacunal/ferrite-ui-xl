@@ -188,7 +188,7 @@ impl ObjPool {
         }
         rec.end();
         let list = rec.list().compact();
-        if !list.ops.is_empty() {
+        if !list.is_empty() {
             self.render.draws.push(Draw::Screen(list));
         }
     }

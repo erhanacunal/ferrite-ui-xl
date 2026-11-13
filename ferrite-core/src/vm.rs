@@ -4276,7 +4276,7 @@ mod anim_tests {
         }
         assert!(ctx.render_away, "recorded, not waited for");
         assert!(ctx.objs.render.screen_rec.busy());
-        assert_eq!(ctx.objs.render.screen_rec.list().ops.len(), 2);
+        assert_eq!(ctx.objs.render.screen_rec.list().len(), 2);
         assert!(ctx.objs.needs_sync());
         crate::mock::finish_render();
         crate::render::render_dirty(&mut ctx);

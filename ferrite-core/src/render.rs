@@ -410,7 +410,7 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
         ctx.objs.mirror_layers(&r.objs);
         let (ops, bytes) = {
             let list = r.objs.render.frame.list();
-            (list.ops.len(), list.used_bytes())
+            (list.len(), list.used_bytes())
         };
         if ops == 0 {
             ctx.render_ctx = Some(r);
@@ -1855,7 +1855,7 @@ fn dl_dump_view<P: Platform>(
             Some(&key) => {
                 write!(out, "key {key:016x} ")?;
                 match cache.peek(key) {
-                    Some(l) => write!(out, "cached {} ops {} B", l.ops.len(), l.heap_bytes())?,
+                    Some(l) => write!(out, "cached {} ops {} B", l.len(), l.heap_bytes())?,
                     None if cache.was_seen(key) => write!(out, "seen")?,
                     None => write!(out, "evicted")?,
                 }
@@ -1865,7 +1865,7 @@ fn dl_dump_view<P: Platform>(
             }
         }
         if let Some(l) = ctx.objs.render.paints.borrow().get(&w) {
-            write!(out, "; on_paint {} ops", l.ops.len())?;
+            write!(out, "; on_paint {} ops", l.len())?;
         }
         writeln!(out)
     };
@@ -1940,8 +1940,8 @@ fn dl_verify<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, cached: &crate
             abs.h,
             abs.x,
             abs.y,
-            cached.ops.len(),
-            fresh.ops.len()
+            cached.len(),
+            fresh.len()
         );
     }
 }
@@ -4648,7 +4648,7 @@ mod shift_tests {
                 let rec = crate::dl::Recorder::new();
                 assert!(rec.begin(&ctx.lcd));
                 draw_widget_body(ctx, &rec, id, &abs, clip);
-                assert!(!rec.list().ops.is_empty() || id != ctx.objs.root);
+                assert!(!rec.list().is_empty() || id != ctx.objs.root);
                 rec.end_replay(&ctx.lcd);
             } else {
                 draw_widget_body(ctx, &ctx.lcd, id, &abs, clip);
@@ -4780,7 +4780,7 @@ mod shift_tests {
         assert!(rec.begin(&replayed.lcd));
         draw(&rec);
         rec.end();
-        assert!(rec.list().ops.iter().any(|op| matches!(op, crate::dl::Op::ThinArc { .. })));
+        assert!(rec.list().ops().any(|op| matches!(op, crate::dl::Op::ThinArc { .. })));
         rec.list().replay(&replayed.lcd);
         let (a, b) = (direct.lcd.backend().px.borrow(), replayed.lcd.backend().px.borrow());
         assert!(a.iter().filter(|&&p| p != 0).count() > 1000);

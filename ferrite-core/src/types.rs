@@ -7,8 +7,10 @@ pub const COLOR_RED: Color = 0xF800;
 pub const COLOR_GREEN: Color = 0x07E0;
 pub const COLOR_BLUE: Color = 0x001F;
 
-/// Pixel offset (relative to parent content area)
+/// Pixel offset (relative to parent content area). `repr(C)`: display lists
+/// (`dl.rs`) read their recorded points in place as `&[Offset]`.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[repr(C)]
 pub struct Offset {
     pub x: i16,
     pub y: i16,

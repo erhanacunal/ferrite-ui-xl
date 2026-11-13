@@ -45,8 +45,8 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 /// The render mode asked for (`POST /api/rcore?mode=0|1|2`:
 /// `render::MODE_NORMAL` / `MODE_PLAIN` / `MODE_PLAY`), applied by CPU0
-/// between passes ([`service`]).
-pub static MODE: AtomicU8 = AtomicU8::new(0);
+/// between passes ([`service`]). Play at boot.
+pub static MODE: AtomicU8 = AtomicU8::new(ferrite_core::render::MODE_PLAY);
 
 /// CPU0, `frame_end`: a render mode asked for over HTTP.
 pub fn service(ctx: &mut Ctx<P>) {

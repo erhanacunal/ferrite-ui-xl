@@ -68,7 +68,31 @@ pub trait TouchBackend {
     fn release_debounce(&self) -> u8 {
         RELEASE_DEBOUNCE
     }
+
+    /// Every finger down (multitouch panels): screen-space points with ids
+    /// that stay the same while a finger stays down (< 32). Returns how many
+    /// were written to `out`. Default: the single `read_screen` point, id 0.
+    fn read_points(&self, cal: &CalParams, out: &mut [TouchPoint]) -> usize {
+        match self.read_screen(cal) {
+            Some((x, y)) if !out.is_empty() => {
+                out[0] = TouchPoint { id: 0, x, y };
+                1
+            }
+            _ => 0,
+        }
+    }
 }
+
+/// One finger of a multitouch sample.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct TouchPoint {
+    pub id: u8,
+    pub x: u16,
+    pub y: u16,
+}
+
+/// Most fingers tracked at once.
+pub const MAX_POINTERS: usize = 10;
 
 /// Backend for boards without a touch screen: never pressed.
 pub struct NoTouch;
@@ -108,6 +132,24 @@ pub struct TouchEvent {
     pub y: u16,
 }
 
+/// A finger's event (`TouchImpl::poll_pointers`): Press = down, Hold = still
+/// down (every poll, moved or not), Release = up.
+#[derive(Clone, Copy, Debug)]
+pub struct PointerEvent {
+    pub kind: TouchEventKind,
+    pub id: u8,
+    pub x: u16,
+    pub y: u16,
+}
+
+#[derive(Clone, Copy)]
+struct Finger {
+    id: u8,
+    x: u16,
+    y: u16,
+    fails: u8,
+}
+
 pub struct TouchImpl<B: TouchBackend> {
     be: B,
     state: TouchState,
@@ -115,6 +157,8 @@ pub struct TouchImpl<B: TouchBackend> {
     last_x: u16,
     last_y: u16,
     pub cal: CalParams,
+    /// Fingers down (`poll_pointers`).
+    fingers: [Option<Finger>; MAX_POINTERS],
 }
 
 impl<B: TouchBackend> TouchImpl<B> {
@@ -126,12 +170,53 @@ impl<B: TouchBackend> TouchImpl<B> {
             last_x: 0,
             last_y: 0,
             cal: CalParams::default(),
+            fingers: [None; MAX_POINTERS],
         }
     }
 
     /// No touch is down or being released (nothing to track between polls).
     pub fn is_idle(&self) -> bool {
-        matches!(self.state, TouchState::Idle)
+        matches!(self.state, TouchState::Idle) && self.fingers.iter().all(|f| f.is_none())
+    }
+
+    /// Multitouch poll: one event per finger — Release for the ones gone
+    /// (after the backend's release debounce, at their last position), Hold
+    /// for the ones still down, then Press for the new ones. Don't mix with
+    /// [`poll`](Self::poll) on one `TouchImpl`.
+    pub fn poll_pointers(&mut self, mut f: impl FnMut(PointerEvent)) {
+        let any = self.fingers.iter().any(|f| f.is_some());
+        if !any && !self.be.is_active() {
+            return;
+        }
+        let mut pts = [TouchPoint::default(); MAX_POINTERS];
+        let n = self.be.read_points(&self.cal, &mut pts).min(MAX_POINTERS);
+        let pts = &pts[..n];
+        let debounce = self.be.release_debounce().max(1);
+        for slot in self.fingers.iter_mut() {
+            let Some(fg) = slot else { continue };
+            match pts.iter().find(|p| p.id == fg.id) {
+                Some(p) => {
+                    (fg.x, fg.y, fg.fails) = (p.x, p.y, 0);
+                    f(PointerEvent { kind: TouchEventKind::Hold, id: fg.id, x: fg.x, y: fg.y });
+                }
+                None => {
+                    fg.fails += 1;
+                    if fg.fails >= debounce {
+                        f(PointerEvent { kind: TouchEventKind::Release, id: fg.id, x: fg.x, y: fg.y });
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        for p in pts {
+            if self.fingers.iter().flatten().any(|fg| fg.id == p.id) {
+                continue;
+            }
+            if let Some(slot) = self.fingers.iter_mut().find(|s| s.is_none()) {
+                *slot = Some(Finger { id: p.id & 31, x: p.x, y: p.y, fails: 0 });
+                f(PointerEvent { kind: TouchEventKind::Press, id: p.id & 31, x: p.x, y: p.y });
+            }
+        }
     }
 
     pub fn poll(&mut self) -> Option<TouchEvent> {

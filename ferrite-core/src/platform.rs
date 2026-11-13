@@ -28,7 +28,7 @@ use crate::usart::UsartBackend;
 // (`P::CAPS & CAP_AUDIO != 0` folds to a constant). Alpha blending is NOT
 // here — it lives on `LcdBackend::HAS_ALPHA`, next to the blend methods.
 // Each bit must be mirrored in the board's `tools/devices/<id>.json`
-// (`caps.audio` / `caps.video` / `caps.jpeg` / `caps.multi_program` / `caps.superops` / `caps.native_flex`) so the designer and build tools agree
+// (`caps.audio` / `caps.video` / `caps.jpeg` / `caps.multi_program` / `caps.superops` / `caps.native_flex` / `caps.storage` / `caps.gestures`) so the designer and build tools agree
 // with the firmware.
 
 /// Board has a real audio output backend (`audio` feature, `Platform::AudioB`).
@@ -47,6 +47,9 @@ pub const CAP_NATIVE_FLEX: u32 = 1 << 5;
 /// Programs create, write and delete files and directories on the board's
 /// storage (`Platform::StorageB`, `storage.rs`; `caps.storage`).
 pub const CAP_STORAGE: u32 = 1 << 6;
+/// `onGesture` / `gestureInfo` (opcodes 0xE6..=0xE7, `gesture.rs`): Flutter-style
+/// gesture recognizers on widgets (`caps.gestures`).
+pub const CAP_GESTURES: u32 = 1 << 7;
 
 // `Sized`: `Renderer` is generic over the platform itself.
 pub trait Platform: Sized {

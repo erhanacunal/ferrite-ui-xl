@@ -205,7 +205,8 @@ fn arg_value(name: &str) -> Option<String> {
 
 /// `--storage <dir>` (read by `arg_value`): programs' files there, else in RAM.
 /// `--fsimage <path>`, any number of `--tap X,Y,MS` / `--swipe X0,Y0,X1,Y1,MS[,DUR]`
-/// (scripted presses),
+/// / `--pinch CX,CY,R0,R1,MS[,DUR[,DEG]]` (scripted presses; Ctrl + drag
+/// adds a second finger mirrored round the screen's centre),
 /// `--eeprom <path>` (file that keeps the virtual EEPROM across runs) and
 /// `--audio-out <path.wav>` (records the audio output).
 fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>, Option<String>) {
@@ -230,6 +231,7 @@ fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>, 
                         y1: y as u16,
                         at_ms,
                         dur_ms: platform::TAP_HOLD_MS,
+                        pinch: None,
                     }),
                     _ => eprintln!("ignoring --tap {spec:?}: expected X,Y,MS"),
                 }
@@ -252,6 +254,29 @@ fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>, 
                     y1: y1 as u16,
                     at_ms,
                     dur_ms,
+                    pinch: None,
+                });
+            }
+            "--pinch" => {
+                let spec = args.next().unwrap_or_default();
+                let parts: Vec<f32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                let (cx, cy, r0, r1, at, dur, deg) = match parts[..] {
+                    [cx, cy, r0, r1, at] => (cx, cy, r0, r1, at, 400.0, 0.0),
+                    [cx, cy, r0, r1, at, dur] => (cx, cy, r0, r1, at, dur, 0.0),
+                    [cx, cy, r0, r1, at, dur, deg] => (cx, cy, r0, r1, at, dur, deg),
+                    _ => {
+                        eprintln!("ignoring --pinch {spec:?}: expected CX,CY,R0,R1,MS[,DUR[,DEG]]");
+                        continue;
+                    }
+                };
+                taps.push(platform::ScriptedTap {
+                    x: 0,
+                    y: 0,
+                    x1: 0,
+                    y1: 0,
+                    at_ms: at as u32,
+                    dur_ms: dur as u32,
+                    pinch: Some(platform::Pinch { cx, cy, r0, r1, deg }),
                 });
             }
             _ => {}

@@ -77,7 +77,7 @@ pub const ALIGN_RIGHT: u8 = 2;
 // --- WidgetId ---
 
 /// Widget pointer (an `ObjPtr` naming a `T_WIDGET` object). NONE = no link.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct WidgetId(pub ObjPtr);
 
 impl WidgetId {
@@ -523,6 +523,7 @@ impl ObjPool {
         if let Some(r) = self.render.recs.get_mut(p as usize) {
             *r = RenderRec::EMPTY;
         }
+        self.gestures.forget(WidgetId(p));
         Some(WidgetId(p))
     }
 

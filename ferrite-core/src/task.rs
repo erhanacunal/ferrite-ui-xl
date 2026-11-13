@@ -188,6 +188,7 @@ impl ObjPool {
     /// array that a surviving widget still shows goes to that widget's owner
     /// instead, so the widget keeps it. The caller repaints.
     pub fn free_task(&mut self, task: u8) {
+        self.gestures.forget_task(task);
         let n = self.ptr_count() as ObjPtr;
         for p in 0..n {
             let w = WidgetId(p);

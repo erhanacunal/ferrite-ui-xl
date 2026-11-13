@@ -66,7 +66,8 @@ impl Platform for Exynos4412Platform {
         | ferrite_core::platform::CAP_MULTI_PROGRAM
         | ferrite_core::platform::CAP_SUPEROPS
         | ferrite_core::platform::CAP_NATIVE_FLEX
-        | ferrite_core::platform::CAP_STORAGE;
+        | ferrite_core::platform::CAP_STORAGE
+        | ferrite_core::platform::CAP_GESTURES;
 
     const ANIM_SLOTS: usize = 64;
     // Glyph bitmaps in RAM at font load: text drawing then needs no

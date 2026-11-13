@@ -28,7 +28,7 @@ use crate::pool::{ObjPool, T_ARRAY, T_FREE, T_STRING, T_WIDGET};
 use crate::syscfg::SysCfg;
 use crate::types::{COLOR_RED, Size};
 use crate::vm::{CodeAddr, FunctionKind, ProgramRef, Vm, VmState};
-use crate::{font, fs, heap, keyboard, protocol, render, widget};
+use crate::{font, fs, gesture, heap, keyboard, protocol, render, widget};
 
 use crate::protocol::{Protocol, RxEvent};
 use crate::widget::{WValue, WidgetId};
@@ -208,8 +208,9 @@ pub trait InputHandler<P: PlatformRuntime>: Sized {
     /// feedback.
     fn handle(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, touch: &mut TouchImpl<P::TouchB>);
 
-    /// Per-frame housekeeping unrelated to a touch event (cursor blink).
-    fn tick(&mut self, _ctx: &mut Ctx<P>) {}
+    /// Per-frame housekeeping unrelated to a touch event (cursor blink,
+    /// gesture timers, scroll flings).
+    fn tick(&mut self, _ctx: &mut Ctx<P>, _tasks: &mut Tasks) {}
 
     /// Nothing for `tick` to do on its own (no cursor blinking): the passes may
     /// stop until an event (`Runtime::idle_ms`).
@@ -573,7 +574,7 @@ impl<P: PlatformRuntime> Runtime<P> {
                 self.tasks.fg = self.ctx.tasks.fg;
             }
             self.input.handle(&mut self.ctx, &mut self.tasks, &mut self.touch);
-            self.input.tick(&mut self.ctx);
+            self.input.tick(&mut self.ctx, &mut self.tasks);
             self.close_fault_dialog_on_click();
         }
         lap!(INPUT);
@@ -1734,6 +1735,84 @@ pub fn scrollbar_set_position<P: Platform>(
     ctx.objs.mark_dirty(scroll_id);
 }
 
+/// Scroll container `id` to content offset `to` (clamped to its range);
+/// marks it dirty if that moved it. False if it was clamped (an edge) or the
+/// container can't scroll.
+fn scroll_to<P: Platform>(ctx: &mut Ctx<P>, id: WidgetId, to: i32) -> bool {
+    let cr = ctx.objs.content_rect(id);
+    let max = ctx.objs.content_height(id) as i32 - cr.h as i32;
+    if max <= 0 {
+        return false;
+    }
+    let v = to.clamp(0, max);
+    if v != ctx.objs.get(id).value as i32 {
+        ctx.objs.update_ext(id, |ext| ext.value = v as WValue);
+        ctx.objs.mark_dirty(id);
+    }
+    v == to
+}
+
+/// A scroll container whose content is taller than its viewport.
+fn scrollable(objs: &ObjPool, id: WidgetId) -> bool {
+    objs.get(id).flags & widget::FLAG_CLIP_CHILDREN != 0 && objs.content_height(id) > objs.content_rect(id).h
+}
+
+/// Where a touch at (x, y) starts: the topmost visible widget there that
+/// takes touches: clickable, with `onGesture` recognizers, or a scrollable
+/// container. Its ancestors complete the gesture path (`gesture_candidates`).
+pub fn gesture_start(objs: &mut ObjPool, x: u16, y: u16) -> WidgetId {
+    objs.ensure_dfs();
+    let mut result = WidgetId::NONE;
+    for i in 0..objs.dfs_len() {
+        let id = objs.dfs_at(i);
+        let w = objs.get(id);
+        let maybe = w.flags & (widget::FLAG_CLICKABLE | widget::FLAG_CLIP_CHILDREN) != 0
+            || (!objs.gestures.is_empty() && objs.gestures.get(id).is_some());
+        if !maybe || !objs.is_tree_visible(id) {
+            continue;
+        }
+        let abs = objs.absolute_rect(id);
+        if !abs.contains(x, y) {
+            continue;
+        }
+        let sp = objs.scroll_parent(id);
+        if sp.is_some() && !objs.scroll_viewport(sp).contains(x, y) {
+            continue;
+        }
+        let takes = w.flags & widget::FLAG_CLICKABLE != 0 || objs.gestures.get(id).is_some() || scrollable(objs, id);
+        if takes {
+            result = id;
+        }
+    }
+    result
+}
+
+/// The recognizers a touch starting on `start` may start, deepest widget
+/// first: each widget's `onGesture` set (its tap merged with the click when
+/// it is `hit`), and a drag-to-scroll per scrollable container. Below
+/// `caught` (a container whose fling the touch stopped) nothing.
+pub fn gesture_candidates(objs: &ObjPool, start: WidgetId, hit: WidgetId, caught: WidgetId, out: &mut Vec<gesture::Candidate>) {
+    let mut w = start;
+    let mut skipping = caught.is_some();
+    let mut guard = 0;
+    while w.is_some() && guard < 256 {
+        guard += 1;
+        if skipping && w == caught {
+            skipping = false;
+        }
+        if !skipping {
+            let abs = objs.absolute_rect(w);
+            let origin = (abs.x as i32, abs.y as i32);
+            let mask = objs.gestures.get(w).map_or(0, |r| r.mask);
+            gesture::push_candidates(out, w, origin, mask, w == hit);
+            if scrollable(objs, w) {
+                out.push(gesture::Candidate { widget: w, kind: gesture::Kind::Scroll, origin });
+            }
+        }
+        w = objs.get(w).parent;
+    }
+}
+
 // ============================================================================
 //  BasicInput — minimal press → on_click (epaper buttons)
 // ============================================================================
@@ -1803,7 +1882,32 @@ pub struct FullInput {
     /// The long-press check ran for this contact (it runs once).
     long_press_checked: bool,
     long_press_fired: bool,
+    /// Gesture recognizers and arenas (`gesture.rs`): every finger.
+    gestures: gesture::Engine,
+    /// The finger the built-in handling follows (keyboard, scrollbar,
+    /// sliders, press highlight, on_touch_*, swipe, long press): the first
+    /// one down, until it lifts. Others only reach the gesture engine.
+    primary: Option<u8>,
+    /// Fingers down (bit = id) and where the engine last saw each.
+    down: u32,
+    last_pos: [(i32, i32); 32],
+    /// Scroll containers coasting after a drag-to-scroll.
+    flings: Vec<Fling>,
 }
+
+/// A scroll container coasting: `v` px/s of content offset, decaying.
+struct Fling {
+    id: WidgetId,
+    v: f32,
+    /// Exact offset (the widget holds it rounded).
+    pos: f32,
+    ms: u32,
+}
+
+/// Fling decay time constant: the velocity falls to 1/e in this many ms.
+const FLING_TAU_MS: f32 = 330.0;
+/// A fling stops below this speed (px/s).
+const FLING_MIN_V: f32 = 20.0;
 
 impl<P: PlatformRuntime> InputHandler<P> for FullInput {
     fn new() -> Self {
@@ -1816,31 +1920,45 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
             press_ms: 0,
             long_press_checked: false,
             long_press_fired: false,
+            gestures: gesture::Engine::new(),
+            primary: None,
+            down: 0,
+            last_pos: [(0, 0); 32],
+            flings: Vec::new(),
         }
     }
 
     #[inline(never)]
     fn handle(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, touch: &mut TouchImpl<P::TouchB>) {
-        let mut event = match touch.poll() {
-            Some(e) => e,
-            None => return,
-        };
-        (event.x, event.y) = ctx.lcd.touch_to_logical(event.x, event.y);
-        match event.kind {
-            TouchEventKind::Press => self.on_press(ctx, tasks, event.x, event.y),
-            TouchEventKind::Hold => self.on_hold(ctx, tasks, event.x, event.y),
-            TouchEventKind::Release => self.on_release(ctx, tasks, event.x, event.y),
+        let mut events = [None; crate::touch::MAX_POINTERS * 2];
+        let mut n = 0;
+        touch.poll_pointers(|e| {
+            if n < events.len() {
+                events[n] = Some(e);
+                n += 1;
+            }
+        });
+        for e in events.into_iter().take(n).flatten() {
+            let (x, y) = ctx.lcd.touch_to_logical(e.x, e.y);
+            self.pointer(ctx, tasks, e.kind, e.id, x, y);
         }
     }
 
     #[inline(never)]
-    fn tick(&mut self, ctx: &mut Ctx<P>) {
+    fn tick(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks) {
+        let now = ctx.systick.millis();
         if self.kb.visible && self.kb.focused.is_some() {
-            let now = ctx.systick.millis();
             if self.kb.update_blink(now) {
                 ctx.cursor_visible = self.kb.cursor_visible;
                 ctx.objs.mark_dirty(self.kb.focused);
             }
+        }
+        if !self.gestures.idle() {
+            self.gestures.tick(now);
+            self.apply_gestures(ctx, tasks);
+        }
+        if !self.flings.is_empty() {
+            self.step_flings(ctx, now);
         }
     }
 
@@ -1865,10 +1983,15 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
         self.scroll_id = WidgetId::NONE;
         self.scroll_active = false;
         ctx.cursor_visible = false;
+        // Fingers still down stay unknown until they lift.
+        self.gestures.reset();
+        self.primary = None;
+        self.down = 0;
+        self.flings.clear();
     }
 
     fn idle(&self) -> bool {
-        !self.kb.visible
+        !self.kb.visible && self.gestures.idle() && self.flings.is_empty()
     }
 
     fn forget_dead(&mut self, ctx: &mut Ctx<P>) {
@@ -1879,21 +2002,217 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
             self.scroll_id = WidgetId::NONE;
             self.scroll_active = false;
         }
+        self.gestures.forget(|w| !ctx.objs.is_live(w));
+        self.flings.retain(|f| ctx.objs.is_live(f.id));
     }
 }
 
 impl FullInput {
-    fn on_press<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16) {
+    /// One finger's event: the gesture engine gets every finger; the built-in
+    /// handling only the primary one.
+    fn pointer<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, kind: TouchEventKind, id: u8, x: u16, y: u16) {
+        let ms = ctx.systick.millis();
+        let id = id & 31;
+        let (xi, yi) = (x as i32, y as i32);
+        let ptr = |kind| gesture::Ptr { kind, id, x: xi, y: yi, ms };
+        match kind {
+            TouchEventKind::Press => {
+                let is_primary = self.primary.is_none() && self.down == 0;
+                self.down |= 1 << id;
+                self.last_pos[id as usize] = (xi, yi);
+                let caught = self.catch_fling(ctx, x, y);
+                let start = gesture_start(&mut ctx.objs, x, y);
+                let clickable = start.is_some() && ctx.objs.get(start).flags & widget::FLAG_CLICKABLE != 0;
+                let mut hit = if clickable && caught.is_none() { start } else { WidgetId::NONE };
+                let mut claimed = false;
+                if is_primary {
+                    self.primary = Some(id);
+                    claimed = self.on_press(ctx, tasks, x, y, start, hit);
+                } else if hit.is_some() && matches!(ctx.objs.get(hit).kind, widget::KIND_SLIDER | widget::KIND_INPUT) {
+                    hit = WidgetId::NONE;
+                }
+                let mut cands = Vec::new();
+                if !claimed {
+                    gesture_candidates(&ctx.objs, start, hit, caught, &mut cands);
+                }
+                self.gestures.pointer(ptr(gesture::PKind::Down), &cands);
+            }
+            TouchEventKind::Hold => {
+                if self.down & (1 << id) != 0 && self.last_pos[id as usize] != (xi, yi) {
+                    self.last_pos[id as usize] = (xi, yi);
+                    self.gestures.pointer(ptr(gesture::PKind::Move), &[]);
+                }
+                if self.primary == Some(id) {
+                    self.on_hold(ctx, tasks, x, y);
+                }
+            }
+            TouchEventKind::Release => {
+                let was_down = self.down & (1 << id) != 0;
+                self.down &= !(1 << id);
+                if self.primary == Some(id) {
+                    self.primary = None;
+                    if let Some(swipe) = self.on_release(ctx, tasks, x, y) {
+                        if was_down {
+                            self.gestures.pointer(ptr(gesture::PKind::Up), &[]);
+                        }
+                        self.apply_gestures(ctx, tasks);
+                        self.release_end(ctx, tasks, swipe);
+                        return;
+                    }
+                }
+                if was_down {
+                    self.gestures.pointer(ptr(gesture::PKind::Up), &[]);
+                }
+            }
+        }
+        self.apply_gestures(ctx, tasks);
+    }
+
+    /// Act on what the gesture engine decided.
+    fn apply_gestures<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks) {
+        for out in self.gestures.take() {
+            match out {
+                gesture::Out::Event { widget, ev, d } => {
+                    let Some(reg) = ctx.objs.gestures.get(widget) else { continue };
+                    if reg.mask & d[gesture::field::KIND] as u16 == 0 || !ctx.objs.is_live(widget) {
+                        continue;
+                    }
+                    if let Some(vm) = tasks.get(reg.task) {
+                        vm.enqueue_gesture(reg.func, widget, ev, &d);
+                    }
+                }
+                gesture::Out::Click { widget, x, y } => {
+                    if ctx.objs.is_live(widget) {
+                        self.click(ctx, tasks, widget, x.clamp(0, u16::MAX as i32) as u16, y.clamp(0, u16::MAX as i32) as u16);
+                    }
+                }
+                gesture::Out::ClickCancel { widget } => {
+                    if ctx.objs.is_live(widget) && ctx.objs.get(widget).flags & widget::FLAG_PRESSED != 0 {
+                        ctx.objs.get_mut(widget).flags &= !widget::FLAG_PRESSED;
+                        if press_shows(&ctx.objs, widget) {
+                            ctx.objs.mark_dirty(widget);
+                        }
+                    }
+                }
+                gesture::Out::Scroll { widget, dy } => {
+                    if ctx.objs.is_live(widget) {
+                        let cur = ctx.objs.get(widget).value as i32;
+                        scroll_to(ctx, widget, cur - dy);
+                    }
+                }
+                gesture::Out::Fling { widget, vy } => {
+                    if vy.abs() > FLING_MIN_V && ctx.objs.is_live(widget) {
+                        self.flings.retain(|f| f.id != widget);
+                        let pos = ctx.objs.get(widget).value as f32;
+                        self.flings.push(Fling { id: widget, v: -vy, pos, ms: ctx.systick.millis() });
+                    }
+                }
+            }
+        }
+    }
+
+    /// A finger down on a coasting scroll container stops it, and the
+    /// container keeps that finger from its children (Flutter's scrollables
+    /// ignore pointers while flinging): returns it.
+    fn catch_fling<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, x: u16, y: u16) -> WidgetId {
+        let mut caught = WidgetId::NONE;
+        self.flings.retain(|f| {
+            let r = ctx.objs.scroll_viewport(f.id);
+            if r.contains(x, y) {
+                caught = f.id;
+                false
+            } else {
+                true
+            }
+        });
+        caught
+    }
+
+    /// Coast the flinging scroll containers: the velocity decays
+    /// exponentially; a fling ends at an edge or below `FLING_MIN_V`.
+    fn step_flings<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, now: u32) {
+        let mut i = 0;
+        while i < self.flings.len() {
+            let f = &mut self.flings[i];
+            let dt = now.wrapping_sub(f.ms).min(100) as f32;
+            f.ms = now;
+            let k = libm::expf(-dt / FLING_TAU_MS);
+            f.pos += f.v * (FLING_TAU_MS / 1000.0) * (1.0 - k);
+            f.v *= k;
+            let (id, target, slow) = (f.id, f.pos, f.v.abs() < FLING_MIN_V);
+            let free = ctx.objs.is_live(id) && scroll_to(ctx, id, libm::roundf(target) as i32);
+            if slow || !free {
+                self.flings.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// `widget` was tapped (the gesture arena gave the tap to its click):
+    /// the built-in actions (dropdown, checkbox, radio / button group, input
+    /// cursor), then on_click and on_tap.
+    fn click<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, id: WidgetId, x: u16, y: u16) {
+        let mut clicked_id = id;
+        // Dropdown handling.
+        let dropdown = dropdown_parent(ctx, clicked_id);
+        if dropdown.is_some() {
+            select_dropdown_option(ctx, dropdown, clicked_id);
+            clicked_id = dropdown;
+        } else if ctx.objs.get(clicked_id).kind == widget::KIND_DROPDOWN {
+            toggle_dropdown(ctx, clicked_id);
+            clicked_id = WidgetId::NONE;
+        }
+
+        // Checkbox toggle.
+        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_CHECKBOX {
+            ctx.objs.get_mut(clicked_id).flags ^= widget::FLAG_CHECKED;
+            ctx.objs.mark_dirty(clicked_id);
+        }
+
+        // Radio / button group: select this one, deselect the rest of its
+        // group (radio group_id 0 = sibling radios).
+        if clicked_id.is_some()
+            && matches!(ctx.objs.get(clicked_id).kind, widget::KIND_RADIO | widget::KIND_BUTTON_GROUP)
+        {
+            ctx.objs.select_in_group(clicked_id);
+        }
+
+        // Input: reposition cursor on tap.
+        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_INPUT {
+            self.position_cursor(ctx, clicked_id, x, y);
+            ctx.objs.mark_dirty(clicked_id);
+        }
+
+        render::render_dirty(ctx);
+
+        // on_click (modal overlay func id first, else the click dispatcher).
+        if clicked_id.is_some() && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
+            tasks.widget_click(&ctx.objs, clicked_id);
+        }
+
+        // on_tap (skip KIND_INPUT).
+        if clicked_id.is_some()
+            && ctx.objs.get(clicked_id).kind != widget::KIND_INPUT
+            && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_TAP != 0
+        {
+            let packed = ((x as u32) << 16 | y as u32) as i32;
+            tasks.widget_event(&ctx.objs, clicked_id, FunctionKind::OnTap, &[clicked_id.0 as i32, packed]);
+        }
+    }
+
+    /// The primary finger went down on `start` (the topmost widget that
+    /// takes touches, `gesture_start`); `hit` is it if clickable. True if
+    /// the touch is claimed (keyboard, scrollbar, slider): no gestures.
+    fn on_press<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16, start: WidgetId, hit: WidgetId) -> bool {
         // Keyboard intercept.
         if self.kb.visible && y >= self.kb.top() {
             self.kb.handle_press(x, y);
             render::wait_idle(ctx);
             self.kb
                 .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, self.kb.pressed_key, true);
-            return;
+            return true;
         }
-
-        let hit = crate::touch::hit_test(&mut ctx.objs, x, y);
 
         // Dismiss keyboard when tapping outside an input.
         if self.kb.visible && (!hit.is_some() || ctx.objs.get(hit).kind != widget::KIND_INPUT) {
@@ -1909,12 +2228,12 @@ impl FullInput {
         self.long_press_fired = false;
 
         // Scrollbar hit-test.
-        let scroll_target = if hit.is_some() {
-            let w = ctx.objs.get(hit);
+        let scroll_target = if start.is_some() {
+            let w = ctx.objs.get(start);
             if w.flags & widget::FLAG_CLIP_CHILDREN != 0 {
-                hit
+                start
             } else {
-                ctx.objs.scroll_parent(hit)
+                ctx.objs.scroll_parent(start)
             }
         } else {
             WidgetId::NONE
@@ -1934,7 +2253,8 @@ impl FullInput {
             }
         }
 
-        if hit.is_some() {
+        let mut claimed = self.scroll_active;
+        if hit.is_some() && !claimed {
             ctx.objs.get_mut(hit).flags |= widget::FLAG_PRESSED;
 
             if ctx.objs.get(hit).kind == widget::KIND_INPUT {
@@ -1943,6 +2263,7 @@ impl FullInput {
             }
 
             if ctx.objs.get(hit).kind == widget::KIND_SLIDER {
+                claimed = true;
                 let abs = ctx.objs.absolute_rect(hit);
                 let new_val = touch_to_slider_value(&abs, x);
                 ctx.objs.update_ext(hit, |ext| {
@@ -1964,6 +2285,7 @@ impl FullInput {
         }
 
         tasks.global_event(FunctionKind::OnTouchDown, &[x as i32, y as i32]);
+        claimed
     }
 
     fn on_hold<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16) {
@@ -2022,7 +2344,11 @@ impl FullInput {
         tasks.global_event(FunctionKind::OnTouchMove, &[x as i32, y as i32]);
     }
 
-    fn on_release<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16) {
+    /// The primary finger lifted: the keyboard's key, or the end of the
+    /// built-in press (highlights cleared, scrollbar drag over, swipe
+    /// measured). None = the keyboard took it; else the swipe to report
+    /// (`release_end`, after the gesture engine has seen the finger lift).
+    fn on_release<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16) -> Option<Option<(i32, WidgetId, i32)>> {
         // Keyboard key release.
         if self.kb.pressed_key != keyboard::KEY_NONE {
             let prev_key = self.kb.pressed_key;
@@ -2034,7 +2360,7 @@ impl FullInput {
                 self.kb
                     .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
             }
-            return;
+            return None;
         }
 
         let was_scrolling = self.scroll_active;
@@ -2046,7 +2372,6 @@ impl FullInput {
         let is_swipe =
             !self.long_press_fired && !was_scrolling && dx * dx + dy * dy > SWIPE_MIN_DIST_SQ;
 
-        let mut clicked_id = WidgetId::NONE;
         let mut swipe_widget_id = WidgetId::NONE;
 
         ctx.objs.ensure_dfs();
@@ -2054,12 +2379,6 @@ impl FullInput {
             let id = ctx.objs.dfs_at(i);
             if ctx.objs.get(id).flags & widget::FLAG_PRESSED != 0 {
                 ctx.objs.get_mut(id).flags &= !widget::FLAG_PRESSED;
-                if !was_scrolling && !is_swipe {
-                    let abs = ctx.objs.absolute_rect(id);
-                    if abs.contains(x, y) {
-                        clicked_id = id;
-                    }
-                }
                 if is_swipe {
                     swipe_widget_id = id;
                 }
@@ -2069,69 +2388,32 @@ impl FullInput {
             }
         }
 
-        // Dropdown handling.
-        let dropdown = dropdown_parent(ctx, clicked_id);
-        if dropdown.is_some() {
-            select_dropdown_option(ctx, dropdown, clicked_id);
-            clicked_id = dropdown;
-        } else if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_DROPDOWN {
-            toggle_dropdown(ctx, clicked_id);
-            clicked_id = WidgetId::NONE;
+        if !is_swipe {
+            return Some(None);
         }
-
-        // Checkbox toggle.
-        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_CHECKBOX {
-            ctx.objs.get_mut(clicked_id).flags ^= widget::FLAG_CHECKED;
-            ctx.objs.mark_dirty(clicked_id);
+        let abs_dx = dx.abs();
+        let abs_dy = dy.abs();
+        let direction: i32 = if abs_dx >= SWIPE_AXIS_RATIO * abs_dy {
+            if dx < 0 { 0 } else { 1 }
+        } else if abs_dy >= SWIPE_AXIS_RATIO * abs_dx {
+            if dy < 0 { 2 } else { 3 }
+        } else {
+            -1
+        };
+        if direction < 0 {
+            return Some(None);
         }
+        let dominant = if direction <= 1 { dx } else { dy };
+        Some(Some((direction, swipe_widget_id, dominant)))
+    }
 
-        // Radio / button group: select this one, deselect the rest of its
-        // group (radio group_id 0 = sibling radios).
-        if clicked_id.is_some()
-            && matches!(ctx.objs.get(clicked_id).kind, widget::KIND_RADIO | widget::KIND_BUTTON_GROUP)
-        {
-            ctx.objs.select_in_group(clicked_id);
-        }
-
-        // Input: reposition cursor on tap.
-        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_INPUT {
-            self.position_cursor(ctx, clicked_id, x, y);
-            ctx.objs.mark_dirty(clicked_id);
-        }
-
+    /// After the gesture engine's clicks: render, OnSwipe, OnTouchUp.
+    fn release_end<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, swipe: Option<(i32, WidgetId, i32)>) {
         render::render_dirty(ctx);
-
-        // OnSwipe — mutually exclusive with on_click.
-        if is_swipe {
-            let abs_dx = dx.abs();
-            let abs_dy = dy.abs();
-            let direction: i32 = if abs_dx >= SWIPE_AXIS_RATIO * abs_dy {
-                if dx < 0 { 0 } else { 1 }
-            } else if abs_dy >= SWIPE_AXIS_RATIO * abs_dx {
-                if dy < 0 { 2 } else { 3 }
-            } else {
-                -1
-            };
-            if direction >= 0 {
-                let dominant = if direction <= 1 { dx } else { dy };
-                tasks.global_event(FunctionKind::OnSwipe, &[direction, swipe_widget_id.0 as i32, dominant]);
-            }
+        // OnSwipe: a swipe moved past the tap slop, so it never clicks.
+        if let Some((direction, widget, dominant)) = swipe {
+            tasks.global_event(FunctionKind::OnSwipe, &[direction, widget.0 as i32, dominant]);
         }
-
-        // on_click (modal overlay func id first, else the click dispatcher).
-        if clicked_id.is_some() && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
-            tasks.widget_click(&ctx.objs, clicked_id);
-        }
-
-        // on_tap (skip KIND_INPUT).
-        if clicked_id.is_some()
-            && ctx.objs.get(clicked_id).kind != widget::KIND_INPUT
-            && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_TAP != 0
-        {
-            let packed = ((x as u32) << 16 | y as u32) as i32;
-            tasks.widget_event(&ctx.objs, clicked_id, FunctionKind::OnTap, &[clicked_id.0 as i32, packed]);
-        }
-
         tasks.global_event(FunctionKind::OnTouchUp, &[]);
     }
 
@@ -2905,5 +3187,148 @@ mod multi_tests {
         assert_eq!(rt.tasks.main.program.name(), b"solo");
         assert!(!rt.ctx.tasks.alive(1) && rt.tasks.get(1).is_none());
         assert!(widgets_of(&rt, 1).is_empty());
+    }
+
+    // --- Gestures through the input handler (FullInput + gesture.rs) ---
+
+    const PUSH_I16: u8 = 0x31;
+    const ON_GESTURE: u8 = 0xE6;
+    const GESTURE_INFO: u8 = 0xE7;
+
+    fn i16(v: i16) -> [u8; 3] {
+        let b = v.to_le_bytes();
+        [PUSH_I16, b[0], b[1]]
+    }
+
+    /// Size the targeted widget (w, h).
+    fn sized(w: i16, h: i16) -> Vec<u8> {
+        cat(&[&i16(w), &[W_SET, PROP_SIZE_W], &i16(h), &[W_SET, PROP_SIZE_H]])
+    }
+
+    /// One pass with these fingers down at `ms`.
+    fn touch(rt: &mut Runtime<MockPlatform>, ms: u32, fingers: &[(u8, u16, u16)]) {
+        crate::mock::set_millis(ms);
+        crate::mock::set_touch(fingers);
+        rt.step();
+    }
+
+    /// main: widget 0 = a result register (0×0, out of the way); widget 1 =
+    /// a 200×100 scroll container at (0, 0); widget 2 = a clickable 200×300
+    /// row inside it whose on_click sets the register's height to 77.
+    fn list_program() -> Vec<u8> {
+        use crate::proto::{PROP_CLICKABLE, PROP_CLIP_CHILDREN};
+        let setup = cat(&[
+            NEW_WIDGET,
+            &[W_ALLOC, DUP, STORE, 1, W_TARGET_S, PUSH_0, W_PARENT_S],
+            &sized(200, 100),
+            &[PUSH_1, W_SET, PROP_CLIP_CHILDREN],
+            &[W_ALLOC, DUP, STORE, 2, W_TARGET_S, LOAD, 1, W_PARENT_S],
+            &sized(200, 300),
+            &[PUSH_1, W_SET, PROP_CLICKABLE, PUSH_1, W_SET, PROP_ON_CLICK, PUSH_0, RET],
+        ]);
+        let on_click = cat(&[MY_WIDGET, &[POP, PUSH_I8, 77, W_SET, PROP_SIZE_H, RET]]);
+        prog(&[(LOOP, IDLE.to_vec()), (SETUP, setup), (ON_CLICK, on_click)])
+    }
+
+    fn list(rt: &Runtime<MockPlatform>) -> (WidgetId, WidgetId, WidgetId) {
+        let w = widgets_of(rt, 0);
+        let objs = &rt.ctx.objs;
+        let reg = *w.iter().find(|&&x| objs.get(x).size.w == 0).unwrap();
+        let cont = *w.iter().find(|&&x| objs.get(x).size.h == 100).unwrap();
+        let row = *w.iter().find(|&&x| objs.get(x).size.h == 300).unwrap();
+        (reg, cont, row)
+    }
+
+    #[test]
+    fn a_tap_on_a_row_of_a_scroll_container_clicks_it() {
+        let mut rt = boot(&[(b"main", list_program())]);
+        let (reg, cont, row) = list(&rt);
+        touch(&mut rt, 1000, &[(0, 50, 50)]);
+        assert!(rt.ctx.objs.get(row).flags & widget::FLAG_PRESSED != 0, "pressed at once");
+        touch(&mut rt, 1016, &[(0, 52, 51)]);
+        touch(&mut rt, 1032, &[]);
+        rt.step();
+        assert_eq!(size(&rt, reg).1, 77, "on_click ran");
+        assert_eq!(rt.ctx.objs.get(cont).value, 0, "not scrolled");
+        assert!(InputHandler::<MockPlatform>::idle(&rt.input));
+    }
+
+    #[test]
+    fn dragging_a_scroll_container_scrolls_it_flings_and_cancels_the_click() {
+        let mut rt = boot(&[(b"main", list_program())]);
+        let (reg, cont, row) = list(&rt);
+        touch(&mut rt, 1000, &[(0, 50, 90)]);
+        let mut y = 90;
+        for i in 1..=4 {
+            y -= 20;
+            touch(&mut rt, 1000 + i * 16, &[(0, 50, y)]);
+        }
+        // The first 20 px won the drag (slop 18); the next three moved it.
+        assert_eq!(rt.ctx.objs.get(cont).value, 60);
+        assert!(rt.ctx.objs.get(row).flags & widget::FLAG_PRESSED == 0, "the row lost the press");
+        touch(&mut rt, 1080, &[]);
+        let at_release = rt.ctx.objs.get(cont).value;
+        assert!(!InputHandler::<MockPlatform>::idle(&rt.input), "flinging");
+        for i in 1..=200 {
+            touch(&mut rt, 1080 + i * 16, &[]);
+        }
+        let v = rt.ctx.objs.get(cont).value;
+        assert!(v > at_release && v <= 200, "coasted from {at_release} to {v}");
+        assert!(InputHandler::<MockPlatform>::idle(&rt.input), "the fling ended");
+        assert_ne!(size(&rt, reg).1, 77, "no click");
+    }
+
+    /// main: widget 0 = the register; widget 1 = a 100×100 box at (0, 0)
+    /// with `onGesture(box, mask, @handler)`, the handler setting the
+    /// register to (event, gestureInfo(field)).
+    fn gesture_program(mask: u8, field: u8) -> Vec<u8> {
+        let setup = cat(&[
+            NEW_WIDGET,
+            &[W_ALLOC, DUP, STORE, 1, W_TARGET_S, PUSH_0, W_PARENT_S],
+            &sized(100, 100),
+            &[LOAD, 1, PUSH_I8, mask, PUSH_I8, 2, ON_GESTURE, PUSH_0, RET],
+        ]);
+        // fn handler(widget, event): stack [widget, event].
+        let handler = cat(&[MY_WIDGET, &[W_SET, PROP_SIZE_W, POP, PUSH_I8, field, GESTURE_INFO, W_SET, PROP_SIZE_H, RET]]);
+        prog(&[(LOOP, IDLE.to_vec()), (SETUP, setup), (FunctionKind::UserFunction as u8, handler)])
+    }
+
+    #[test]
+    fn on_gesture_handlers_get_their_events_with_details() {
+        use crate::gesture::{G_PAN, G_TAP, ev, field};
+        let mut rt = boot(&[(b"main", gesture_program((G_TAP | G_PAN) as u8, field::X as u8))]);
+        let reg = widgets_of(&rt, 0).into_iter().find(|&w| rt.ctx.objs.get(w).size.w == 0).unwrap();
+        // A tap: TAP last, at x 30.
+        touch(&mut rt, 1000, &[(0, 30, 40)]);
+        touch(&mut rt, 1050, &[]);
+        rt.step();
+        assert_eq!(size(&rt, reg), (ev::TAP as u16, 30));
+        // A pan: past the pan slop (36) the tap gives up; DRAG_END last.
+        touch(&mut rt, 2000, &[(0, 20, 40)]);
+        touch(&mut rt, 2016, &[(0, 45, 40)]);
+        touch(&mut rt, 2032, &[(0, 70, 40)]);
+        touch(&mut rt, 2048, &[(0, 85, 40)]);
+        touch(&mut rt, 2064, &[]);
+        rt.step();
+        assert_eq!(size(&rt, reg), (ev::DRAG_END as u16, 85));
+    }
+
+    #[test]
+    fn two_fingers_scale_a_widget() {
+        use crate::gesture::{G_SCALE, ev, field};
+        let mut rt = boot(&[(b"main", gesture_program(G_SCALE as u8, field::SCALE as u8))]);
+        let reg = widgets_of(&rt, 0).into_iter().find(|&w| rt.ctx.objs.get(w).size.w == 0).unwrap();
+        touch(&mut rt, 1000, &[(0, 40, 50)]);
+        touch(&mut rt, 1016, &[(0, 40, 50), (3, 60, 50)]);
+        // Spread from 20 to 80 apart: scale 4.0 against the two-finger start.
+        for (i, d) in [(1u32, 20u16), (2, 30), (3, 40)] {
+            touch(&mut rt, 1016 + i * 16, &[(0, 50 - d, 50), (3, 50 + d, 50)]);
+            rt.step();
+        }
+        assert_eq!(size(&rt, reg), (ev::SCALE_UPDATE as u16, 4000));
+        touch(&mut rt, 1100, &[]);
+        rt.step();
+        assert_eq!(size(&rt, reg).0, ev::SCALE_END as u16);
+        assert!(InputHandler::<MockPlatform>::idle(&rt.input));
     }
 }

@@ -42,7 +42,7 @@ impl Platform for SimPlatform {
 
     // Software JPEG decoder (sim/src/jpeg.rs) + silent real-time audio
     // output (sim/src/audio.rs).
-    const CAPS: u32 = CAP_AUDIO | CAP_JPEG | ferrite_core::platform::CAP_MULTI_PROGRAM | ferrite_core::platform::CAP_SUPEROPS | ferrite_core::platform::CAP_NATIVE_FLEX | ferrite_core::platform::CAP_STORAGE;
+    const CAPS: u32 = CAP_AUDIO | CAP_JPEG | ferrite_core::platform::CAP_MULTI_PROGRAM | ferrite_core::platform::CAP_SUPEROPS | ferrite_core::platform::CAP_NATIVE_FLEX | ferrite_core::platform::CAP_STORAGE | ferrite_core::platform::CAP_GESTURES;
     // The tablet demo animates more widgets at once (exynos4412 has 64).
     const ANIM_SLOTS: usize = 64;
 
@@ -126,9 +126,12 @@ fn write_bmp(path: &std::path::Path, px: &[u32], w: usize, h: usize) -> std::io:
 
 /// A scripted press: `--tap X,Y,MS` holds (x, y) for `TAP_HOLD_MS`;
 /// `--swipe X0,Y0,X1,Y1,MS[,DUR]` presses at (x, y) and moves to (x1, y1)
-/// over `dur` ms (default 250), then releases. Times are from launch.
-/// minifb samples the real mouse, so synthetic OS input cannot drive the
-/// sim — this lets tests click and swipe.
+/// over `dur` ms (default 250), then releases; `--pinch CX,CY,R0,R1,MS[,DUR[,DEG]]`
+/// puts two fingers on opposite sides of (cx, cy), r0 from it, and moves
+/// them to r1 while turning the pair by `deg` degrees (clockwise) over
+/// `dur` ms. Times are from launch. minifb samples the real mouse, so
+/// synthetic OS input cannot drive the sim — this lets tests click, swipe
+/// and pinch.
 #[derive(Clone, Copy)]
 pub struct ScriptedTap {
     pub x: u16,
@@ -137,13 +140,34 @@ pub struct ScriptedTap {
     pub y1: u16,
     pub at_ms: u32,
     pub dur_ms: u32,
+    pub pinch: Option<Pinch>,
+}
+
+/// Two fingers round a centre (`--pinch`): radius r0 → r1, turning by `deg`.
+#[derive(Clone, Copy)]
+pub struct Pinch {
+    pub cx: f32,
+    pub cy: f32,
+    pub r0: f32,
+    pub r1: f32,
+    pub deg: f32,
 }
 
 impl ScriptedTap {
-    /// Where the press is `t` ms after it started.
-    fn at(&self, t: u32) -> (u16, u16) {
+    /// Where the press is `t` ms after it started, and the second finger.
+    fn at(&self, t: u32) -> ((u16, u16), Option<(u16, u16)>) {
+        let f = t.min(self.dur_ms) as f32 / self.dur_ms.max(1) as f32;
+        if let Some(p) = self.pinch {
+            let r = p.r0 + (p.r1 - p.r0) * f;
+            let a = (p.deg * f).to_radians();
+            let (dx, dy) = (r * a.cos(), r * a.sin());
+            let px = |v: f32, max: u32| v.round().clamp(0.0, (max - 1) as f32) as u16;
+            let one = (px(p.cx + dx, WIDTH as u32), px(p.cy + dy, HEIGHT as u32));
+            let two = (px(p.cx - dx, WIDTH as u32), px(p.cy - dy, HEIGHT as u32));
+            return (one, Some(two));
+        }
         let lerp = |a: u16, b: u16| (a as i64 + (b as i64 - a as i64) * t.min(self.dur_ms) as i64 / self.dur_ms.max(1) as i64) as u16;
-        (lerp(self.x, self.x1), lerp(self.y, self.y1))
+        ((lerp(self.x, self.x1), lerp(self.y, self.y1)), None)
     }
 }
 
@@ -240,10 +264,19 @@ impl PlatformRuntime for SimPlatform {
             }
             match host.taps.iter().find(|t| now >= t.at_ms && now < t.at_ms + t.dur_ms) {
                 Some(t) => {
-                    let (x, y) = t.at(now - t.at_ms);
-                    host.mouse.update(x, y, true)
+                    let ((x, y), second) = t.at(now - t.at_ms);
+                    host.mouse.update2(x, y, true, second)
                 }
-                None => host.mouse.update(mx, my, pressed && pos.is_some()),
+                None => {
+                    // Ctrl + drag: a second finger mirrored round the screen's
+                    // centre (pinch towards / away from it, turn round it).
+                    let ctrl = host.window.is_key_down(Key::LeftCtrl) || host.window.is_key_down(Key::RightCtrl);
+                    let second = ctrl.then(|| {
+                        let mirror = |v: u16, max: u32| (max as i32 - 1 - v as i32).clamp(0, max as i32 - 1) as u16;
+                        (mirror(mx, WIDTH as u32), mirror(my, HEIGHT as u32))
+                    });
+                    host.mouse.update2(mx, my, pressed && pos.is_some(), second)
+                }
             }
 
             // Present the front (displayed) buffer (blocks to the target FPS

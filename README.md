@@ -45,7 +45,7 @@ HAL: [exynos-4412-rs](https://github.com/erhanacunal/exynos-4412-rs) (git submod
   <img src="docs/images/tablet/settings.png" width="49%" alt="Settings">
 </p>
 
-Other examples in [`examples/exynos4412`](examples/exynos4412): `launcher` (programs switched with `runProgram`), `multitask` (programs running together), `layers`, `scroll`, `paint` (`on_paint`), `model3d`, `jpeg`, `storage` (files, directories, the EEPROM), `audio_demo`, `bench`.
+Other examples in [`examples/exynos4412`](examples/exynos4412): `launcher` (programs switched with `runProgram`), `multitask` (programs running together), `layers`, `scroll`, `paint` (`on_paint`), `model3d`, `jpeg`, `storage` (files, directories, the EEPROM), `gestures` (tap, double tap, long press, drags, pinch, tap-and-drag, a flinging list), `audio_demo`, `bench`.
 
 ## How it runs on the board
 
@@ -53,6 +53,7 @@ Other examples in [`examples/exynos4412`](examples/exynos4412): `launcher` (prog
 - **Drawing:** the VM's core records each frame as a display list; CPU2 plays it, through the GPU where it can and the CPU otherwise. Drawing goes into a shadow buffer whose changed area is copied to the scanned framebuffer at vsync, so there is no tearing and no half-drawn frame. Widget subtrees marked as layers (`set(layer, n)`) can live in the display's hardware windows, so moving or fading them costs no drawing.
 - **Filesystem:** the 64 MB flash image (programs, fonts, images, sounds) lives in RAM, loaded from `FERRITE/FLASH.BIN`. A `writefs` changes it until the next boot; `ferrite_cli bootflash` or an HTTP upload saves it.
 - **Program storage:** programs can write files and directories (`lib/storage.fl`) under `FERRITE/USER`, their own root: the firmware's files are out of their reach. The EEPROM builtins use 4096 bytes kept in `FERRITE/EEPROM.BIN`.
+- **Touch:** every finger is tracked. Widgets take part in Flutter-style gesture recognizers (`onGesture`, `lib/gesture.fl`: tap, double tap, long press, pan and axis drags, scale/rotate, tap-and-drag) that compete in a gesture arena; `on_click` is a tap in that arena, and scroll containers scroll and fling when dragged.
 - **Recovery:** hold the top-left 80×80 px for 3 s at boot. Recovery also starts when CACHE has no filesystem yet.
 - **Power key:** a short press puts the tablet in standby (another press wakes it). Hold to power off; with volume up to restart; with volume down to restart into fastboot.
 - **CPU clock:** set from the HTTP API, throttled by temperature; CPU0 sleeps while nothing changes on the screen.
@@ -117,6 +118,8 @@ or by hand:
 python ..\ferrite-ui\tools\ferrite_build.py examples\exynos4412\tablet\project.json -o tablet.bin
 cargo run --release -p bsp-sim -- --fsimage tablet.bin [--storage DIR] [--eeprom FILE]
 ```
+
+In the sim, Ctrl + drag adds a second finger mirrored round the screen's centre (pinch, rotate). Scripted input: `--tap X,Y,MS`, `--swipe X0,Y0,X1,Y1,MS[,DUR]`, `--pinch CX,CY,R0,R1,MS[,DUR[,DEG]]`.
 
 ### Tests
 

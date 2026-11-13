@@ -1,0 +1,292 @@
+// main.fl — Flutter-style gesture recognizers (devices with caps.gestures)
+//
+// * Left: a scroll list. Drag it to scroll (let go with speed: it flings,
+//   touch it to stop); tap a row to click it. A drag that starts on a row
+//   scrolls the list and the row's click is cancelled (the gesture arena).
+// * Middle: a circle with GESTURE_SCALE | GESTURE_DOUBLE_TAP. Two fingers
+//   scale it (in the sim: hold Ctrl while dragging = a second finger
+//   mirrored round the screen's centre, or --pinch); double tap resets it.
+// * Top right: a card with GESTURE_PAN | GESTURE_LONG_PRESS: drag it
+//   around; a long press changes its colour, and moving while still held
+//   drags it too (GE_LONG_PRESS_MOVE).
+// * Bottom right: a pad with GESTURE_TAP_DRAG (taps counted: tap, double
+//   tap, triple tap...) and a knob with GESTURE_HDRAG inside it.
+// The top line shows the last event and its details.
+
+#include "core.fl"
+#include "color.fl"
+#include "shapes.fl"
+#include "gesture.fl"
+
+var status_lbl;
+var list;
+var circle;
+var circle_lbl;
+var card;
+var pad;
+var pad_lbl;
+var knob;
+var base = 240;       // the circle's size when a scale starts
+var card_color = 0;
+var rows = 0;
+
+fn event_name(e) -> string {
+    if (e == GE_TAP_DOWN) { return "tap down"; }
+    if (e == GE_TAP_UP) { return "tap up"; }
+    if (e == GE_TAP) { return "tap"; }
+    if (e == GE_TAP_CANCEL) { return "tap cancel"; }
+    if (e == GE_DOUBLE_TAP) { return "double tap"; }
+    if (e == GE_LONG_PRESS_START) { return "long press start"; }
+    if (e == GE_LONG_PRESS_MOVE) { return "long press move"; }
+    if (e == GE_LONG_PRESS_END) { return "long press end"; }
+    if (e == GE_DRAG_START) { return "drag start"; }
+    if (e == GE_DRAG_UPDATE) { return "drag update"; }
+    if (e == GE_DRAG_END) { return "drag end"; }
+    if (e == GE_SCALE_START) { return "scale start"; }
+    if (e == GE_SCALE_UPDATE) { return "scale update"; }
+    if (e == GE_SCALE_END) { return "scale end"; }
+    if (e == GE_TAP_DRAG_DOWN) { return "tap-drag down"; }
+    if (e == GE_TAP_DRAG_UP) { return "tap-drag up"; }
+    if (e == GE_TAP_DRAG_START) { return "tap-drag start"; }
+    if (e == GE_TAP_DRAG_UPDATE) { return "tap-drag update"; }
+    if (e == GE_TAP_DRAG_END) { return "tap-drag end"; }
+    if (e == GE_TAP_DRAG_CANCEL) { return "tap-drag cancel"; }
+    return "?";
+}
+
+// The top line: what happened, where, and the details that event carries.
+fn show_event(what, e) {
+    var a = sprintf("%s: %s at %d,%d (local %d,%d) d %d,%d", what, event_name(e),
+        gestureInfo(GI_X), gestureInfo(GI_Y), gestureInfo(GI_LOCAL_X), gestureInfo(GI_LOCAL_Y),
+        gestureInfo(GI_DX), gestureInfo(GI_DY));
+    var b = sprintf(" total %d,%d v %d,%d scale %d rot %d", gestureInfo(GI_TOTAL_X),
+        gestureInfo(GI_TOTAL_Y), gestureInfo(GI_VX), gestureInfo(GI_VY),
+        gestureInfo(GI_SCALE), gestureInfo(GI_ROTATION));
+    var c = sprintf(" fingers %d taps %d, %d ms", gestureInfo(GI_POINTERS),
+        gestureInfo(GI_TAPS), gestureInfo(GI_TIME));
+    var s = concat(concat(a, b), c);
+    target(status_lbl);
+    set(text, s);
+}
+
+fn make_label(l: widget, p: widget, x, y, w, h, text, color) {
+    target(l);
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(text, text);
+    set(text_color, color);
+    set(text_align, ALIGN_CENTER);
+    parent(p);
+}
+
+// --- The scroll list ---
+
+// The rows tap through the arena too: a drag that starts on one scrolls
+// the list instead (the row gets GE_TAP_CANCEL).
+fn on_row(w, e) {
+    if (e == GE_TAP) {
+        rows = rows + 1;
+    }
+    show_event(sprintf("list row (%d taps)", rows), e);
+    strClear();
+}
+
+fn make_list() {
+    list = alloc();
+    target(list);
+    set(location, 20, 100);
+    set(size, 320, 680);
+    set(bg_color, 0x18C3);
+    set(clip_children, ON);
+    parent(0);
+    var i = 0;
+    while (i < 40) {
+        var row = alloc();
+        target(row);
+        set(kind, KIND_BUTTON);
+        set(location, 8, 8 + i * 64);
+        set(size, 290, 56);
+        set(bg_color, 0x3A6B);
+        set(press_color, 0x5CBF);
+        set(border_radius, 8);
+        set(clickable, ON);
+        parent(list);
+        onGesture(row, GESTURE_TAP, @on_row);
+        var t = alloc();
+        make_label(t, row, 0, 0, 290, 56, sprintf("Row %d: drag or tap", i + 1), WHITE);
+        i = i + 1;
+    }
+}
+
+// --- The circle: scale + double tap ---
+
+fn size_circle(s) {
+    if (s < 80) { s = 80; }
+    if (s > 640) { s = 640; }
+    target(circle);
+    set(location, 640 - s / 2, 440 - s / 2);
+    set(size, s, s);
+    target(circle_lbl);
+    set(location, s / 2 - 100, s / 2 - 20);
+    return s;
+}
+
+fn circle_gesture(w, e) {
+    if (e == GE_SCALE_UPDATE) {
+        size_circle(base * gestureInfo(GI_SCALE) / 1000);
+        target(circle_lbl);
+        set(text, sprintf("x%d.%d  %d mrad", gestureInfo(GI_SCALE) / 1000,
+            gestureInfo(GI_SCALE) % 1000 / 100, gestureInfo(GI_ROTATION)));
+    } else if (e == GE_SCALE_END) {
+        target(circle);
+        base = get(size_w);
+    } else if (e == GE_DOUBLE_TAP) {
+        base = size_circle(240);
+        target(circle_lbl);
+        set(text, "pinch me");
+    }
+    show_event("circle", e);
+    strClear();
+}
+
+fn make_circle() {
+    circle = alloc();
+    target(circle);
+    set(kind, KIND_CIRCLE);
+    set(bg_color, 0x2B7F);
+    set(border_color, WHITE);
+    set(border, 2);
+    parent(0);
+    circle_lbl = alloc();
+    make_label(circle_lbl, circle, 0, 0, 200, 40, "pinch me", WHITE);
+    size_circle(base);
+    onGesture(circle, GESTURE_SCALE | GESTURE_DOUBLE_TAP, @circle_gesture);
+}
+
+// --- The card: pan + long press ---
+
+fn move_card(dx, dy) {
+    target(card);
+    var x = get(loc_x) + dx;
+    var y = get(loc_y) + dy;
+    if (x < 360) { x = 360; }
+    if (x > 1060) { x = 1060; }
+    if (y < 100) { y = 100; }
+    if (y > 640) { y = 640; }
+    set(location, x, y);
+}
+
+fn card_gesture(w, e) {
+    if (e == GE_DRAG_UPDATE || e == GE_LONG_PRESS_MOVE) {
+        move_card(gestureInfo(GI_DX), gestureInfo(GI_DY));
+    } else if (e == GE_LONG_PRESS_START) {
+        card_color = (card_color + 1) % 4;
+        target(card);
+        if (card_color == 0) { set(bg_color, 0xFD20); }
+        if (card_color == 1) { set(bg_color, 0x07E0); }
+        if (card_color == 2) { set(bg_color, 0xF81F); }
+        if (card_color == 3) { set(bg_color, 0x07FF); }
+    }
+    show_event("card", e);
+    strClear();
+}
+
+fn make_card() {
+    card = alloc();
+    target(card);
+    set(location, 1040, 100);
+    set(size, 200, 140);
+    set(bg_color, 0xFD20);
+    set(border_radius, 16);
+    parent(0);
+    var t = alloc();
+    make_label(t, card, 0, 30, 200, 40, "drag me", BLACK);
+    var t2 = alloc();
+    make_label(t2, card, 0, 70, 200, 40, "hold: colour", BLACK);
+    onGesture(card, GESTURE_PAN | GESTURE_LONG_PRESS, @card_gesture);
+}
+
+// --- The pad: tap and drag, with a horizontal knob ---
+
+fn pad_gesture(w, e) {
+    if (e == GE_TAP_DRAG_DOWN) {
+        target(pad_lbl);
+        set(text, sprintf("%d tap(s)", gestureInfo(GI_TAPS)));
+    } else if (e == GE_TAP_DRAG_UPDATE) {
+        target(pad_lbl);
+        set(text, sprintf("%d tap(s) + drag %d,%d", gestureInfo(GI_TAPS),
+            gestureInfo(GI_TOTAL_X), gestureInfo(GI_TOTAL_Y)));
+    }
+    show_event("pad", e);
+    strClear();
+}
+
+fn knob_gesture(w, e) {
+    if (e == GE_DRAG_UPDATE) {
+        target(knob);
+        var x = get(loc_x) + gestureInfo(GI_DX);
+        if (x < 0) { x = 0; }
+        if (x > 300) { x = 300; }
+        set(loc_x, x);
+    }
+    show_event("knob", e);
+    strClear();
+}
+
+fn make_pad() {
+    pad = alloc();
+    target(pad);
+    set(location, 880, 440);
+    set(size, 380, 340);
+    set(bg_color, 0x2945);
+    set(border_radius, 16);
+    parent(0);
+    var t = alloc();
+    make_label(t, pad, 0, 20, 380, 40, "tap, double tap, then drag", WHITE);
+    pad_lbl = alloc();
+    make_label(pad_lbl, pad, 0, 80, 380, 40, "", YELLOW);
+    var track = alloc();
+    target(track);
+    set(location, 20, 260);
+    set(size, 340, 60);
+    set(bg_color, 0x18C3);
+    set(border_radius, 30);
+    parent(pad);
+    knob = alloc();
+    target(knob);
+    set(location, 0, 0);
+    set(size, 40, 60);
+    set(bg_color, WHITE);
+    set(border_radius, 20);
+    parent(track);
+    onGesture(pad, GESTURE_TAP_DRAG, @pad_gesture);
+    onGesture(knob, GESTURE_HDRAG, @knob_gesture);
+}
+
+fn setup() {
+    target(0);
+    set(bg_color, 0x0841);
+    status_lbl = alloc();
+    target(status_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 20, 20);
+    set(size, 1240, 64);
+    set(bg_color, 0x2945);
+    set(text_color, CYAN);
+    set(text_align, ALIGN_LEFT);
+    set(padding, 12, 8, 12, 8);
+    set(multi_line, 1);
+    set(text, "Gestures: drag the list, pinch the circle (Ctrl + drag in the sim), drag the card, tap-drag the pad");
+    parent(0);
+    make_list();
+    make_circle();
+    make_card();
+    make_pad();
+    strClear();
+    render();
+    return 0;
+}
+
+fn loop() {
+}

@@ -22,6 +22,8 @@ use crate::render;
 mod flex;
 #[path = "vm_storage.rs"]
 mod disk;
+#[path = "vm_gesture.rs"]
+mod gesture_ops;
 pub use flex::FLEX_AUTO;
 pub(crate) use flex::flush as flex_flush;
 use crate::strpool;
@@ -682,6 +684,8 @@ struct CbFrame {
     critical: bool,
     frame_base: u8,
     frame_size: u8,
+    /// The interrupted callback's gesture event details (`gestureInfo`).
+    gesture: crate::gesture::Detail,
 }
 
 /// Maximum callback nesting: a callback suspended on each open modal, the
@@ -699,6 +703,8 @@ struct CbRequest {
     offset: CodeAddr,
     arg_count: u8,
     args: [i32; CB_MAX_ARGS],
+    /// A gesture event: its details are `cb_details[slot]`.
+    gesture: bool,
 }
 
 /// Open file slot — absolute flash offset, total size, current read position.
@@ -829,6 +835,10 @@ pub struct Vm {
     cb_queue: Box<[CbRequest]>,
     cb_head: u8,
     cb_tail: u8,
+    // Gesture details of the queued callbacks, by queue slot (allocated on
+    // the first gesture event), and of the running gesture callback.
+    cb_details: Vec<crate::gesture::Detail>,
+    gesture_cur: crate::gesture::Detail,
     // Critical section — when true, VM runs until next YIELD without returning to main loop
     critical: bool,
     // Stack-based locals: frame_base = first local slot for current function
@@ -873,6 +883,7 @@ const EMPTY_CB: CbRequest = CbRequest {
     offset: 0,
     arg_count: 0,
     args: [0; CB_MAX_ARGS],
+    gesture: false,
 };
 const EMPTY_FRAME: CallFrame = CallFrame {
     ret_addr: 0,
@@ -911,6 +922,8 @@ impl Vm {
             cb_queue: alloc::vec![EMPTY_CB; CB_QUEUE_SIZE].into_boxed_slice(),
             cb_head: 0,
             cb_tail: 0,
+            cb_details: Vec::new(),
+            gesture_cur: [0; crate::gesture::field::COUNT],
             critical: false,
             frame_base: 0,
             frame_size: 0,
@@ -1133,6 +1146,7 @@ impl Vm {
             offset,
             arg_count: args.len().min(CB_MAX_ARGS) as u8,
             args: [0; CB_MAX_ARGS],
+            gesture: false,
         };
         for i in 0..req.arg_count as usize {
             req.args[i] = args[i];
@@ -1185,9 +1199,15 @@ impl Vm {
     pub fn drain_callbacks<P: Platform>(&mut self, ctx: &mut Ctx<P>) -> bool {
         let mut ran = false;
         while self.cb_head != self.cb_tail && self.can_take_callback() {
-            let req = self.cb_queue[self.cb_head as usize];
+            let slot = self.cb_head as usize;
+            let req = self.cb_queue[slot];
             self.cb_head = (self.cb_head + 1) % self.cb_queue.len() as u8;
-            self.enter_callback(req.offset, &req.args[..req.arg_count as usize]);
+            if self.enter_callback(req.offset, &req.args[..req.arg_count as usize]) {
+                self.gesture_cur = match self.cb_details.get(slot) {
+                    Some(d) if req.gesture => *d,
+                    _ => [0; crate::gesture::field::COUNT],
+                };
+            }
             self.run_active_callback(ctx);
             ran = true;
         }
@@ -1652,6 +1672,7 @@ impl Vm {
             critical: self.critical,
             frame_base: self.frame_base,
             frame_size: self.frame_size,
+            gesture: self.gesture_cur,
         });
         self.sp_floor = self.sp;
         self.pc = offset;
@@ -1691,6 +1712,7 @@ impl Vm {
             self.critical = f.critical;
             self.frame_base = f.frame_base;
             self.frame_size = f.frame_size;
+            self.gesture_cur = f.gesture;
         }
     }
 
@@ -2625,6 +2647,7 @@ impl Vm {
                 self.push(0);
             }
             disk::OP_DISK_OPEN..=disk::OP_FILE_READ_ARR => self.storage_op(ctx, op),
+            gesture_ops::OP_ON_GESTURE..=gesture_ops::OP_GESTURE_INFO => self.gesture_op(ctx, op),
             OP_PROGRAM_NAME => {
                 let index = self.pop();
                 let mut buf = [0u8; crate::fs::NAME_LEN];

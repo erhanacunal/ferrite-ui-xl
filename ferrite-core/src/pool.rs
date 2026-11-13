@@ -293,6 +293,8 @@ pub struct ObjPool {
     pub layers: crate::layer::Layers,
     /// `FLEX_AUTO` containers waiting for their automatic layout (`vm_flex.rs`).
     pub(crate) flex_pending: Vec<WidgetId>,
+    /// `onGesture` registrations (`gesture.rs`; VM pool only).
+    pub gestures: crate::gesture::Registry,
     /// A layout is running: its own writes queue nothing.
     pub(crate) flex_busy: bool,
     /// The render pool (`Ctx::view`, `view.rs`): a copy of the VM pool's
@@ -381,6 +383,7 @@ impl ObjPool {
             overlay: None,
             layers: crate::layer::Layers::new(),
             flex_pending: Vec::new(),
+            gestures: crate::gesture::Registry::new(),
             flex_busy: false,
             is_view: false,
             touched_bits: Vec::new(),
@@ -550,6 +553,7 @@ impl ObjPool {
         self.root = WidgetId::NONE;
         self.dfs_cache.clear();
         self.dfs_valid = false;
+        self.gestures.clear();
         self.render.reset();
         self.render.msgs.clear();
         self.render.shape_changed = true;

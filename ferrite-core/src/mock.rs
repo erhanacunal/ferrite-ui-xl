@@ -68,13 +68,52 @@ impl FlashBackend for MockFlash {
     }
 }
 
+#[cfg(feature = "host")]
+std::thread_local! {
+    /// The fingers `MockTouch` reports ([`set_touch`]) and the time
+    /// `MockSystick` reports ([`set_millis`]).
+    static TOUCH: core::cell::RefCell<alloc::vec::Vec<crate::touch::TouchPoint>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+    static MILLIS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Fingers down on this thread's `MockTouch`: (id, x, y).
+#[cfg(feature = "host")]
+pub fn set_touch(points: &[(u8, u16, u16)]) {
+    TOUCH.with(|t| *t.borrow_mut() = points.iter().map(|&(id, x, y)| crate::touch::TouchPoint { id, x, y }).collect());
+}
+
+/// What `MockSystick::millis` returns on this thread (0 by default).
+#[cfg(feature = "host")]
+pub fn set_millis(ms: u32) {
+    MILLIS.with(|m| m.set(ms));
+}
+
 pub struct MockTouch;
 impl TouchBackend for MockTouch {
     fn is_active(&self) -> bool {
+        #[cfg(feature = "host")]
+        return TOUCH.with(|t| !t.borrow().is_empty());
+        #[cfg(not(feature = "host"))]
         false
     }
     fn read_screen(&self, _cal: &CalParams) -> Option<(u16, u16)> {
+        #[cfg(feature = "host")]
+        return TOUCH.with(|t| t.borrow().first().map(|p| (p.x, p.y)));
+        #[cfg(not(feature = "host"))]
         None
+    }
+    fn release_debounce(&self) -> u8 {
+        1
+    }
+    #[cfg(feature = "host")]
+    fn read_points(&self, _cal: &CalParams, out: &mut [crate::touch::TouchPoint]) -> usize {
+        TOUCH.with(|t| {
+            let t = t.borrow();
+            let n = t.len().min(out.len());
+            out[..n].copy_from_slice(&t[..n]);
+            n
+        })
     }
 }
 
@@ -162,6 +201,9 @@ impl SystickBackend for MockSystick {
     fn init() {}
     fn delay_ms(_ms: u32) {}
     fn millis() -> u32 {
+        #[cfg(feature = "host")]
+        return MILLIS.with(|m| m.get());
+        #[cfg(not(feature = "host"))]
         0
     }
 }

@@ -2,6 +2,8 @@
 
 ferrite-ui for RAM-rich, multi-core devices (first target: Exynos 4412 tablet). Plan: `docs/plan.md`.
 
+Working branch: `main` (commit and push there; ferrite-ui's is `main` too). `cpu2-render-perf` was merged and deleted on 2026-11-13.
+
 **Differences from ferrite-ui (read these first; the sections below are inherited and still describe ferrite-ui where they disagree):**
 - Targets: `bsp/exynos4412` and `bsp/sim` only. The sim is always 1280×800 with a readback framebuffer.
 - Always compiled (no longer features): `layers`, `multi_program`, `perf`, `fast_vm`, `superops`, `render_cache`, `wide_obj`, `wide_code`, `pool_large`, `audio`. Remaining core features: `host`, `mock`, `external_alloc`, `jpeg`.

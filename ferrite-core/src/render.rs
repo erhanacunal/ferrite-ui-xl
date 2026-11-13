@@ -40,6 +40,12 @@ pub const MODE_PLAIN: u8 = 1;
 /// into one display list a frame (`RenderState::frame`), and hands that to
 /// the render side (`RenderJob::Play`), which needs nothing of the widgets.
 pub const MODE_PLAY: u8 = 2;
+/// As play, but recorded in compositor order: each changed area
+/// (`compose_dirty`'s) repainted whole, every widget touching it back to
+/// front, after an area marker (`Canvas::area`); no clip regions, restores
+/// or occluders. The board may play it its own way (`WidgetRenderer::play`,
+/// a GPU), else it is replayed on the CPU like play.
+pub const MODE_AREAS: u8 = 3;
 
 /// Frames recorded for the render side to play (`MODE_PLAY`), their
 /// commands and their bytes, since boot.
@@ -270,7 +276,10 @@ pub enum RenderJob {
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let ta = crate::perf::now();
     if job == RenderJob::Play {
-        r.objs.render.frame.list().replay(&r.lcd, &r.refs());
+        let list = r.objs.render.frame.list();
+        if !(r.objs.render.areas && <P::Renderer as WidgetRenderer<P>>::play(r, &list)) {
+            list.replay(&r.lcd, &r.refs());
+        }
         JOB_TICKS[JOB_RENDER].fetch_add(crate::perf::now().wrapping_sub(ta) as u64, core::sync::atomic::Ordering::Relaxed);
         return;
     }
@@ -298,6 +307,10 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
         RenderJob::Play => {}
     }
     let t2 = crate::perf::now();
+    if r.objs.render.areas && !later.is_empty() {
+        // Drawing outside the areas follows (`Canvas::area`).
+        screen!(r, |c| c.area(Rect::new(0, 0, 0, 0)));
+    }
     for (id, list) in later {
         if r.objs.is_tree_visible(id) {
             screen!(r, |c| list.replay(c, &r.refs()));
@@ -401,7 +414,8 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
     let t0 = crate::perf::now();
     let mode = ctx.objs.render.mode;
     r.objs.render.plain = mode != MODE_NORMAL;
-    let job = if mode == MODE_PLAY {
+    r.objs.render.areas = mode == MODE_AREAS;
+    let job = if mode == MODE_PLAY || mode == MODE_AREAS {
         // The whole render here, into a list: the render side plays it.
         sync_render_ctx(ctx, &mut r, false);
         r.objs.render.frame.begin(&r.lcd);
@@ -410,6 +424,9 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
         ctx.objs.mirror_layers(&r.objs);
         let (ops, bytes) = {
             let list = r.objs.render.frame.list();
+            if crate::dl::OP_STATS.load(core::sync::atomic::Ordering::Relaxed) {
+                list.tally();
+            }
             (list.len(), list.used_bytes())
         };
         if ops == 0 {
@@ -520,6 +537,10 @@ fn render_all_view<P: Platform>(ctx: &mut Ctx<P>) {
         active
     };
     let n = ctx.objs.dfs_len();
+    if ctx.objs.render.areas {
+        let screen = screen_rect(&ctx.lcd);
+        screen!(ctx, |c| c.area(screen));
+    }
     render_all_iterative(ctx, 0, n);
     {
         ctx.objs.layers.scope = crate::layer::Scope::All;
@@ -628,7 +649,8 @@ fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
     let active = layers_sync(ctx);
 
     // A board that repaints whole areas (a GPU) takes the render over.
-    if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.plain && compose_dirty(ctx, false) {
+    let composes = <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.plain;
+    if active == 0 && (composes || ctx.objs.render.areas) && compose_dirty(ctx, false) {
         ctx.objs.geo_end();
         return;
     }
@@ -1220,8 +1242,13 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
             areas.add(slot.restore, &screen);
         }
     }
-    if areas.n > 0 && !<P::Renderer as WidgetRenderer<P>>::compose(ctx, &areas.list[..areas.n]) {
-        return false;
+    if areas.n > 0 {
+        if ctx.objs.render.areas && !layered {
+            let areas = <P::Renderer as WidgetRenderer<P>>::play_areas(&areas.list[..areas.n]);
+            paint_areas(ctx, &areas);
+        } else if !<P::Renderer as WidgetRenderer<P>>::compose(ctx, &areas.list[..areas.n]) {
+            return false;
+        }
     }
     if layered {
         for slot in ctx.objs.layers.slots.iter_mut() {
@@ -1247,6 +1274,50 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
         ctx.objs.render.settled_epoch = ctx.objs.render.draw_epoch;
     }
     true
+}
+
+/// `MODE_AREAS`: repaints `areas` whole, each after its marker
+/// (`Canvas::area`): every visible widget touching it, in DFS order, clipped
+/// to it (scroll containers' children as `render_all`: only those wholly
+/// inside the viewport), then the scrollbars there. What the board's
+/// compositor does with the tree (`WidgetRenderer::compose`), on the canvas.
+fn paint_areas<P: Platform>(ctx: &mut Ctx<P>, areas: &[Rect]) {
+    let n = ctx.objs.dfs_len();
+    for a in areas {
+        let clip = ClipRegion::from_rect(*a);
+        screen!(ctx, |c| {
+            c.area(*a);
+            c.set_scissor(Some(*a));
+        });
+        let mut i = 0;
+        while i < n {
+            if !ctx.objs.vis_at(i) {
+                i = ctx.objs.sub_end_at(i);
+                continue;
+            }
+            let abs = ctx.objs.abs_at(i);
+            if scroll_hidden(&ctx.objs, i, &abs) {
+                i = ctx.objs.sub_end_at(i);
+                continue;
+            }
+            if abs.intersects(a) {
+                let id = ctx.objs.dfs_at(i);
+                draw_widget(ctx, id, &abs, &clip);
+            }
+            i += 1;
+        }
+        screen!(ctx, |c| c.set_scissor(Some(*a)));
+        for i in 0..n {
+            let id = ctx.objs.dfs_at(i);
+            if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.objs.vis_at(i) {
+                let abs = ctx.objs.abs_at(i);
+                if abs.intersects(a) {
+                    draw_scrollbar(ctx, id, &abs);
+                }
+            }
+        }
+        screen!(ctx, |c| c.set_scissor(None));
+    }
 }
 
 /// Most rects one shift moves (they come from two clip regions).

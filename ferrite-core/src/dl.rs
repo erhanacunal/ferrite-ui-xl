@@ -66,6 +66,24 @@ pub static DIRECT: AtomicU32 = AtomicU32::new(0);
 pub static STORES: AtomicU32 = AtomicU32::new(0);
 pub static EVICTS: AtomicU32 = AtomicU32::new(0);
 pub static BYTES: AtomicU32 = AtomicU32::new(0);
+/// Count the calls of the frames played (`render::submit` in `MODE_PLAY`)
+/// by opcode (`OP_CALLS` / `OP_WORDS`; sim `FERRITE_SIM_OP_STATS=1`, exynos
+/// `POST /api/rcore?ops=1`): what a GPU player of the lists must cover.
+pub static OP_STATS: AtomicBool = AtomicBool::new(false);
+/// Opcodes 0..`OPCODES`: calls and words (header included) since boot.
+pub const OPCODES: usize = 37;
+pub static OP_CALLS: [AtomicU32; OPCODES] = [const { AtomicU32::new(0) }; OPCODES];
+pub static OP_WORDS: [AtomicU32; OPCODES] = [const { AtomicU32::new(0) }; OPCODES];
+
+/// Opcode names (`OP_CALLS` reports), by opcode.
+pub const OP_NAMES: [&str; OPCODES] = [
+    "?", "scissor", "fill_rect", "blend_rect", "gradient_rect", "draw_rect", "pixel", "begin_pixels",
+    "pixels", "run", "blend_span", "blend_row", "line", "line_thick", "polyline", "wedge", "pen_begin",
+    "pen_to", "pen_finish", "pen_end", "fill_polygon", "circle", "fill_circle", "ellipse", "fill_ellipse",
+    "stroke_ellipse", "oval", "arc", "thin_arc", "rounded_rect", "fill_rounded_rect", "fill_rounded_rect_at",
+    "gradient_rounded_rect_at", "stroke_rounded_rect", "image", "text", "area",
+];
+
 /// Image / text calls replayed whose image or font the replaying side
 /// doesn't hold (drawn as nothing; should stay 0).
 pub static REF_MISSES: AtomicU32 = AtomicU32::new(0);
@@ -176,6 +194,52 @@ pub enum Op<'a> {
     Image { addr: u32, x: i16, y: i16 },
     /// `draw_text`: the font by id and bitmap flash address, the UTF-8 text.
     Text { font_id: u8, bitmaps: u32, x: i16, y: i16, fg: u16, bg: Option<u16>, text: &'a [u8] },
+    /// `Canvas::area`: what follows repaints this area whole.
+    Area(Rect),
+}
+
+impl Op<'_> {
+    /// Its opcode (an index into [`OP_NAMES`]).
+    pub fn code(&self) -> u8 {
+        match self {
+            Op::SetScissor(..) => code::SET_SCISSOR,
+            Op::FillRect { .. } => code::FILL_RECT,
+            Op::BlendRect { .. } => code::BLEND_RECT,
+            Op::GradientRect { .. } => code::GRADIENT_RECT,
+            Op::DrawRect { .. } => code::DRAW_RECT,
+            Op::DrawPixel { .. } => code::DRAW_PIXEL,
+            Op::BeginPixels { .. } => code::BEGIN_PIXELS,
+            Op::Pixels(..) => code::PIXELS,
+            Op::Run { .. } => code::RUN,
+            Op::BlendSpan { .. } => code::BLEND_SPAN,
+            Op::BlendRow { .. } => code::BLEND_ROW,
+            Op::Line { .. } => code::LINE,
+            Op::LineThick { .. } => code::LINE_THICK,
+            Op::Polyline { .. } => code::POLYLINE,
+            Op::Wedge { .. } => code::WEDGE,
+            Op::PenBegin { .. } => code::PEN_BEGIN,
+            Op::PenTo { .. } => code::PEN_TO,
+            Op::PenFinish => code::PEN_FINISH,
+            Op::PenEnd => code::PEN_END,
+            Op::FillPolygon { .. } => code::FILL_POLYGON,
+            Op::Circle { .. } => code::CIRCLE,
+            Op::FillCircle { .. } => code::FILL_CIRCLE,
+            Op::Ellipse { .. } => code::ELLIPSE,
+            Op::FillEllipse { .. } => code::FILL_ELLIPSE,
+            Op::StrokeEllipse { .. } => code::STROKE_ELLIPSE,
+            Op::Oval { .. } => code::OVAL,
+            Op::Arc { .. } => code::ARC,
+            Op::ThinArc { .. } => code::THIN_ARC,
+            Op::RoundedRect { .. } => code::ROUNDED_RECT,
+            Op::FillRoundedRect { .. } => code::FILL_ROUNDED_RECT,
+            Op::FillRoundedRectAt { .. } => code::FILL_ROUNDED_RECT_AT,
+            Op::GradientRoundedRectAt { .. } => code::GRADIENT_ROUNDED_RECT_AT,
+            Op::StrokeRoundedRect { .. } => code::STROKE_ROUNDED_RECT,
+            Op::Image { .. } => code::IMAGE,
+            Op::Text { .. } => code::TEXT,
+            Op::Area(..) => code::AREA,
+        }
+    }
 }
 
 /// Opcodes (header bits 0-7). The words after the header, in order:
@@ -245,6 +309,8 @@ mod code {
     pub const IMAGE: u8 = 34;
     /// `[font_id]{fg}` `bitmaps` `x|y` `bg|HAS_BG` `len`, the text's bytes.
     pub const TEXT: u8 = 35;
+    /// `x|y` `w|h` (`Canvas::area`).
+    pub const AREA: u8 = 36;
 
     /// TEXT: bit 16 of the `bg` word.
     pub const HAS_BG: u32 = 1 << 16;
@@ -359,6 +425,20 @@ impl List {
     /// The calls, decoded.
     pub fn ops(&self) -> Ops<'_> {
         Ops { w: &self.words, i: 0 }
+    }
+
+    /// Add its calls to `OP_CALLS` / `OP_WORDS`.
+    pub fn tally(&self) {
+        let mut it = self.ops();
+        loop {
+            let at = it.i;
+            if it.next().is_none() {
+                break;
+            }
+            let op = (self.words[at] as u8 as usize).min(OPCODES - 1);
+            OP_CALLS[op].fetch_add(1, Ordering::Relaxed);
+            OP_WORDS[op].fetch_add((it.i - at) as u32, Ordering::Relaxed);
+        }
     }
 
     /// The scissor the drawing left set, given the one it started with.
@@ -669,6 +749,7 @@ impl List {
                 Op::Text { font_id, bitmaps, x, y, fg, bg, text } => {
                     refs.draw_text(c, font_id, bitmaps, text, x, y, fg, bg)
                 }
+                Op::Area(r) => c.area(r),
             }
         }
     }
@@ -921,6 +1002,10 @@ impl<'a> Iterator for Ops<'a> {
                 let text = view_u8(self.data((n as usize).div_ceil(4)), n as usize);
                 Op::Text { font_id: a, bitmaps, x, y, fg: b, bg, text }
             }
+            code::AREA => {
+                let [p, sz] = self.args();
+                Op::Area(Rect::new(lo(p) as i16, hi(p) as i16, lo(sz), hi(sz)))
+            }
             op => panic!("dl: bad opcode {op} at word {}", self.i - 1),
         })
     }
@@ -1104,6 +1189,9 @@ impl Canvas for Recorder {
     }
     fn scissor(&self) -> Option<Rect> {
         self.scissor.get()
+    }
+    fn area(&self, r: Rect) {
+        self.l().call(&[header(code::AREA, 0, 0), pki(r.x, r.y), pk(r.w, r.h)]);
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
@@ -1472,6 +1560,7 @@ mod tests {
         r.fill_rounded_rect_at(-1, -2, 3, 4, 5, 6, 7);
         r.fill_gradient_rounded_rect_at(-1, -2, 3, 4, 5, 6, 7, 1);
         r.stroke_rounded_rect(-1, -2, 3, 4, 5, 6, 7);
+        r.area(Rect::new(-16, 32, 1280, 800));
         r.set_scissor(None);
 
         let want = [
@@ -1512,6 +1601,7 @@ mod tests {
             Op::FillRoundedRectAt { x: -1, y: -2, w: 3, h: 4, r: 5, color: 6, alpha: 7 },
             Op::GradientRoundedRectAt { x: -1, y: -2, w: 3, h: 4, r: 5, c1: 6, c2: 7, dir: 1 },
             Op::StrokeRoundedRect { x: -1, y: -2, w: 3, h: 4, r: 5, t: 6, color: 7 },
+            Op::Area(Rect::new(-16, 32, 1280, 800)),
             Op::SetScissor(None),
         ];
         let l = r.list();
@@ -1521,6 +1611,13 @@ mod tests {
             assert_eq!(g, w);
         }
         assert_eq!(l.len(), want.len());
+        // Each call's opcode, as recorded.
+        let mut it = l.ops();
+        loop {
+            let at = it.i;
+            let Some(op) = it.next() else { break };
+            assert_eq!(op.code() as u32, l.words[at] & 0xFF, "{op:?}");
+        }
         assert_eq!(l.end_scissor(Some(Rect::new(0, 0, 1, 1))), None);
         assert!(l.compact() == *l);
         // FillRect: a header and two words, not a padded enum.

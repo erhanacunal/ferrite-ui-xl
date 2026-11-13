@@ -66,6 +66,8 @@ use crate::platform::Exynos4412Platform as P;
 use crate::renderer::{self, Sprite};
 
 pub mod shaders;
+mod play;
+pub use play::{PLAY_COUNTS, PLAY_NAMES, PLAY_LAST_OP, play};
 
 const TILE: i32 = 16;
 /// Where a piece of a box away from its corners is against them: far inside.
@@ -676,6 +678,12 @@ fn merge_areas(areas: &[Rect]) -> Vec<R> {
     }
 }
 
+/// `MODE_AREAS` (`WidgetRenderer::play_areas`): the core's areas merged as [`compose`]
+/// merges them, so the recording covers the frames the player will draw.
+pub fn play_areas(areas: &[Rect]) -> Vec<Rect> {
+    merge_areas(areas).iter().map(R::rect).collect()
+}
+
 /// Where the compositor's time goes, summed since boot (HTTP `/api/status`): the names of
 /// [`TIMES`]' slots. GPU frames, their draws, pieces and pixels; the HAL's GP / PP / whole-frame
 /// times (resets and L2 clear included in the last); CPU time building and running the frames,
@@ -1009,6 +1017,14 @@ impl State {
             (inner.x0, inner.y0)
         };
         let at = R { x0: x, y0: y, x1: x + pw, y1: y + ph };
+        let (tex, shift, opaque) = self.image(ctx, img)?;
+        Some(Some(Picture { at, tex, shift, opaque }))
+    }
+
+    /// `img` as a texture: a raw opaque RGB565 picture where it is in the flash shadow (its
+    /// first texel `shift` texels into the texture; opaque), else decoded ([`Images`]).
+    fn image(&mut self, ctx: &Ctx<P>, img: &ferrite_core::image::Image) -> Option<(Tex, usize, bool)> {
+        let (pw, ph) = (img.width as i32, img.height as i32);
         if img.is_raw_opaque()
             && let Some(addr) = renderer::picture_addr(img.data_addr(), (pw * ph * 2) as usize)
         {
@@ -1017,11 +1033,10 @@ impl State {
             let stride = pw as usize * 2;
             if addr % 2 == 0 && (self.any_565 || stride % 64 == 0) && pw as usize + shift <= 4096 {
                 let tex = Tex { addr: addr - addr % 64, w: pw as usize + shift, h: ph as usize, stride, fmt: Fmt::Rgb565 };
-                return Some(Some(Picture { at, tex, shift, opaque: true }));
+                return Some((tex, shift, true));
             }
         }
-        let tex = self.images.tex(ctx, img)?;
-        Some(Some(Picture { at, tex, shift: 0, opaque: false }))
+        Some((self.images.tex(ctx, img)?, 0, false))
     }
 
     /// `p`, cut to the widget's box `r` (as the scissor). True if it covers the box opaquely.

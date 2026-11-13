@@ -120,6 +120,12 @@ pub trait Canvas {
     {
         font.draw_str(self, flash, text, x, y, fg, bg)
     }
+
+    // --- Markers ---
+    /// What follows repaints `area` whole, back to front (`render::MODE_AREAS`):
+    /// nothing to draw; a recording canvas notes it for a player that
+    /// repaints areas (a GPU compositor).
+    fn area(&self, _area: Rect) {}
 }
 
 /// The immediate canvas: everything goes straight to the backend.

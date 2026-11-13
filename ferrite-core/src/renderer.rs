@@ -80,6 +80,22 @@ pub trait WidgetRenderer<P: Platform> {
         false
     }
 
+    /// Play a frame recorded in compositor order (`render::MODE_AREAS`):
+    /// areas, each after its `dl::Op::Area` marker, repainted whole; an empty
+    /// marker = drawing outside them follows. The images and fonts it refers
+    /// to are `ctx`'s (`Ctx::refs`). Return `false`, having drawn nothing,
+    /// to have it replayed on the CPU.
+    fn play(_ctx: &Ctx<P>, _list: &crate::dl::List) -> bool {
+        false
+    }
+
+    /// `MODE_AREAS`: the areas to repaint (and record) for these changed
+    /// ones, disjoint: joined where [`play`](Self::play) draws one area
+    /// over both cheaper than each apart. As given by default.
+    fn play_areas(areas: &[Rect]) -> alloc::vec::Vec<Rect> {
+        areas.to_vec()
+    }
+
     /// Draw widget `id` (absolute box `abs`) into `clip`. Return `false` to
     /// leave it to the built-in drawing. See the module's contract.
     #[inline(always)]

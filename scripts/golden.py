@@ -111,6 +111,9 @@ def main():
     ap.add_argument("--play", action="store_true",
                     help="the render side only plays each frame's display list, recorded by the VM's side "
                          "(FERRITE_SIM_PLAY=1); must match --plain")
+    ap.add_argument("--areas", action="store_true",
+                    help="as --play, recorded in compositor order: changed areas repainted whole, back to front "
+                         "(FERRITE_SIM_AREAS=1); compare with --plain")
     ap.add_argument("--hashes", help="check against / write (--update) this hash file instead of golden/hashes.json")
     a = ap.parse_args()
     global HASHES
@@ -141,7 +144,9 @@ def main():
             env.update(FERRITE_SIM_DL="1", FERRITE_SIM_DL_VERIFY="1")
         if a.stale:
             env.update(FERRITE_SIM_STALE_READS="1")
-        if a.play:
+        if a.areas:
+            env.update(FERRITE_SIM_AREAS="1")
+        elif a.play:
             env.update(FERRITE_SIM_PLAY="1")
         elif a.plain:
             env.update(FERRITE_SIM_PLAIN="1")

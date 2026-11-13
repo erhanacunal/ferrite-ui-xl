@@ -96,6 +96,29 @@ impl WidgetRenderer<P> for ExynosRenderer {
         }
     }
 
+    fn play_areas(areas: &[Rect]) -> alloc::vec::Vec<Rect> {
+        #[cfg(feature = "gpu_compose")]
+        {
+            crate::compose::play_areas(areas)
+        }
+        #[cfg(not(feature = "gpu_compose"))]
+        {
+            areas.to_vec()
+        }
+    }
+
+    fn play(ctx: &Ctx<P>, list: &ferrite_core::dl::List) -> bool {
+        #[cfg(feature = "gpu_compose")]
+        {
+            crate::compose::play(ctx, list)
+        }
+        #[cfg(not(feature = "gpu_compose"))]
+        {
+            let _ = (ctx, list);
+            false
+        }
+    }
+
     fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
         let Some(c) = captures().get(&ctx.objs, id, abs) else { return draw_plain(ctx, id, abs, clip) };
         if !draw_plain(ctx, id, abs, clip) {
@@ -518,6 +541,33 @@ impl Sprite {
         lcd::end_sprite(base, stride * h);
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::SPRITE, crate::perf::cycles().wrapping_sub(t0));
         Some(Self { key, w, h, stride, px, start, used: 0 })
+    }
+
+    /// What `f` draws inside `r` (screen coordinates, the primitives cut to `r`) in a new
+    /// sprite covering `r`, premultiplied, cleaned for the GPU. None if it cannot get the
+    /// memory or `r` is larger than the panel.
+    pub(crate) fn draw_at(ctx: &Ctx<P>, r: &Rect, f: impl FnOnce()) -> Option<Self> {
+        let (w, h) = (r.w as usize, r.h as usize);
+        if w == 0 || h == 0 || w > lcd::PANEL.width || h > lcd::PANEL.height {
+            return None;
+        }
+        let stride = w.next_multiple_of(ROW_ALIGN);
+        let words = stride * h + ROW_ALIGN;
+        let mut px = Vec::new();
+        px.try_reserve_exact(words).ok()?;
+        px.resize(words, 0);
+        let start = ((px.as_ptr() as usize).next_multiple_of(ROW_ALIGN * 4) - px.as_ptr() as usize) / 4;
+        let base = px[start..].as_mut_ptr();
+        let t0 = crate::perf::cycles();
+        let scissor = ctx.lcd.scissor();
+        // SAFETY: as `draw`.
+        unsafe { lcd::begin_sprite_at(base, w, h, stride, r.x as i32, r.y as i32) };
+        ctx.lcd.set_scissor(Some(*r));
+        f();
+        ctx.lcd.set_scissor(scissor);
+        lcd::end_sprite(base, stride * h);
+        ferrite_core::perf::add_sub(ferrite_core::perf::phase::SPRITE, crate::perf::cycles().wrapping_sub(t0));
+        Some(Self { key: 0, w, h, stride, px, start, used: 0 })
     }
 
     fn bytes(&self) -> usize {

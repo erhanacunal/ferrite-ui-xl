@@ -421,20 +421,29 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             // (`ferrite_core::scene::INCREMENTAL`).
             let scene = query_param(query, b"scene");
             // `mode`: 0 normal, 1 plain CPU drawing, 2 CPU2 only plays the display list CPU0
-            // records of each frame (`ferrite_core::render::MODE_*`).
+            // records of each frame, 3 the same recorded in compositor order and played by the
+            // GPU (`compose::play`) (`ferrite_core::render::MODE_*`).
             let mode = query_param(query, b"mode");
+            // `ops`: count the played frames' calls by opcode (`dl::OP_STATS`).
+            let ops = query_param(query, b"ops");
             // `wake`: CPU2 wakes CPU0's UI task when a job ends (`rcore::WAKE`).
-            if let Some(v @ (b"0" | b"1")) = query_param(query, b"wake") {
-                crate::rcore::WAKE.store(v == b"1", Ordering::Relaxed);
-            }
-            let mode_ok = matches!(mode, None | Some(b"0" | b"1" | b"2"));
+            let wake = query_param(query, b"wake");
+            let mode_ok = matches!(mode, None | Some(b"0" | b"1" | b"2" | b"3"));
             let bit = |v: Option<&[u8]>| matches!(v, None | Some(b"0" | b"1"));
-            if (on.is_some() || fence.is_some() || scene.is_some() || mode.is_some())
+            if (on.is_some() || fence.is_some() || scene.is_some() || mode.is_some() || ops.is_some() || wake.is_some())
                 && bit(on)
                 && bit(fence)
                 && bit(scene)
+                && bit(ops)
+                && bit(wake)
                 && mode_ok
             {
+                if let Some(v) = ops {
+                    ferrite_core::dl::OP_STATS.store(v == b"1", Ordering::Relaxed);
+                }
+                if let Some(v) = wake {
+                    crate::rcore::WAKE.store(v == b"1", Ordering::Relaxed);
+                }
                 if let Some(v) = mode {
                     crate::rcore::MODE.store(v[0] - b'0', Ordering::Relaxed);
                 }
@@ -449,7 +458,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 text(socket, "200 OK", "render core set\n").await?;
             } else {
-                text(socket, "400 Bad Request", "on=0|1, fence=0|1, scene=0|1 and/or mode=0|1|2\n").await?;
+                text(socket, "400 Bad Request", "on=0|1, fence=0|1, scene=0|1, ops=0|1, wake=0|1 and/or mode=0|1|2\n").await?;
             }
         }
         (b"POST", b"/api/dl") => {
@@ -988,6 +997,33 @@ fn status_json() -> String {
             ",\"present_waits\":{},\"present_wait_us\":{},\"clean_us\":{},\"start_clean_us\":{},\"pickup_us\":{},\"pickup_max_us\":{}}}",
             t.waits, t.wait_us, t.clean_us, t.start_clean_us, t.pickup_us, t.pickup_max_us
         );
+    }
+    {
+        // Played frames' calls by opcode since boot (`POST /api/rcore?ops=1`):
+        // name: [calls, words].
+        use core::sync::atomic::Ordering::Relaxed;
+        use ferrite_core::dl;
+        let _ = write!(s, ",\"dl_ops\":{{\"on\":{}", dl::OP_STATS.load(Relaxed));
+        for i in 0..dl::OPCODES {
+            let n = dl::OP_CALLS[i].load(Relaxed);
+            if n != 0 {
+                let _ = write!(s, ",\"{}\":[{},{}]", dl::OP_NAMES[i], n, dl::OP_WORDS[i].load(Relaxed));
+            }
+        }
+        s.push('}');
+    }
+    #[cfg(feature = "gpu_compose")]
+    {
+        // GPU player (`MODE_AREAS`): frames played / declined since boot, the last call it
+        // couldn't draw.
+        use core::sync::atomic::Ordering::Relaxed;
+        use crate::compose::{PLAY_COUNTS, PLAY_LAST_OP, PLAY_NAMES};
+        s.push_str(",\"gplay\":{");
+        for (i, name) in PLAY_NAMES.iter().enumerate() {
+            let _ = write!(s, "\"{}\":{},", name, PLAY_COUNTS[i].load(Relaxed));
+        }
+        let op = PLAY_LAST_OP.load(Relaxed) as usize;
+        let _ = write!(s, "\"last_op\":\"{}\"}}", ferrite_core::dl::OP_NAMES.get(op).copied().unwrap_or("?"));
     }
     {
         // Display lists (`/api/dl`): counters since boot, bytes held now.

@@ -337,6 +337,18 @@ fn print_snapshot_stats() {
                 p[2].load(Relaxed)
             );
         }
+        // Calls of the played frames by opcode (`FERRITE_SIM_OP_STATS`).
+        if ferrite_core::dl::OP_STATS.load(Relaxed) {
+            use ferrite_core::dl;
+            let mut s = String::from("sim: dl ops");
+            for i in 0..dl::OPCODES {
+                let n = dl::OP_CALLS[i].load(Relaxed);
+                if n != 0 {
+                    s += &format!(" {}={}/{}w", dl::OP_NAMES[i], n, dl::OP_WORDS[i].load(Relaxed));
+                }
+            }
+            eprintln!("{s}");
+        }
         // Lists that referred to an image or font the replaying side didn't hold.
         let misses = ferrite_core::dl::REF_MISSES.load(Relaxed);
         if misses != 0 {

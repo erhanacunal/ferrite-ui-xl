@@ -351,6 +351,8 @@ const OP_W_GET: u8 = 0x3B; // + u8 prop_id
 const OP_W_PARENT: u8 = 0x3C; // + u8 parent_id
 const OP_W_SET_LEN: u8 = 0x3D; // + u8 prop_id + u8 len + data
 const OP_ARR_ALLOC: u8 = 0x3E; // + u8 size
+/// Pop size, push a zero-filled array (sizes over 255; `ARR_ALLOC` takes a u8).
+const OP_ARR_ALLOC_S: u8 = 0x2E;
 const OP_ARR_INIT: u8 = 0x3F; // + u8 count + i32 values LE
 const OP_F_READ: u8 = 0x40; // + u32 addr + u16 len
 const OP_F_WRITE: u8 = 0x41; // + u32 addr + u8 len + data
@@ -2301,6 +2303,13 @@ impl Vm {
             OP_ARR_ALLOC => {
                 let size = self.read_u8() as usize;
                 match ctx.objs.arr_alloc(size) {
+                    Some(id) => self.push(id as i32),
+                    None => self.fail(fault::ARR_ALLOC),
+                }
+            }
+            OP_ARR_ALLOC_S => {
+                let size = self.pop();
+                match usize::try_from(size).ok().and_then(|n| ctx.objs.arr_alloc(n)) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::ARR_ALLOC),
                 }
@@ -5038,6 +5047,31 @@ mod anim_tests {
         assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
         let want: Vec<i32> = (100..120).collect();
         assert_eq!(ctx.objs.arr(vm.var_get(3) as ObjPtr), Some(&want[..]));
+    }
+
+    #[test]
+    fn arrays_over_255_elements_take_their_size_from_the_stack() {
+        // a = ARR_ALLOC_S(600); n = len(a); a[599] = 7; v = a[599]; HALT
+        let [lo, hi] = 600i16.to_le_bytes();
+        let code = [
+            OP_PUSH_I16, lo, hi, OP_ARR_ALLOC_S, OP_STORE, 0,
+            OP_LOAD, 0, OP_ARR_LEN, OP_STORE, 1,
+            OP_LOAD, 0, OP_PUSH_I16, 0x57, 0x02, OP_PUSH_I8, 7, OP_ARR_STORE,
+            OP_LOAD, 0, OP_PUSH_I16, 0x57, 0x02, OP_ARR_LOAD, OP_STORE, 2,
+            OP_HALT,
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
+        assert_eq!(vm.var_get(1), 600);
+        assert_eq!(vm.var_get(2), 7);
+
+        // A negative size faults instead of allocating something.
+        let code = [OP_PUSH_I8, 0xFF, OP_ARR_ALLOC_S, OP_HALT];
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 100);
+        assert_eq!(vm.fault(), fault::ARR_ALLOC);
     }
 
     #[test]

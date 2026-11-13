@@ -80,9 +80,11 @@ pub struct Image {
     palette_addr: u32,
     data_addr: u32,
     data_size: u32,
-    /// Decoded RGB565 pixels (JPEG only), `stride` per row.
+    /// Decoded RGB565 pixels (JPEG only), `stride` per row. Never written
+    /// after decoding, so copies share them (the render context's copy of
+    /// the VM's images, `ImageList::sync_from`).
     #[cfg(feature = "jpeg")]
-    pixels: Option<AlignedBuf>,
+    pixels: Option<alloc::sync::Arc<AlignedBuf>>,
     #[cfg(feature = "jpeg")]
     stride: u16,
 }
@@ -219,7 +221,7 @@ impl Image {
             return false;
         }
         self.stride = stride;
-        self.pixels = Some(px);
+        self.pixels = Some(alloc::sync::Arc::new(px));
         true
     }
 
@@ -728,8 +730,8 @@ impl ImageList {
     }
 
     /// Make this list hold the images `other` holds (the render context's
-    /// copy of the VM's list): copies the ones missing (decoded pixels
-    /// included); starts over if it holds one `other` doesn't.
+    /// copy of the VM's list): copies the ones missing (their decoded pixels
+    /// shared, not copied); starts over if it holds one `other` doesn't.
     pub fn sync_from(&mut self, other: &ImageList) {
         let mine = &self.images[..self.count as usize];
         let theirs = &other.images[..other.count as usize];

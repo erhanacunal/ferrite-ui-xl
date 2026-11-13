@@ -31,6 +31,7 @@
 extern crate alloc;
 
 use crate::fs::{Fs, RES_FONT};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::flash::{FlashBackend, FlashImpl};
 use crate::canvas::Canvas;
@@ -47,6 +48,8 @@ const BITMAP_BUF_SIZE: usize = 128;
 pub const EMBEDDED_FONT_ID: u8 = 0;
 
 /// Glyph + codepoint storage — ROM reference (embedded) or heap-allocated (flash-loaded).
+/// Never changed after loading, so copies share it (`Arc`: the render context's copy of
+/// the VM's fonts, `FontList::sync_from`, costs no copy of the tables).
 #[derive(Clone)]
 enum GlyphData {
     Static {
@@ -54,8 +57,8 @@ enum GlyphData {
         codepoints: &'static [u16],
     },
     Heap {
-        glyphs: Vec<GfxGlyph>,
-        codepoints: Vec<u16>,
+        glyphs: Arc<[GfxGlyph]>,
+        codepoints: Arc<[u16]>,
     },
 }
 
@@ -76,6 +79,7 @@ impl GlyphData {
 }
 
 /// Font — sparse format, binary search on sorted codepoints[].
+#[derive(Clone)]
 pub struct Font {
     pub font_id: u8,
     /// Bits per pixel: 1 = monochrome, 2 = 2bpp anti-aliased
@@ -88,30 +92,17 @@ pub struct Font {
     /// means bitmaps are read from flash.
     embedded_bitmap: *const u8,
     /// RAM copy of the bitmap data (`Platform::CACHE_FONT_BITMAPS`);
-    /// `embedded_bitmap` points into it. Empty when not cached. Only held
-    /// to own the buffer, never read directly.
+    /// `embedded_bitmap` points into it. None when not cached. Only held
+    /// to own the buffer, never read directly. Never written after loading,
+    /// so a copy of the font shares it: the copy's `embedded_bitmap` points
+    /// into the same buffer, alive while any copy holds it.
     #[allow(dead_code)]
-    bitmap_ram: Vec<u8>,
+    bitmap_ram: Option<Arc<[u8]>>,
 }
 
-impl Clone for Font {
-    fn clone(&self) -> Self {
-        let bitmap_ram = self.bitmap_ram.clone();
-        // A cached bitmap is pointed at in the copy's own buffer.
-        let embedded_bitmap = if self.bitmap_ram.is_empty() { self.embedded_bitmap } else { bitmap_ram.as_ptr() };
-        Font {
-            font_id: self.font_id,
-            bpp: self.bpp,
-            y_advance: self.y_advance,
-            glyphs: self.glyphs.clone(),
-            bitmap_addr: self.bitmap_addr,
-            embedded_bitmap,
-            bitmap_ram,
-        }
-    }
-}
-
-// Font only holds a const pointer — Send/Sync safe (single core, no ISR access)
+// Font only holds a const pointer to read-only data (ROM or the shared
+// `bitmap_ram`), so it may move to and be read from another core (the render
+// context's copy).
 unsafe impl Send for Font {}
 unsafe impl Sync for Font {}
 
@@ -130,12 +121,12 @@ impl Font {
             bpp: 1,
             y_advance: 0,
             glyphs: GlyphData::Heap {
-                glyphs: Vec::new(),
-                codepoints: Vec::new(),
+                glyphs: Arc::from([]),
+                codepoints: Arc::from([]),
             },
             bitmap_addr: 0,
             embedded_bitmap: core::ptr::null(),
-            bitmap_ram: Vec::new(),
+            bitmap_ram: None,
         }
     }
 
@@ -221,27 +212,28 @@ impl Font {
 
         let bitmap_addr = gl_base + gl_bytes;
 
-        let mut bitmap_ram = Vec::new();
+        let mut bitmap_ram: Option<Arc<[u8]>> = None;
         if cache_bitmap {
             let len = (entry.offset + entry.size - bitmap_addr) as usize;
-            if bitmap_ram.try_reserve_exact(len).is_ok() {
-                bitmap_ram.resize(len, 0);
-                flash.read(bitmap_addr, &mut bitmap_ram);
+            let mut v = Vec::new();
+            if len != 0 && v.try_reserve_exact(len).is_ok() {
+                v.resize(len, 0);
+                flash.read(bitmap_addr, &mut v);
+                bitmap_ram = Some(Arc::from(v));
             }
         }
-        // The Vec's heap buffer does not move with the Font, so the pointer
-        // stays valid for the Font's lifetime.
-        let embedded_bitmap = if bitmap_ram.is_empty() {
-            core::ptr::null()
-        } else {
-            bitmap_ram.as_ptr()
+        // The Arc's heap buffer does not move with the Font (or its copies),
+        // so the pointer stays valid while one of them holds it.
+        let embedded_bitmap = match &bitmap_ram {
+            Some(b) => b.as_ptr(),
+            None => core::ptr::null(),
         };
 
         Some(Font {
             font_id,
             bpp,
             y_advance,
-            glyphs: GlyphData::Heap { glyphs, codepoints },
+            glyphs: GlyphData::Heap { glyphs: Arc::from(glyphs), codepoints: Arc::from(codepoints) },
             bitmap_addr,
             embedded_bitmap,
             bitmap_ram,
@@ -299,7 +291,7 @@ impl Font {
             glyphs: GlyphData::Static { glyphs, codepoints },
             bitmap_addr: 0,
             embedded_bitmap: bitmap.as_ptr(),
-            bitmap_ram: Vec::new(),
+            bitmap_ram: None,
         }
     }
 
@@ -942,8 +934,9 @@ impl FontList {
     }
 
     /// Make this list hold the fonts `other` holds (the render context's copy
-    /// of the VM's list): copies the ones missing; starts over if it holds
-    /// one `other` doesn't.
+    /// of the VM's list): copies the ones missing (their glyph tables and
+    /// cached bitmaps shared, not copied); starts over if it holds one
+    /// `other` doesn't.
     pub fn sync_from(&mut self, other: &FontList) {
         if self.fonts.len() == other.fonts.len()
             && self.fonts.iter().zip(&other.fonts).all(|(a, b)| a.font_id == b.font_id)
@@ -983,6 +976,34 @@ mod tests {
             crate::embedded_font::Y_ADVANCE,
             crate::embedded_font::BPP,
         )
+    }
+
+    /// A copy of a loaded font (the render context's, `FontList::sync_from`)
+    /// shares its glyph tables and cached bitmap instead of copying them, and
+    /// keeps reading the bitmap after the original is gone.
+    #[test]
+    fn copies_share_the_loaded_tables_and_bitmap() {
+        // V1 font, one glyph 'A' (8×2, advance 9, top 8 px above the baseline).
+        let mut img = alloc::vec![1, 0, 10, 5];
+        img.extend_from_slice(&65u16.to_le_bytes());
+        img.extend_from_slice(&[0, 0, 8, 2, 9, 0, 0xF8]);
+        img.extend_from_slice(&[0xFF, 0x81]);
+        crate::mock::set_flash_image(img.clone());
+        let flash = FlashImpl::with_backend(crate::mock::MockFlash);
+        let entry = crate::fs::ResourceEntry { kind: RES_FONT, flags: 0, offset: 0, size: img.len() as u32 };
+        let f = Font::load_from_entry(&flash, &entry, true).unwrap();
+        let g = f.clone();
+        assert!(!f.embedded_bitmap.is_null());
+        assert_eq!(f.embedded_bitmap, g.embedded_bitmap);
+        match (&f.glyphs, &g.glyphs) {
+            (GlyphData::Heap { glyphs: a, codepoints: c }, GlyphData::Heap { glyphs: b, codepoints: d }) => {
+                assert!(Arc::ptr_eq(a, b) && Arc::ptr_eq(c, d));
+            }
+            _ => panic!("flash fonts keep their tables on the heap"),
+        }
+        drop(f);
+        assert_eq!(unsafe { *g.embedded_bitmap }, 0xFF);
+        assert_eq!(g.glyph(65).map(|x| x.x_advance), Some(9));
     }
 
     /// All lines of `text` wrapped to the width of `fit` in the ROM font.

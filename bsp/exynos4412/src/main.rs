@@ -71,6 +71,7 @@ mod cpuclock;
 mod gpu;
 // CPU1 / CPU3 stopped for standby and started again.
 mod hotplug;
+mod jpeg;
 mod lcd;
 mod model3d;
 #[cfg(feature = "wifi")]
@@ -203,6 +204,7 @@ fn main(_args: BootArgs) -> ! {
         gpio: ferrite_core::gpio::GpioImpl::none(),
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
         audio: ferrite_core::audio::AudioImpl::with_backend(audio::new(pmic)),
+        jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         cursor_visible: false,
         tasks: ferrite_core::task::TaskTable::new(),
     }));
@@ -223,6 +225,7 @@ fn main(_args: BootArgs) -> ! {
         gpio: ferrite_core::gpio::GpioImpl::none(),
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
         audio: ferrite_core::audio::AudioImpl::with_backend(audio),
+        jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         cursor_visible: false,
         tasks: ferrite_core::task::TaskTable::new(),
     });

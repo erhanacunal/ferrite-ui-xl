@@ -49,6 +49,7 @@ impl Platform for Exynos4412Platform {
     type GpioB = ferrite_core::gpio::NoGpio;
     type EepromB = ferrite_core::eeprom::NoEeprom;
     type AudioB = crate::audio::I2sAudio;
+    type JpegB = crate::jpeg::SoftJpeg;
     type Renderer = crate::renderer::ExynosRenderer;
 
     // Default layout (config sector 0, FS from 0x1000) inside the RAM region.

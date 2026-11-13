@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "device": "exynos4412-xl",
+  "screen": [1280, 800],
+  "render_mode": "dirty",
+  "include_dirs": ["../../../../ferrite-ui/lib"],
+  "images": [
+    {"name": "sunset", "image_id": 1, "source": "assets/sunset.jpg", "mode": "jpeg", "quality": 85},
+    {"name": "fractal", "image_id": 2, "source": "assets/fractal.jpg", "mode": "jpeg", "quality": 85},
+    {"name": "rings", "image_id": 3, "source": "assets/rings.jpg", "mode": "jpeg", "quality": 85}
+  ],
+  "programs": [
+    {"name": "main", "source": "main.fl"}
+  ]
+}

@@ -29,7 +29,7 @@ gpu_compose = ["g2d_render"]
 wifi = ["exynos_4412_rs/wifi-net", "dep:embassy-net", "dep:embassy-sync"]
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["external_alloc"] }
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "jpeg"] }
 # HAL: its panic handler prints file:line on the UART console and halts. A ferrite
 # panic screen (LCD + USART, like the other BSPs) can replace it later: turn
 # default features off then.
@@ -42,3 +42,5 @@ embassy-time = "0.5"
 # The HAL's multi-core implementation (`rcore::job_done`: a waker shared with CPU2).
 critical-section = "1.2"
 embassy-sync = { version = "0.8", optional = true }
+zune-jpeg = { version = "0.5", default-features = false }
+zune-core = { version = "0.5", default-features = false }

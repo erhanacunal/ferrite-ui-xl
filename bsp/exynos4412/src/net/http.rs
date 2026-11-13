@@ -928,6 +928,14 @@ fn status_json() -> String {
             crate::battery::LAST_PERCENT.load(Relaxed),
             crate::battery::LAST_CHARGER.load(Relaxed)
         );
+        // JPEG images decoded by the CPU (jpeg.rs).
+        let _ = write!(
+            s,
+            ",\"jpeg\":{{\"decoded\":{},\"failed\":{},\"last_us\":{}}}",
+            crate::jpeg::DECODED.load(Relaxed),
+            crate::jpeg::FAILED.load(Relaxed),
+            crate::jpeg::LAST_US.load(Relaxed)
+        );
     }
     let _ = write!(s, ",\"cpu_mhz\":{}", crate::cpuclock::mhz());
     {

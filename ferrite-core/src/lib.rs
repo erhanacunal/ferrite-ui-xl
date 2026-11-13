@@ -52,6 +52,7 @@ pub mod perf;
 pub mod strpool;
 pub mod syscfg;
 pub mod sysinfo;
+pub mod storage;
 pub mod task;
 pub mod types;
 pub mod view;

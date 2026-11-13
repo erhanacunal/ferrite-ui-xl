@@ -22,6 +22,7 @@ use ferrite_core::pool::ObjPool;
 mod audio;
 mod backlight;
 mod eeprom;
+mod storage;
 mod flash;
 mod gpio;
 mod jpeg;
@@ -142,6 +143,7 @@ fn main() {
             jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
             gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
             eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(None)),
+            storage: ferrite_core::storage::StorageImpl::with_backend(storage::SimStorage::new(None)),
             cursor_visible: false,
             tasks: ferrite_core::task::TaskTable::new(),
         }))
@@ -164,6 +166,7 @@ fn main() {
         jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
         eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(eeprom_path)),
+        storage: ferrite_core::storage::StorageImpl::with_backend(storage::SimStorage::new(arg_value("--storage"))),
         cursor_visible: false,
         tasks: ferrite_core::task::TaskTable::new(),
     });
@@ -193,6 +196,14 @@ fn main() {
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
 }
 
+/// The value after `name` on the command line.
+fn arg_value(name: &str) -> Option<String> {
+    let mut args = env::args().skip(1);
+    args.by_ref().find(|a| a == name)?;
+    args.next()
+}
+
+/// `--storage <dir>` (read by `arg_value`): programs' files there, else in RAM.
 /// `--fsimage <path>`, any number of `--tap X,Y,MS` / `--swipe X0,Y0,X1,Y1,MS[,DUR]`
 /// (scripted presses),
 /// `--eeprom <path>` (file that keeps the virtual EEPROM across runs) and

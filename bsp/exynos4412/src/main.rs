@@ -68,6 +68,7 @@ mod compose;
 // The CPU clock at run time (HTTP `POST /api/cpu?mhz=N`), thermal throttling, idle sleep.
 #[cfg_attr(not(feature = "wifi"), allow(dead_code))]
 mod cpuclock;
+mod eeprom;
 mod gpu;
 // CPU1 / CPU3 stopped for standby and started again.
 mod hotplug;
@@ -151,6 +152,8 @@ fn main(_args: BootArgs) -> ! {
     // Resources: the CACHE partition's FAT32 (FERRITE/FLASH.BIN) → RAM region.
     storage::init();
     flash::init();
+    // The user EEPROM: FERRITE/EEPROM.BIN → RAM.
+    eeprom::load();
 
     power_off_unused(mct);
 
@@ -202,7 +205,8 @@ fn main(_args: BootArgs) -> ! {
         usart: UsartImpl::with_backend(usart::HwUart),
         systick: SystickImpl::init(),
         gpio: ferrite_core::gpio::GpioImpl::none(),
-        eeprom: ferrite_core::eeprom::EepromImpl::none(),
+        eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::FileEeprom),
+        storage: ferrite_core::storage::StorageImpl::with_backend(storage::CacheStorage),
         audio: ferrite_core::audio::AudioImpl::with_backend(audio::new(pmic)),
         jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         cursor_visible: false,
@@ -223,7 +227,8 @@ fn main(_args: BootArgs) -> ! {
         usart: UsartImpl::with_backend(usart::HwUart),
         systick: SystickImpl::init(),
         gpio: ferrite_core::gpio::GpioImpl::none(),
-        eeprom: ferrite_core::eeprom::EepromImpl::none(),
+        eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::FileEeprom),
+        storage: ferrite_core::storage::StorageImpl::with_backend(storage::CacheStorage),
         audio: ferrite_core::audio::AudioImpl::with_backend(audio),
         jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         cursor_visible: false,

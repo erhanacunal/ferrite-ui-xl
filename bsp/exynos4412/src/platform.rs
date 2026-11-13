@@ -47,20 +47,26 @@ impl Platform for Exynos4412Platform {
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::MctSystick;
     type GpioB = ferrite_core::gpio::NoGpio;
-    type EepromB = ferrite_core::eeprom::NoEeprom;
+    // FERRITE/EEPROM.BIN on CACHE (eeprom.rs).
+    type EepromB = crate::eeprom::FileEeprom;
+    // Programs' files in FERRITE/USER on CACHE (storage.rs).
+    type StorageB = crate::storage::CacheStorage;
     type AudioB = crate::audio::I2sAudio;
     type JpegB = crate::jpeg::SoftJpeg;
     type Renderer = crate::renderer::ExynosRenderer;
 
     // Default layout (config sector 0, FS from 0x1000) inside the RAM region.
 
-    // WM8758 codec on I2S0 + pdma0 (audio.rs). JPEG → software decoder behind
-    // `jpeg` later (no HW codec driver yet). Mirrored in
-    // ferrite-ui tools/devices/exynos4412-xl.json (caps.*).
+    // WM8758 codec on I2S0 + pdma0 (audio.rs). JPEG: the CPU decodes
+    // (jpeg.rs, zune-jpeg; the SoC codec's crate is GPL). Storage: programs'
+    // files on CACHE (storage.rs). Mirrored in ferrite-ui
+    // tools/devices/exynos4412-xl.json (caps.*).
     const CAPS: u32 = ferrite_core::platform::CAP_AUDIO
+        | ferrite_core::platform::CAP_JPEG
         | ferrite_core::platform::CAP_MULTI_PROGRAM
         | ferrite_core::platform::CAP_SUPEROPS
-        | ferrite_core::platform::CAP_NATIVE_FLEX;
+        | ferrite_core::platform::CAP_NATIVE_FLEX
+        | ferrite_core::platform::CAP_STORAGE;
 
     const ANIM_SLOTS: usize = 64;
     // Glyph bitmaps in RAM at font load: text drawing then needs no
@@ -165,7 +171,9 @@ impl PlatformRuntime for Exynos4412Platform {
                 core::hint::spin_loop();
             }
         }
-        // A finished writefs (or a config write) reaches the eMMC first.
+        // A finished writefs (or a config write), programs' files and the
+        // EEPROM reach the eMMC first.
+        crate::storage::sync(true);
         crate::flash::save_if_dirty(true);
         exynos_4412_rs::console::flush();
         power::restart(BootMode::Normal)
@@ -262,6 +270,8 @@ impl PlatformRuntime for Exynos4412Platform {
         crate::backlight::service(ctx);
         // Config writes (touch calibration…): save once they settle.
         crate::flash::save_if_dirty(false);
+        // Programs' written files and the EEPROM: once writes settle.
+        crate::storage::sync(false);
         // An FS image uploaded over HTTP, a restart request (net/).
         // (Screen grabs read the shadow: not while the render core draws.)
         #[cfg(feature = "wifi")]
@@ -307,6 +317,8 @@ fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
     ferrite_core::render::wait_idle(ctx);
     lcd::flush_wait();
     ctx.audio.stop();
+    // The battery may run out asleep.
+    crate::storage::sync(true);
     let gpu = crate::gpu::suspend();
     #[cfg(feature = "wifi")]
     let wifi = crate::net::suspend();
@@ -350,6 +362,7 @@ fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
             );
             if r.press == Press::Long {
                 // Held 2 s while asleep: power off, as when awake.
+                crate::storage::sync(true);
                 crate::flash::save_if_dirty(true);
                 exynos_4412_rs::console::flush();
                 power::power_off();

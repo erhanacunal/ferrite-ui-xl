@@ -1,0 +1,184 @@
+// main.fl — writable storage and the EEPROM (devices with caps.storage)
+//
+// At start: a boot counter in the EEPROM (bytes 0-1), then one line
+// appended to /LOGS/BOOT.TXT. The buttons append a line, read the file back,
+// and delete it and its directory. The lower label lists the root and /LOGS.
+// On the tablet the files are in FERRITE/USER on the eMMC (kept across
+// boots); in the sim with --storage DIR in DIR.
+
+#include "core.fl"
+#include "color.fl"
+#include "storage.fl"
+
+var status_lbl;
+var file_lbl;
+var list_lbl;
+var append_btn;
+var read_btn;
+var delete_btn;
+var boots = 0;
+var lines = 0;
+var buf[255];
+
+fn style_label(l: widget, x, y, w, h, color) {
+    target(l);
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(bg_color, 0x2945);
+    set(text_color, color);
+    set(text_align, ALIGN_LEFT);
+    set(padding, 12, 12, 12, 12);
+    set(multi_line, 1);
+    parent(0);
+}
+
+fn style_button(b: widget, x, text) {
+    target(b);
+    set(kind, KIND_BUTTON);
+    set(location, x, 40);
+    set(size, 280, 70);
+    set(bg_color, 0x3A6B);
+    set(press_color, 0x5CBF);
+    set(clickable, ON);
+    parent(0);
+    var t = alloc();
+    target(t);
+    set(kind, KIND_LABEL);
+    set(location, 0, 0);
+    set(size, 280, 70);
+    set(text, text);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(b);
+}
+
+fn show_status(text) {
+    target(status_lbl);
+    set(text, text);
+}
+
+// One line at the end of /LOGS/BOOT.TXT.
+fn append_line(text) {
+    var r = diskMkdir("/logs");
+    if (r != 0 && r != DISK_ERR_EXISTS) {
+        return r;
+    }
+    var h = diskOpen("/logs/boot.txt", DISK_APPEND);
+    if (h < 0) {
+        return h;
+    }
+    r = fileWriteStr(h, text);
+    fileClose(h);
+    lines = lines + 1;
+    return r;
+}
+
+// The file, its first 255 bytes as text.
+fn show_file() {
+    var h = diskOpen("/logs/boot.txt", DISK_READ);
+    if (h < 0) {
+        target(file_lbl);
+        set(text, sprintf("/LOGS/BOOT.TXT: error %d", h));
+        return 0;
+    }
+    var size = fileSize(h);
+    var n = fileReadArr(h, buf, 255);
+    fileClose(h);
+    target(file_lbl);
+    set(text, sprintf("/LOGS/BOOT.TXT, %d bytes:\n%s", size, arrToStr(buf, n)));
+    return 0;
+}
+
+fn list_dir(dir) {
+    var out = sprintf("%s:", dir);
+    var i = 0;
+    var name = diskList(dir, 0);
+    while (strLen(name) > 0) {
+        out = sprintf("%s %s", out, name);
+        i = i + 1;
+        name = diskList(dir, i);
+    }
+    if (i == 0) {
+        out = sprintf("%s (empty)", out);
+    }
+    return out;
+}
+
+fn show_list() {
+    var k = diskExists("/logs");
+    var root = list_dir("/");
+    var logs = "";
+    if (k == DISK_DIR) {
+        logs = list_dir("/logs");
+    } else {
+        logs = sprintf("/LOGS: diskExists %d", k);
+    }
+    target(list_lbl);
+    set(text, sprintf("%s\n%s", root, logs));
+}
+
+fn on_append(w) {
+    var r = append_line(sprintf("tap at %d ms\n", millis()));
+    show_status(sprintf("append: %d", r));
+    show_file();
+    show_list();
+    strClear();
+}
+
+fn on_read(w) {
+    show_status("read back");
+    show_file();
+    show_list();
+    strClear();
+}
+
+fn on_delete(w) {
+    var a = diskDelete("/logs/boot.txt");
+    var b = diskRmdir("/logs");
+    show_status(sprintf("diskDelete %d, diskRmdir %d", a, b));
+    show_file();
+    show_list();
+    strClear();
+}
+
+fn setup() {
+    append_btn = alloc();
+    style_button(append_btn, 40, "Append a line");
+    target(append_btn);
+    set(on_click, @on_append);
+    read_btn = alloc();
+    style_button(read_btn, 340, "Read back");
+    target(read_btn);
+    set(on_click, @on_read);
+    delete_btn = alloc();
+    style_button(delete_btn, 640, "Delete all");
+    target(delete_btn);
+    set(on_click, @on_delete);
+    status_lbl = alloc();
+    style_label(status_lbl, 40, 130, 1200, 60, YELLOW);
+    file_lbl = alloc();
+    style_label(file_lbl, 40, 200, 1200, 380, WHITE);
+    list_lbl = alloc();
+    style_label(list_lbl, 40, 590, 1200, 170, CYAN);
+
+    // Boot counter: two EEPROM bytes (0xFFFF when erased = never booted).
+    boots = eepromRead(0) + eepromRead(1) * 256;
+    if (boots == 0xFFFF) {
+        boots = 0;
+    }
+    boots = boots + 1;
+    eepromWrite(0, boots);
+    eepromWrite(1, boots / 256);
+
+    var r = append_line(sprintf("boot %d\n", boots));
+    show_status(sprintf("boot %d (EEPROM %d bytes), append: %d", boots, eepromSize(), r));
+    show_file();
+    show_list();
+    strClear();
+    render();
+    return 0;
+}
+
+fn loop() {
+}

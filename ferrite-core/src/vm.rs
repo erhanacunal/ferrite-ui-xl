@@ -20,6 +20,8 @@ use crate::render;
 
 #[path = "vm_flex.rs"]
 mod flex;
+#[path = "vm_storage.rs"]
+mod disk;
 pub use flex::FLEX_AUTO;
 pub(crate) use flex::flush as flex_flush;
 use crate::strpool;
@@ -2613,6 +2615,7 @@ impl Vm {
                 self.flex_layout(ctx, bx);
                 self.push(0);
             }
+            disk::OP_DISK_OPEN..=disk::OP_FILE_READ_ARR => self.storage_op(ctx, op),
             OP_PROGRAM_NAME => {
                 let index = self.pop();
                 let mut buf = [0u8; crate::fs::NAME_LEN];
@@ -2684,6 +2687,14 @@ impl Vm {
             }
             OP_FILE_READ => {
                 let handle = self.pop();
+                if let Some(slot) = self.storage_slot(ctx, handle) {
+                    let mut b = [0u8; 1];
+                    let r = match ctx.storage.read(slot, &mut b) {
+                        Ok(1) => b[0] as i32,
+                        _ => FILE_EOF,
+                    };
+                    return self.push(r);
+                }
                 match self.file_slot_mut(handle) {
                     Some(f) => {
                         if f.pos >= f.size {
@@ -2701,6 +2712,10 @@ impl Vm {
             }
             OP_FILE_SIZE => {
                 let handle = self.pop();
+                if let Some(slot) = self.storage_slot(ctx, handle) {
+                    let r = ctx.storage.size(slot).map_or_else(|e| e, |n| n as i32);
+                    return self.push(r);
+                }
                 match self.file_slot(handle) {
                     Some(f) => self.push(f.size as i32),
                     None => self.fail(fault::BAD_FILE),
@@ -2708,6 +2723,10 @@ impl Vm {
             }
             OP_FILE_CLOSE => {
                 let handle = self.pop();
+                if let Some(slot) = self.storage_slot(ctx, handle) {
+                    ctx.storage.close(slot);
+                    return;
+                }
                 match self.file_slot_index(handle) {
                     Some(idx) => self.open_files[idx] = None,
                     None => self.fail(fault::BAD_FILE),
@@ -2715,6 +2734,10 @@ impl Vm {
             }
             OP_FILE_SEEK => {
                 let (handle, pos) = self.pop2();
+                if let Some(slot) = self.storage_slot(ctx, handle) {
+                    let _ = ctx.storage.seek(slot, pos);
+                    return;
+                }
                 match self.file_slot_mut(handle) {
                     Some(f) => f.pos = (pos.max(0) as u32).min(f.size),
                     None => self.fail(fault::BAD_FILE),
@@ -3838,6 +3861,18 @@ impl Vm {
         self.open_files[idx].as_mut()
     }
 
+    /// Reads up to `buf.len()` bytes of resource file `handle` (open) from its
+    /// position; the bytes read.
+    fn resource_read<P: Platform>(&mut self, ctx: &Ctx<P>, handle: i32, buf: &mut [u8]) -> usize {
+        let Some(f) = self.file_slot_mut(handle) else {
+            return 0;
+        };
+        let n = buf.len().min(f.size.saturating_sub(f.pos) as usize);
+        ctx.flash.read(f.offset + f.pos, &mut buf[..n]);
+        f.pos += n as u32;
+        n
+    }
+
     /// Open a file by name. Returns handle 1 or 2, or 0xFF on error:
     ///   - fs not mounted
     ///   - name not found
@@ -4093,6 +4128,7 @@ mod anim_tests {
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
+            storage: crate::storage::StorageImpl::with_backend(crate::storage::MemStorage::default()),
             cursor_visible: false,
             tasks: crate::task::TaskTable::new(),
         }
@@ -5002,6 +5038,75 @@ mod anim_tests {
         assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
         let want: Vec<i32> = (100..120).collect();
         assert_eq!(ctx.objs.arr(vm.var_get(3) as ObjPtr), Some(&want[..]));
+    }
+
+    #[test]
+    fn storage_files_and_directories() {
+        use disk::*;
+        let mut ctx = mock_ctx();
+        let s = |ctx: &mut Ctx<MockPlatform>, t: &[u8]| ctx.objs.str_alloc(t).unwrap() as u8;
+        let (logs, file, hello) = (s(&mut ctx, b"logs"), s(&mut ctx, b"/Logs/a.txt"), s(&mut ctx, b"hello"));
+        let code = [
+            OP_PUSH_I8, logs, OP_DISK_MKDIR, OP_STORE, 0,
+            OP_PUSH_I8, file, OP_PUSH_1, OP_DISK_OPEN, OP_STORE, 1,
+            OP_LOAD, 1, OP_PUSH_I8, hello, OP_FILE_WRITE_STR, OP_STORE, 2,
+            OP_LOAD, 1, OP_PUSH_I8, b'!', OP_FILE_WRITE, OP_STORE, 3,
+            OP_LOAD, 1, OP_FILE_CLOSE,
+            OP_PUSH_I8, file, OP_PUSH_0, OP_DISK_OPEN, OP_STORE, 4,
+            OP_LOAD, 4, OP_FILE_SIZE, OP_STORE, 5,
+            OP_LOAD, 4, OP_FILE_READ, OP_STORE, 6,
+            OP_ARR_ALLOC, 10, OP_STORE, 7,
+            OP_LOAD, 4, OP_LOAD, 7, OP_PUSH_I8, 10, OP_FILE_READ_ARR, OP_STORE, 8,
+            OP_LOAD, 4, OP_PUSH_I8, b'x', OP_FILE_WRITE, OP_STORE, 9,
+            OP_LOAD, 4, OP_FILE_CLOSE,
+            OP_PUSH_I8, logs, OP_PUSH_0, OP_DISK_LIST, OP_STORE, 10,
+            OP_PUSH_I8, file, OP_DISK_EXISTS, OP_STORE, 11,
+            OP_PUSH_I8, logs, OP_DISK_RMDIR, OP_STORE, 12,
+            OP_PUSH_I8, file, OP_DISK_DELETE, OP_STORE, 13,
+            OP_PUSH_I8, logs, OP_DISK_RMDIR, OP_STORE, 14,
+            OP_PUSH_I8, logs, OP_DISK_EXISTS, OP_STORE, 15,
+            OP_HALT,
+        ];
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 200);
+        assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
+        use crate::storage::{HANDLE_BASE, err};
+        let g: Vec<i32> = (0..16).map(|i| vm.var_get(i)).collect();
+        assert_eq!(g[0], 0, "mkdir");
+        assert_eq!(g[1], HANDLE_BASE);
+        assert_eq!((g[2], g[3]), (5, 1), "bytes written");
+        assert_eq!(g[4], HANDLE_BASE, "the slot was freed by close");
+        assert_eq!((g[5], g[6]), (6, b'h' as i32));
+        assert_eq!(g[8], 5, "the rest of the file");
+        assert_eq!(ctx.objs.arr(g[7] as ObjPtr).unwrap()[..5], [b'e', b'l', b'l', b'o', b'!'].map(i32::from));
+        assert_eq!(g[9], err::BAD_PATH, "opened for reading");
+        assert_eq!(ctx.objs.str_get(g[10] as ObjPtr), b"A.TXT");
+        assert_eq!(g[11], 1, "a file");
+        assert_eq!(g[12], err::NOT_EMPTY);
+        assert_eq!((g[13], g[14], g[15]), (0, 0, 0));
+    }
+
+    #[test]
+    fn storage_handles_fault_when_not_open_or_not_the_tasks() {
+        use disk::*;
+        let mut ctx = mock_ctx();
+        let name = ctx.objs.str_alloc(b"a.bin").unwrap() as u8;
+        // fileWrite(1, 0): a resource file's handle, not open
+        let mut vm = cb_vm(&[OP_PUSH_1, OP_PUSH_0, OP_FILE_WRITE, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::BAD_FILE);
+        // Task 3 opens a file; main (task 0) may not use its handle.
+        ctx.objs.cur_task = 3;
+        let mut vm = cb_vm(&[OP_PUSH_I8, name, OP_PUSH_1, OP_DISK_OPEN, OP_STORE, 0, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        let h = vm.var_get(0);
+        assert_eq!(h, crate::storage::HANDLE_BASE);
+        ctx.objs.cur_task = 0;
+        let mut vm = cb_vm(&[OP_PUSH_I8, h as u8, OP_FILE_SIZE, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::BAD_FILE);
+        ctx.storage.close_task(3);
+        assert_eq!(ctx.storage.open(0, b"a.bin", 0), crate::storage::HANDLE_BASE);
     }
 
     #[test]

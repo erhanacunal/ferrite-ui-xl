@@ -37,11 +37,12 @@ impl Platform for SimPlatform {
     type JpegB = crate::jpeg::SoftJpeg;
     type GpioB = crate::gpio::SimGpio;
     type EepromB = crate::eeprom::SimEeprom;
+    type StorageB = crate::storage::SimStorage;
     type Renderer = ferrite_core::renderer::DefaultRenderer;
 
     // Software JPEG decoder (sim/src/jpeg.rs) + silent real-time audio
     // output (sim/src/audio.rs).
-    const CAPS: u32 = CAP_AUDIO | CAP_JPEG | ferrite_core::platform::CAP_MULTI_PROGRAM | ferrite_core::platform::CAP_SUPEROPS | ferrite_core::platform::CAP_NATIVE_FLEX;
+    const CAPS: u32 = CAP_AUDIO | CAP_JPEG | ferrite_core::platform::CAP_MULTI_PROGRAM | ferrite_core::platform::CAP_SUPEROPS | ferrite_core::platform::CAP_NATIVE_FLEX | ferrite_core::platform::CAP_STORAGE;
     // The tablet demo animates more widgets at once (exynos4412 has 64).
     const ANIM_SLOTS: usize = 64;
 

@@ -744,6 +744,7 @@ mod tests {
         type JpegB = crate::jpeg::NoJpeg;
         type GpioB = MockGpio;
         type EepromB = MockEeprom;
+        type StorageB = crate::storage::MemStorage;
         type Renderer = crate::renderer::DefaultRenderer;
     }
 
@@ -773,6 +774,7 @@ mod tests {
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(MockEeprom::default()),
+            storage: crate::storage::StorageImpl::with_backend(crate::storage::MemStorage::default()),
             cursor_visible: false,
             tasks: crate::task::TaskTable::new(),
         }
@@ -1253,6 +1255,7 @@ mod tests {
         type JpegB = crate::jpeg::NoJpeg;
         type GpioB = MockGpio;
         type EepromB = MockEeprom;
+        type StorageB = crate::storage::MemStorage;
         type Renderer = SoftComposer;
     }
 
@@ -1277,6 +1280,7 @@ mod tests {
             jpeg: c.jpeg,
             gpio: c.gpio,
             eeprom: c.eeprom,
+            storage: c.storage,
             cursor_visible: c.cursor_visible,
             tasks: c.tasks,
         }

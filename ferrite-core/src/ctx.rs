@@ -6,6 +6,7 @@
 use crate::audio::AudioImpl;
 use crate::backlight::BacklightImpl;
 use crate::eeprom::EepromImpl;
+use crate::storage::StorageImpl;
 use crate::flash::FlashImpl;
 use crate::gpio::GpioImpl;
 #[cfg(feature = "jpeg")]
@@ -51,6 +52,7 @@ pub struct Ctx<P: Platform> {
     pub jpeg: JpegImpl<P::JpegB>,
     pub gpio: GpioImpl<P::GpioB>,
     pub eeprom: EepromImpl<P::EepromB>,
+    pub storage: StorageImpl<P::StorageB>,
     pub cursor_visible: bool,
     /// Task slots and the requests the VMs queue (`multi_program`).
     pub tasks: crate::task::TaskTable,

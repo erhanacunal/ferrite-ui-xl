@@ -10,6 +10,7 @@ extern crate alloc;
 use crate::audio::AudioBackend;
 use crate::backlight::BacklightBackend;
 use crate::eeprom::EepromBackend;
+use crate::storage::StorageBackend;
 use crate::flash::FlashBackend;
 use crate::gpio::GpioBackend;
 #[cfg(feature = "jpeg")]
@@ -43,6 +44,9 @@ pub const CAP_SUPEROPS: u32 = 1 << 4;
 /// `flexLayout(box)` is the native `FLEX_LAYOUT` opcode (0xDB, `vm_flex.rs`)
 /// instead of lib/flex.fl's function (`caps.native_flex`, ferrite-ui-xl).
 pub const CAP_NATIVE_FLEX: u32 = 1 << 5;
+/// Programs create, write and delete files and directories on the board's
+/// storage (`Platform::StorageB`, `storage.rs`; `caps.storage`).
+pub const CAP_STORAGE: u32 = 1 << 6;
 
 // `Sized`: `Renderer` is generic over the platform itself.
 pub trait Platform: Sized {
@@ -67,6 +71,9 @@ pub trait Platform: Sized {
     // User-data EEPROM (`eepromRead`/`eepromWrite`/…); boards without one
     // use `ferrite_core::eeprom::NoEeprom`.
     type EepromB: EepromBackend;
+    // Writable files and directories (`diskOpen`/`fileWrite`/…, `storage.rs`);
+    // boards without storage use `ferrite_core::storage::NoStorage`.
+    type StorageB: StorageBackend;
     // How widgets are drawn (`renderer`); boards without their own use
     // `ferrite_core::renderer::DefaultRenderer`.
     type Renderer: WidgetRenderer<Self>;

@@ -627,6 +627,8 @@ impl<P: PlatformRuntime> Runtime<P> {
         // --- Commit EEPROM writes made this pass (one erase on flash-backed
         //     boards for a whole save; no-op on write-through chips) ---
         self.ctx.eeprom.flush();
+        // Storage writes reach the card once they settle (the backend times it).
+        self.ctx.storage.flush(false);
         lap!(MISC);
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
@@ -723,6 +725,8 @@ impl<P: PlatformRuntime> Runtime<P> {
             RxEvent::Ping => protocol::send_pong(&self.ctx.usart),
             RxEvent::Restart => {
                 self.ctx.eeprom.flush();
+                self.ctx.storage.close_all();
+                self.ctx.storage.flush(true);
                 P::reset()
             }
             RxEvent::MemInfo => {
@@ -759,6 +763,7 @@ impl<P: PlatformRuntime> Runtime<P> {
             RxEvent::FsReady => {
                 self.drop_children();
                 self.tasks.main.reset();
+                self.ctx.storage.close_all();
                 self.ctx.audio.stop();
                 self.ctx.objs.clear();
                 self.ctx.images.clear();
@@ -796,6 +801,8 @@ impl<P: PlatformRuntime> Runtime<P> {
                 self.ack_chunk();
                 self.ctx.usart.flush();
                 self.ctx.eeprom.flush();
+                self.ctx.storage.close_all();
+                self.ctx.storage.flush(true);
                 P::reset();
             }
             RxEvent::UserMessage => {
@@ -1024,6 +1031,7 @@ fn switch_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut
     ctx.objs.clear();
     ctx.images.clear();
     vm.reset();
+    ctx.storage.close_all();
     ctx.audio.stop();
     input.reset(ctx);
     ctx.cursor_visible = false;
@@ -1051,6 +1059,7 @@ fn reload_program<P: PlatformRuntime>(
 ) -> u8 {
     ctx.objs.clear();
     vm.reset();
+    ctx.storage.close_all();
     ctx.audio.stop();
     input.reset(ctx);
     ctx.cursor_visible = false;
@@ -1179,6 +1188,7 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// its objects, the input focus on its widgets; repaint the screen.
     fn clear_task(&mut self, id: u8) {
         self.tasks.kids[id as usize - 1] = None;
+        self.ctx.storage.close_task(id);
         self.ctx.objs.free_task(id);
         let root = self.ctx.objs.root;
         self.ctx.objs.mark_dirty(root);
@@ -2443,6 +2453,7 @@ mod mem_detail_tests {
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
+            storage: crate::storage::StorageImpl::with_backend(crate::storage::MemStorage::default()),
             cursor_visible: false,
             tasks: crate::task::TaskTable::new(),
         }

@@ -81,7 +81,43 @@ pub trait TouchBackend {
             _ => 0,
         }
     }
+
+    /// Backends that queue finger samples as they come (an interrupt, another
+    /// core) instead of being polled: moves the queued samples, oldest first,
+    /// into `out` and returns how many (0 = none waiting). `None` (the
+    /// default) = this backend is polled through [`read_points`](Self::read_points)
+    /// right now; a backend may switch between the two at run time.
+    ///
+    /// Every finger's Down comes before its Moves and its Up. A Down for a
+    /// finger already down counts as a Move, an Up or Move for one not down
+    /// is ignored (a backend resyncing after it dropped samples may repeat).
+    fn read_samples(&self, _cal: &CalParams, _out: &mut [TouchSample]) -> Option<usize> {
+        None
+    }
 }
+
+/// What happened to a finger in a [`TouchSample`].
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum SampleKind {
+    #[default]
+    Down,
+    Move,
+    Up,
+}
+
+/// One queued finger event (`TouchBackend::read_samples`): screen-space
+/// position and the `SystickBackend::millis` time it was read at.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct TouchSample {
+    pub kind: SampleKind,
+    pub id: u8,
+    pub x: u16,
+    pub y: u16,
+    pub ms: u32,
+}
+
+/// Samples taken from a queued backend per poll (the rest wait for the next).
+pub const SAMPLES_PER_POLL: usize = 64;
 
 /// One finger of a multitouch sample.
 #[derive(Clone, Copy, Default, Debug)]
@@ -133,13 +169,15 @@ pub struct TouchEvent {
 }
 
 /// A finger's event (`TouchImpl::poll_pointers`): Press = down, Hold = still
-/// down (every poll, moved or not), Release = up.
+/// down (every poll, moved or not, and every queued move), Release = up.
 #[derive(Clone, Copy, Debug)]
 pub struct PointerEvent {
     pub kind: TouchEventKind,
     pub id: u8,
     pub x: u16,
     pub y: u16,
+    /// When a queued backend read it (`TouchSample::ms`); None = now.
+    pub ms: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -181,9 +219,16 @@ impl<B: TouchBackend> TouchImpl<B> {
 
     /// Multitouch poll: one event per finger — Release for the ones gone
     /// (after the backend's release debounce, at their last position), Hold
-    /// for the ones still down, then Press for the new ones. Don't mix with
-    /// [`poll`](Self::poll) on one `TouchImpl`.
+    /// for the ones still down, then Press for the new ones. A queued backend
+    /// (`read_samples`) gives each sample in order with its time instead,
+    /// then a Hold for each finger still down that the samples didn't move.
+    /// Don't mix with [`poll`](Self::poll) on one `TouchImpl`.
     pub fn poll_pointers(&mut self, mut f: impl FnMut(PointerEvent)) {
+        let mut buf = [TouchSample::default(); SAMPLES_PER_POLL];
+        if let Some(n) = self.be.read_samples(&self.cal, &mut buf) {
+            self.apply_samples(&buf[..n.min(SAMPLES_PER_POLL)], &mut f);
+            return;
+        }
         let any = self.fingers.iter().any(|f| f.is_some());
         if !any && !self.be.is_active() {
             return;
@@ -197,12 +242,12 @@ impl<B: TouchBackend> TouchImpl<B> {
             match pts.iter().find(|p| p.id == fg.id) {
                 Some(p) => {
                     (fg.x, fg.y, fg.fails) = (p.x, p.y, 0);
-                    f(PointerEvent { kind: TouchEventKind::Hold, id: fg.id, x: fg.x, y: fg.y });
+                    f(PointerEvent { kind: TouchEventKind::Hold, id: fg.id, x: fg.x, y: fg.y, ms: None });
                 }
                 None => {
                     fg.fails += 1;
                     if fg.fails >= debounce {
-                        f(PointerEvent { kind: TouchEventKind::Release, id: fg.id, x: fg.x, y: fg.y });
+                        f(PointerEvent { kind: TouchEventKind::Release, id: fg.id, x: fg.x, y: fg.y, ms: None });
                         *slot = None;
                     }
                 }
@@ -214,7 +259,46 @@ impl<B: TouchBackend> TouchImpl<B> {
             }
             if let Some(slot) = self.fingers.iter_mut().find(|s| s.is_none()) {
                 *slot = Some(Finger { id: p.id & 31, x: p.x, y: p.y, fails: 0 });
-                f(PointerEvent { kind: TouchEventKind::Press, id: p.id & 31, x: p.x, y: p.y });
+                f(PointerEvent { kind: TouchEventKind::Press, id: p.id & 31, x: p.x, y: p.y, ms: None });
+            }
+        }
+    }
+
+    /// [`poll_pointers`](Self::poll_pointers) for a queued backend.
+    fn apply_samples(&mut self, samples: &[TouchSample], f: &mut impl FnMut(PointerEvent)) {
+        // Bit n = slot n got a sample this poll.
+        let mut seen = 0u32;
+        for s in samples {
+            let id = s.id & 31;
+            let at = self.fingers.iter().position(|fg| matches!(fg, Some(fg) if fg.id == id));
+            let ev = |kind| PointerEvent { kind, id, x: s.x, y: s.y, ms: Some(s.ms) };
+            match (s.kind, at) {
+                (SampleKind::Down | SampleKind::Move, Some(i)) => {
+                    self.fingers[i] = Some(Finger { id, x: s.x, y: s.y, fails: 0 });
+                    seen |= 1 << i;
+                    f(ev(TouchEventKind::Hold));
+                }
+                (SampleKind::Down, None) => {
+                    if let Some(i) = self.fingers.iter().position(|fg| fg.is_none()) {
+                        self.fingers[i] = Some(Finger { id, x: s.x, y: s.y, fails: 0 });
+                        seen |= 1 << i;
+                        f(ev(TouchEventKind::Press));
+                    }
+                }
+                (SampleKind::Up, Some(i)) => {
+                    // Released where the finger last was (the Up may carry no position).
+                    let fg = self.fingers[i].take().unwrap();
+                    seen &= !(1 << i);
+                    f(PointerEvent { kind: TouchEventKind::Release, id, x: fg.x, y: fg.y, ms: Some(s.ms) });
+                }
+                (SampleKind::Move | SampleKind::Up, None) => {}
+            }
+        }
+        for (i, fg) in self.fingers.iter().enumerate() {
+            if let Some(fg) = fg {
+                if seen & (1 << i) == 0 {
+                    f(PointerEvent { kind: TouchEventKind::Hold, id: fg.id, x: fg.x, y: fg.y, ms: None });
+                }
             }
         }
     }

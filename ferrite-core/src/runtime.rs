@@ -1930,18 +1930,10 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 
     #[inline(never)]
     fn handle(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, touch: &mut TouchImpl<P::TouchB>) {
-        let mut events = [None; crate::touch::MAX_POINTERS * 2];
-        let mut n = 0;
         touch.poll_pointers(|e| {
-            if n < events.len() {
-                events[n] = Some(e);
-                n += 1;
-            }
-        });
-        for e in events.into_iter().take(n).flatten() {
             let (x, y) = ctx.lcd.touch_to_logical(e.x, e.y);
-            self.pointer(ctx, tasks, e.kind, e.id, x, y);
-        }
+            self.pointer(ctx, tasks, e.kind, e.id, x, y, e.ms);
+        });
     }
 
     #[inline(never)]
@@ -2010,8 +2002,10 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 impl FullInput {
     /// One finger's event: the gesture engine gets every finger; the built-in
     /// handling only the primary one.
-    fn pointer<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, kind: TouchEventKind, id: u8, x: u16, y: u16) {
-        let ms = ctx.systick.millis();
+    /// One finger event; `at` = when a queued backend read it (else now).
+    #[allow(clippy::too_many_arguments)]
+    fn pointer<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, kind: TouchEventKind, id: u8, x: u16, y: u16, at: Option<u32>) {
+        let ms = at.unwrap_or_else(|| ctx.systick.millis());
         let id = id & 31;
         let (xi, yi) = (x as i32, y as i32);
         let ptr = |kind| gesture::Ptr { kind, id, x: xi, y: yi, ms };
@@ -3276,6 +3270,52 @@ mod multi_tests {
         assert!(v > at_release && v <= 200, "coasted from {at_release} to {v}");
         assert!(InputHandler::<MockPlatform>::idle(&rt.input), "the fling ended");
         assert_ne!(size(&rt, reg).1, 77, "no click");
+    }
+
+    #[test]
+    fn queued_samples_reach_the_gestures_one_by_one_with_their_times() {
+        use crate::touch::SampleKind::{Down, Move, Up};
+        let mut rt = boot(&[(b"main", list_program())]);
+        let (reg, cont, _row) = list(&rt);
+        // A quick flick read by a queued backend: every 8 ms, all handed
+        // over in one pass (a polled backend would see only the last point).
+        let mut samples = alloc::vec![(Down, 0u8, 50u16, 95u16, 1000u32)];
+        for i in 1..=6u16 {
+            samples.push((Move, 0, 50, 95 - i * 10, 1000 + u32::from(i) * 8));
+        }
+        samples.push((Up, 0, 50, 35, 1050));
+        crate::mock::queue_touch(&samples);
+        crate::mock::set_millis(1050);
+        rt.step();
+        // The drag won at the second move (20 px, past the 18 px slop) and
+        // followed every sample after it.
+        let at_release = rt.ctx.objs.get(cont).value;
+        assert!(at_release >= 40, "scrolled {at_release}");
+        // 10 px / 8 ms = 1250 px/s: it flings.
+        assert!(!InputHandler::<MockPlatform>::idle(&rt.input), "flinging");
+        for i in 1..=200 {
+            crate::mock::set_millis(1050 + i * 16);
+            rt.step();
+        }
+        let v = rt.ctx.objs.get(cont).value;
+        assert!(v > at_release, "coasted from {at_release} to {v}");
+        assert!(InputHandler::<MockPlatform>::idle(&rt.input));
+        assert_ne!(size(&rt, reg).1, 77, "no click");
+    }
+
+    #[test]
+    fn a_queued_tap_clicks_and_repeated_samples_are_ignored() {
+        use crate::touch::SampleKind::{Down, Move, Up};
+        let mut rt = boot(&[(b"main", list_program())]);
+        let (reg, cont, _row) = list(&rt);
+        // A Down twice (a backend resyncing), an Up twice, a Move for no finger.
+        crate::mock::queue_touch(&[(Move, 3, 1, 1, 990), (Down, 0, 50, 50, 1000), (Down, 0, 51, 50, 1004), (Up, 0, 51, 50, 1040), (Up, 0, 51, 50, 1041)]);
+        crate::mock::set_millis(1040);
+        rt.step();
+        rt.step();
+        assert_eq!(size(&rt, reg).1, 77, "on_click ran");
+        assert_eq!(rt.ctx.objs.get(cont).value, 0);
+        assert!(InputHandler::<MockPlatform>::idle(&rt.input));
     }
 
     /// main: widget 0 = the register; widget 1 = a 100×100 box at (0, 0)

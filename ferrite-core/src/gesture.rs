@@ -558,6 +558,23 @@ impl Engine {
         self.recs.iter().all(|r| r.is_none()) && self.arenas.is_empty()
     }
 
+    /// What is left (tests).
+    #[cfg(test)]
+    fn dump(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let mut o = alloc::string::String::new();
+        for (i, r) in self.recs.iter().enumerate() {
+            if let Some(r) = r {
+                let st = match r.st { St::Tap(_) => "tap", St::Double(_) => "double", St::Long(_) => "long", St::Drag(_) => "drag", St::Scale(_) => "scale", St::TapDrag(_) => "tapdrag" };
+                let _ = write!(o, "rec{i} {:?} {st} tracked {:#x} entries {:#x}; ", r.kind, r.tracked, r.entries);
+            }
+        }
+        for a in &self.arenas {
+            let _ = write!(o, "arena p{} members {:?} open {} held {} sweep {} eager {:?}; ", a.pointer, a.members, a.open, a.held, a.pending_sweep, a.eager);
+        }
+        o
+    }
+
     /// Outputs since the last call, in order.
     pub fn take(&mut self) -> Vec<Out> {
         core::mem::take(&mut self.out)
@@ -594,7 +611,19 @@ impl Engine {
         self.now = e.ms;
         match e.kind {
             PKind::Down => {
-                self.arenas.retain(|a| a.pointer != e.id);
+                // Finger ids are reused (Flutter's pointer ids are not): an
+                // arena still open for this id (held by a double tap) belongs
+                // to the finger's last contact. Its members leave it unresolved,
+                // as Flutter's tap drops a tap still undecided when the next
+                // one starts.
+                if let Some(a) = self.arena(e.id) {
+                    let old = self.arenas.remove(a);
+                    for &m in &old.members {
+                        if self.alive(m) {
+                            self.rec(m).entries &= !bit(e.id);
+                        }
+                    }
+                }
                 self.arenas.push(Arena {
                     pointer: e.id,
                     members: Vec::new(),
@@ -2563,6 +2592,67 @@ mod tests {
         let ev = events(&mut e);
         assert!(ev.contains(&(CHILD, ev::DOUBLE_TAP)), "{ev:?}");
         assert!(e.idle());
+    }
+
+    /// Random fingers on a widget with every recognizer under a scrolling,
+    /// clickable parent, ticks running ahead of the pointer times (as a
+    /// queued backend hands over samples read before the pass): no panic,
+    /// and idle once every finger is up and the timers have run.
+    #[test]
+    fn random_pointers_with_late_times_never_panic() {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = |n: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % n
+        };
+        let mut leaks = 0;
+        for round in 0..3000 {
+            let mut c = Vec::new();
+            push_candidates(&mut c, CHILD, (0, 0), G_ALL, round % 2 == 0);
+            c.push(cand(PARENT, Kind::Scroll));
+            c.push(cand(PARENT, Kind::Tap { click: true, events: false }));
+            let mut e = Engine::new();
+            let mut down = [None::<(i32, i32)>; 4];
+            let mut now = 1000u32;
+            for _ in 0..200 {
+                now += rnd(20);
+                let late = now.wrapping_sub(rnd(40));
+                let id = rnd(4) as usize;
+                match (down[id], rnd(4)) {
+                    (None, _) => {
+                        let p = (rnd(300) as i32, rnd(300) as i32);
+                        down[id] = Some(p);
+                        e.pointer(down_at(id as u8, p, late), &c);
+                    }
+                    (Some(p), 0) => {
+                        down[id] = None;
+                        e.pointer(Ptr { kind: PKind::Up, id: id as u8, x: p.0, y: p.1, ms: late }, &[]);
+                    }
+                    (Some(p), _) => {
+                        let q = (p.0 + rnd(81) as i32 - 40, p.1 + rnd(81) as i32 - 40);
+                        down[id] = Some(q);
+                        e.pointer(Ptr { kind: PKind::Move, id: id as u8, x: q.0, y: q.1, ms: late }, &[]);
+                    }
+                }
+                if rnd(3) == 0 {
+                    e.tick(now);
+                }
+                e.take();
+            }
+            for (id, p) in down.iter().enumerate() {
+                if let Some(p) = p {
+                    e.pointer(Ptr { kind: PKind::Up, id: id as u8, x: p.0, y: p.1, ms: now }, &[]);
+                }
+            }
+            e.tick(now + 2000);
+            e.take();
+            if !e.idle() { leaks += 1; if leaks == 1 { std::eprintln!("round {round}: {}", e.dump()); } }
+        }
+        assert_eq!(leaks, 0);
+    }
+
+    fn down_at(id: u8, p: (i32, i32), ms: u32) -> Ptr {
+        Ptr { kind: PKind::Down, id, x: p.0, y: p.1, ms }
     }
 
     #[test]

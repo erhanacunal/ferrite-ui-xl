@@ -34,10 +34,12 @@ const STOP_MS: u64 = 100;
 /// `CLK_GATE_IP_PERIL` (Exynos 4412 UM 7.9.1): bit n = UARTn's clock.
 const GATE_IP_PERIL: usize = 0xC950;
 
-/// CPU1's task ([`rx_task`]), ended for standby.
+/// CPU1's tasks ([`rx_task`], and the touch reader `touch::run`), ended for standby.
 static GROUP: Group = Group::new();
 /// RX runs on CPU1 (else on CPU0, which never stops: [`suspend`] leaves UART2 alone).
 static ON_CPU1: AtomicBool = AtomicBool::new(false);
+/// CPU1 also runs the touch reader (set by CPU0 before it starts CPU1).
+static TOUCH: AtomicBool = AtomicBool::new(false);
 /// The RX handle for CPU1's task, set before CPU1 starts.
 static mut RX: Option<UartRx> = None;
 
@@ -112,13 +114,16 @@ pub fn start_core(rx: UartRx) -> bool {
     // SAFETY: CPU1 is not running; it reads this only after its start.
     unsafe { *(&raw mut RX) = Some(rx) };
     GROUP.arm();
+    // Touch is read on CPU1 too (interrupt-driven), if there is a controller.
+    TOUCH.store(crate::touch::hand_to_cpu1(), Ordering::Release);
     match smp::start_cpu(CORE, cpu1) {
         Ok(()) => {
             ON_CPU1.store(true, Ordering::Release);
             true
         }
         Err(e) => {
-            println!("ferrite: CPU{} ERROR {:?}, UART RX on CPU0", CORE, e);
+            crate::touch::take_back();
+            println!("ferrite: CPU{} ERROR {:?}, UART RX and touch on CPU0", CORE, e);
             if let Some(id) = UART.irq() {
                 Gic::new().set_target(id, 0);
             }
@@ -127,7 +132,7 @@ pub fn start_core(rx: UartRx) -> bool {
     }
 }
 
-/// CPU1: UART2 RX until [`suspend`], then the core stops.
+/// CPU1: UART2 RX and the touch reader until [`suspend`], then the core stops.
 fn cpu1(_core: usize) -> ! {
     Gic::new().init_this_cpu();
     cpu::enable_irq();
@@ -135,15 +140,21 @@ fn cpu1(_core: usize) -> ! {
     let rx = unsafe { (*(&raw const RX)).expect("RX set before CPU1 starts") };
     embassy::run_until(
         |spawner| {
-            GROUP.begin(1);
+            let touch = TOUCH.load(Ordering::Acquire);
+            GROUP.begin(1 + u32::from(touch));
             spawner.spawn(rx_task_stoppable(rx).unwrap());
+            if touch {
+                spawner.spawn(touch_task_stoppable().unwrap());
+            }
         },
         || GROUP.done(),
-        // No wake-up from UART2 for the ended task: its interrupt off, from this side too.
+        // No wake-up from UART2 or the touch controller for the ended tasks: their
+        // interrupts off, from this side too.
         || {
             if let Some(id) = UART.irq() {
                 Gic::new().disable(id);
             }
+            crate::touch::quiesce();
         },
     );
     smp::stop_this_cpu()
@@ -152,6 +163,11 @@ fn cpu1(_core: usize) -> ! {
 #[embassy_executor::task]
 async fn rx_task_stoppable(rx: UartRx) {
     GROUP.run(rx_loop(rx)).await
+}
+
+#[embassy_executor::task]
+async fn touch_task_stoppable() {
+    GROUP.run(crate::touch::run()).await
 }
 
 fn set_gate(open: bool) {
@@ -178,6 +194,8 @@ pub fn suspend() -> bool {
         return false;
     }
     ON_CPU1.store(false, Ordering::Release);
+    // Until CPU1 runs again, touch is CPU0's (polled).
+    crate::touch::take_back();
     // What was printed goes out first (the console's ring too, when it is this UART).
     exynos_4412_rs::console::flush();
     Uart::new(UART).flush();

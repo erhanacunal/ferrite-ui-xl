@@ -928,6 +928,24 @@ fn status_json() -> String {
             crate::battery::LAST_PERCENT.load(Relaxed),
             crate::battery::LAST_CHARGER.load(Relaxed)
         );
+        // Touch (touch.rs): read on CPU1 by interrupt (queued) or polled on CPU0.
+        // chg = [level, interrupt masked, pending].
+        let chg = crate::touch::chg_bits();
+        let _ = write!(
+            s,
+            ",\"touch\":{{\"queued\":{},\"messages\":{},\"dropped\":{},\"errors\":{},\"interrupts\":{},\"wakes_irq\":{},\"wakes_timer\":{},\"timer_found\":{},\"chg\":[{},{},{}]}}",
+            crate::touch::queued_mode(),
+            crate::touch::MESSAGES.load(Relaxed),
+            crate::touch::DROPPED.load(Relaxed),
+            crate::touch::ERRORS.load(Relaxed),
+            crate::touch::INTERRUPTS.load(Relaxed),
+            crate::touch::WAKES_IRQ.load(Relaxed),
+            crate::touch::WAKES_TIMER.load(Relaxed),
+            crate::touch::TIMER_FOUND.load(Relaxed),
+            u8::from(chg.0),
+            u8::from(chg.1),
+            u8::from(chg.2)
+        );
         // JPEG images decoded by the CPU (jpeg.rs).
         let _ = write!(
             s,

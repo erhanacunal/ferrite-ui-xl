@@ -75,6 +75,22 @@ std::thread_local! {
     static TOUCH: core::cell::RefCell<alloc::vec::Vec<crate::touch::TouchPoint>> =
         const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
     static MILLIS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// Queued samples ([`queue_touch`]): `Some` = `MockTouch` is a queued backend.
+    static SAMPLES: core::cell::RefCell<Option<alloc::collections::VecDeque<crate::touch::TouchSample>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Makes this thread's `MockTouch` a queued backend (`read_samples`) and
+/// queues `samples` (kind, id, x, y, ms) after the ones still waiting.
+#[cfg(feature = "host")]
+pub fn queue_touch(samples: &[(crate::touch::SampleKind, u8, u16, u16, u32)]) {
+    SAMPLES.with(|q| {
+        let mut q = q.borrow_mut();
+        let q = q.get_or_insert_with(Default::default);
+        for &(kind, id, x, y, ms) in samples {
+            q.push_back(crate::touch::TouchSample { kind, id, x, y, ms });
+        }
+    });
 }
 
 /// Fingers down on this thread's `MockTouch`: (id, x, y).
@@ -92,6 +108,10 @@ pub fn set_millis(ms: u32) {
 pub struct MockTouch;
 impl TouchBackend for MockTouch {
     fn is_active(&self) -> bool {
+        #[cfg(feature = "host")]
+        if let Some(waiting) = SAMPLES.with(|q| q.borrow().as_ref().map(|q| !q.is_empty())) {
+            return waiting;
+        }
         #[cfg(feature = "host")]
         return TOUCH.with(|t| !t.borrow().is_empty());
         #[cfg(not(feature = "host"))]
@@ -113,6 +133,18 @@ impl TouchBackend for MockTouch {
             let n = t.len().min(out.len());
             out[..n].copy_from_slice(&t[..n]);
             n
+        })
+    }
+    #[cfg(feature = "host")]
+    fn read_samples(&self, _cal: &CalParams, out: &mut [crate::touch::TouchSample]) -> Option<usize> {
+        SAMPLES.with(|q| {
+            let mut q = q.borrow_mut();
+            let q = q.as_mut()?;
+            let n = q.len().min(out.len());
+            for (o, s) in out.iter_mut().zip(q.drain(..n)) {
+                *o = s;
+            }
+            Some(n)
         })
     }
 }

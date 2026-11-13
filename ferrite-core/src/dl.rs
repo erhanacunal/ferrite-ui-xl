@@ -32,6 +32,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use crate::canvas::{Canvas, Pen};
+use crate::flash::{FlashBackend, FlashImpl};
+use crate::font::{Font, FontList};
+use crate::image::{Image, ImageList};
 use crate::types::{Offset, Rect};
 
 /// Draw widgets through cached display lists (instead of drawing directly).
@@ -63,10 +66,70 @@ pub static DIRECT: AtomicU32 = AtomicU32::new(0);
 pub static STORES: AtomicU32 = AtomicU32::new(0);
 pub static EVICTS: AtomicU32 = AtomicU32::new(0);
 pub static BYTES: AtomicU32 = AtomicU32::new(0);
+/// Image / text calls replayed whose image or font the replaying side
+/// doesn't hold (drawn as nothing; should stay 0).
+pub static REF_MISSES: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
 fn count(c: &AtomicU32) {
     c.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Where a replay finds what a list refers to: `Canvas::draw_image` is
+/// recorded as the image's flash address, `Canvas::draw_text` as the font's
+/// id and bitmap address (plus the text).
+pub trait Refs {
+    /// `c.draw_image(…)` for the image whose pixel data is at `addr`.
+    fn draw_image<C: Canvas>(&self, c: &C, addr: u32, x: i16, y: i16);
+    /// `c.draw_text(…)` with font `font_id` whose bitmaps are at `bitmaps`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text<C: Canvas>(&self, c: &C, font_id: u8, bitmaps: u32, text: &[u8], x: i16, y: i16, fg: u16, bg: Option<u16>);
+}
+
+/// A context's loaded images and fonts and the flash they are read from
+/// (`Ctx::refs`).
+pub struct Resources<'a, F: FlashBackend> {
+    pub images: &'a ImageList,
+    pub fonts: &'a FontList,
+    pub flash: &'a FlashImpl<F>,
+}
+
+impl<F: FlashBackend> Refs for Resources<'_, F> {
+    #[inline]
+    fn draw_image<C: Canvas>(&self, c: &C, addr: u32, x: i16, y: i16) {
+        match self.images.find_addr(addr) {
+            Some(img) => c.draw_image(img, self.flash, x, y),
+            None => miss("image", addr),
+        }
+    }
+    #[inline]
+    fn draw_text<C: Canvas>(&self, c: &C, font_id: u8, bitmaps: u32, text: &[u8], x: i16, y: i16, fg: u16, bg: Option<u16>) {
+        match self.fonts.find(font_id) {
+            Some(f) if f.bitmap_addr() == bitmaps => {
+                c.draw_text(f, self.flash, text, x, y, fg, bg);
+            }
+            _ => miss("font", bitmaps),
+        }
+    }
+}
+
+/// Nothing to refer to (lists known to hold no image or text).
+pub struct NoRefs;
+
+impl Refs for NoRefs {
+    fn draw_image<C: Canvas>(&self, _: &C, addr: u32, _: i16, _: i16) {
+        miss("image", addr)
+    }
+    fn draw_text<C: Canvas>(&self, _: &C, _: u8, bitmaps: u32, _: &[u8], _: i16, _: i16, _: u16, _: Option<u16>) {
+        miss("font", bitmaps)
+    }
+}
+
+#[cold]
+fn miss(what: &str, addr: u32) {
+    debug_assert!(false, "dl: replayed {what} {addr:#x} not loaded here");
+    let _ = what;
+    count(&REF_MISSES);
 }
 
 /// One recorded call (the `Canvas` method of the same name), as decoded from
@@ -109,6 +172,10 @@ pub enum Op<'a> {
     FillRoundedRectAt { x: i16, y: i16, w: u16, h: u16, r: u16, color: u16, alpha: u8 },
     GradientRoundedRectAt { x: i16, y: i16, w: u16, h: u16, r: u16, c1: u16, c2: u16, dir: u8 },
     StrokeRoundedRect { x: i16, y: i16, w: u16, h: u16, r: u16, t: u16, color: u16 },
+    /// `draw_image`: the image by the flash address of its pixel data.
+    Image { addr: u32, x: i16, y: i16 },
+    /// `draw_text`: the font by id and bitmap flash address, the UTF-8 text.
+    Text { font_id: u8, bitmaps: u32, x: i16, y: i16, fg: u16, bg: Option<u16>, text: &'a [u8] },
 }
 
 /// Opcodes (header bits 0-7). The words after the header, in order:
@@ -174,6 +241,13 @@ mod code {
     pub const GRADIENT_ROUNDED_RECT_AT: u8 = 32;
     /// `{color}` `x|y` `w|h` `r|t`.
     pub const STROKE_ROUNDED_RECT: u8 = 33;
+    /// `addr` `x|y` (`Image::data_addr`, the position).
+    pub const IMAGE: u8 = 34;
+    /// `[font_id]{fg}` `bitmaps` `x|y` `bg|HAS_BG` `len`, the text's bytes.
+    pub const TEXT: u8 = 35;
+
+    /// TEXT: bit 16 of the `bg` word.
+    pub const HAS_BG: u32 = 1 << 16;
 
     /// BLEND_SPAN / BLEND_ROW: x and y fit an i16 and share a word.
     pub const SHORT: u8 = 1;
@@ -454,6 +528,11 @@ impl List {
                     write!(out, "FillPolygon {{ color: {color}, n: {} }}", points.len())?;
                     pts(out, points)?
                 }
+                Op::Text { font_id, bitmaps, x, y, fg, bg, text } => write!(
+                    out,
+                    "Text {{ font_id: {font_id}, bitmaps: {bitmaps:#x}, x: {x}, y: {y}, fg: {fg}, bg: {bg:?}, text: {:?} }}",
+                    core::str::from_utf8(text).unwrap_or("<bad utf-8>")
+                )?,
                 op => write!(out, "{op:?}")?,
             }
             writeln!(out)?;
@@ -461,9 +540,9 @@ impl List {
         Ok(())
     }
 
-    /// Make the recorded calls on `c`.
-    pub fn replay<C: Canvas>(&self, c: &C) {
-        self.play(c, None, None);
+    /// Make the recorded calls on `c`, images from `img`.
+    pub fn replay<C: Canvas>(&self, c: &C, refs: &impl Refs) {
+        self.play(c, refs, None, None);
     }
 
     /// Make the recorded calls on `c` as if drawn with the scissor always
@@ -473,11 +552,11 @@ impl List {
     /// against the whole screen and replayed into each rect of a clip region
     /// draws what the drawing would have drawn clipped to that region.
     /// Leaves the scissor at `clip`'s cut of the last one set.
-    pub fn replay_clipped<C: Canvas>(&self, c: &C, clip: Rect, start: Option<Rect>) {
-        self.play(c, Some(clip), start);
+    pub fn replay_clipped<C: Canvas>(&self, c: &C, refs: &impl Refs, clip: Rect, start: Option<Rect>) {
+        self.play(c, refs, Some(clip), start);
     }
 
-    fn play<C: Canvas>(&self, c: &C, clip: Option<Rect>, start: Option<Rect>) {
+    fn play<C: Canvas>(&self, c: &C, refs: &impl Refs, clip: Option<Rect>, start: Option<Rect>) {
         let cut = |s: Option<Rect>| -> Option<Rect> {
             let k = clip?;
             Some(match s {
@@ -585,6 +664,11 @@ impl List {
                     c.fill_gradient_rounded_rect_at(x, y, w, h, r, c1, c2, dir)
                 }
                 Op::StrokeRoundedRect { x, y, w, h, r, t, color } => c.stroke_rounded_rect(x, y, w, h, r, t, color),
+                // Draws itself inside the scissor in force (cut in a clipped replay).
+                Op::Image { addr, x, y } => refs.draw_image(c, addr, x, y),
+                Op::Text { font_id, bitmaps, x, y, fg, bg, text } => {
+                    refs.draw_text(c, font_id, bitmaps, text, x, y, fg, bg)
+                }
             }
         }
     }
@@ -825,6 +909,18 @@ impl<'a> Iterator for Ops<'a> {
                     color: b,
                 }
             }
+            code::IMAGE => {
+                let [addr, p] = self.args();
+                let (x, y) = s(p);
+                Op::Image { addr, x, y }
+            }
+            code::TEXT => {
+                let [bitmaps, p, bgw, n] = self.args();
+                let (x, y) = s(p);
+                let bg = if bgw & code::HAS_BG != 0 { Some(lo(bgw)) } else { None };
+                let text = view_u8(self.data((n as usize).div_ceil(4)), n as usize);
+                Op::Text { font_id: a, bitmaps, x, y, fg: b, bg, text }
+            }
             op => panic!("dl: bad opcode {op} at word {}", self.i - 1),
         })
     }
@@ -939,9 +1035,9 @@ impl Recorder {
     }
 
     /// End the recording and replay it onto `target`.
-    pub fn end_replay<C: Canvas>(&self, target: &C) {
+    pub fn end_replay<C: Canvas>(&self, target: &C, refs: &impl Refs) {
         self.busy.set(false);
-        self.list.borrow().replay(target);
+        self.list.borrow().replay(target, refs);
     }
 
     /// The recorded list.
@@ -951,6 +1047,14 @@ impl Recorder {
 
     pub fn heap_bytes(&self) -> usize {
         self.list.borrow().heap_bytes()
+    }
+
+    /// A recorder for a `w`×`h` canvas without one at hand (tests).
+    #[cfg(test)]
+    fn sized(w: u16, h: u16) -> Self {
+        let r = Self::new();
+        r.info.set(Info { width: w, height: h, has_alpha: true, smooth: true });
+        r
     }
 
     #[inline]
@@ -1129,6 +1233,44 @@ impl Canvas for Recorder {
     }
     fn stroke_rounded_rect(&self, x: i16, y: i16, w: u16, h: u16, r: u16, t: u16, color: u16) {
         self.l().call(&[header(code::STROKE_ROUNDED_RECT, 0, color), pki(x, y), pk(w, h), pk(r, t)]);
+    }
+
+    fn draw_image<F: FlashBackend>(&self, img: &Image, _: &FlashImpl<F>, x: i16, y: i16) {
+        // Recorded by reference: the replaying side decodes it from its own
+        // copy of the images (same flash, same pixels).
+        if img.visible(self, x, y) {
+            self.l().call(&[header(code::IMAGE, 0, 0), img.data_addr(), pki(x, y)]);
+        }
+    }
+
+    fn draw_text<F: FlashBackend>(
+        &self,
+        font: &Font,
+        _: &FlashImpl<F>,
+        text: &[u8],
+        x: i16,
+        y: i16,
+        fg: u16,
+        bg: Option<u16>,
+    ) -> i16 {
+        // Recorded by reference when a glyph would be drawn (`draw_str`'s
+        // culling: a glyph with pixels touching the screen and the scissor).
+        let screen = Rect::new(0, 0, self.width(), self.height());
+        let area = match self.scissor() {
+            Some(s) => s.intersection(&screen),
+            None => Some(screen),
+        };
+        let mut shows = false;
+        let end = font.for_each_glyph(text, x, y, |_, g, gx, gy| {
+            shows |= area.is_some_and(|a| Rect::new(gx, gy, g.width as u16, g.height as u16).intersects(&a));
+        });
+        if shows {
+            let bgw = bg.map_or(0, |c| c as u32 | code::HAS_BG);
+            let mut l = self.l();
+            l.call(&[header(code::TEXT, font.font_id, fg), font.bitmap_addr(), pki(x, y), bgw, text.len() as u32]);
+            l.data_u8(text);
+        }
+        end
     }
 }
 
@@ -1383,5 +1525,46 @@ mod tests {
         assert!(l.compact() == *l);
         // FillRect: a header and two words, not a padded enum.
         assert_eq!(&l.words[3..6], &[header(code::FILL_RECT, 0, 0xF800), pk(1, 2), pk(3, 4)]);
+    }
+
+    /// Text is recorded as the font reference and the bytes, returns the pen
+    /// position `draw_str` would, and is left out where `draw_str` would draw
+    /// no glyph (off the screen or the scissor).
+    #[test]
+    fn text_is_recorded_by_reference() {
+        let font = crate::font::Font::from_embedded(
+            &crate::embedded_font::GLYPHS,
+            &crate::embedded_font::CODEPOINTS,
+            &crate::embedded_font::BITMAP,
+            crate::embedded_font::Y_ADVANCE,
+            crate::embedded_font::BPP,
+        );
+        let flash = crate::flash::FlashImpl::with_backend(crate::mock::MockFlash);
+        let r = Recorder::sized(100, 50);
+        let text = "Hi, ğ!".as_bytes();
+        let end = r.draw_text(&font, &flash, text, 10, 20, 0xFFFF, Some(0x0001));
+        assert_eq!(end, font.for_each_glyph(text, 10, 20, |_, _, _, _| {}));
+        assert!(end > 10);
+        // Off the screen, then outside the scissor: nothing recorded.
+        r.draw_text(&font, &flash, text, 10, 500, 0xFFFF, None);
+        r.set_scissor(Some(Rect::new(0, 40, 100, 10)));
+        r.draw_text(&font, &flash, text, 10, 20, 0xFFFF, None);
+        let l = r.list();
+        let ops: Vec<Op<'_>> = l.ops().collect();
+        assert_eq!(
+            ops,
+            [
+                Op::Text {
+                    font_id: font.font_id,
+                    bitmaps: font.bitmap_addr(),
+                    x: 10,
+                    y: 20,
+                    fg: 0xFFFF,
+                    bg: Some(0x0001),
+                    text
+                },
+                Op::SetScissor(Some(Rect::new(0, 40, 100, 10))),
+            ]
+        );
     }
 }

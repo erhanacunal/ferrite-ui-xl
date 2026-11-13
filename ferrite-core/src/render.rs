@@ -270,7 +270,7 @@ pub enum RenderJob {
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let ta = crate::perf::now();
     if job == RenderJob::Play {
-        r.objs.render.frame.list().replay(&r.lcd);
+        r.objs.render.frame.list().replay(&r.lcd, &r.refs());
         JOB_TICKS[JOB_RENDER].fetch_add(crate::perf::now().wrapping_sub(ta) as u64, core::sync::atomic::Ordering::Relaxed);
         return;
     }
@@ -281,7 +281,7 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let mut later = alloc::vec::Vec::new();
     for d in draws {
         match d {
-            crate::view::Draw::Screen(list) => screen!(r, |c| list.replay(c)),
+            crate::view::Draw::Screen(list) => screen!(r, |c| list.replay(c, &r.refs())),
             crate::view::Draw::Paint(id, list) => {
                 if capture_list(r, id, &list) {
                     keep_paint(r, id, list);
@@ -300,7 +300,7 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let t2 = crate::perf::now();
     for (id, list) in later {
         if r.objs.is_tree_visible(id) {
-            screen!(r, |c| list.replay(c));
+            screen!(r, |c| list.replay(c, &r.refs()));
             r.objs.screen_touched();
         }
         keep_paint(r, id, list);
@@ -346,7 +346,7 @@ fn capture_list<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: &crate::dl::Lis
     }
     let scissor = r.lcd.scissor();
     r.lcd.set_scissor(Some(boxed));
-    list.replay(&r.lcd);
+    list.replay(&r.lcd, &r.refs());
     r.lcd.set_scissor(scissor);
     <P::Renderer as WidgetRenderer<P>>::capture_end(r, id);
     true
@@ -1786,7 +1786,7 @@ fn draw_cached<P: Platform, C: Canvas>(ctx: &Ctx<P>, lcd: &C, id: WidgetId, abs:
                 dl_verify(ctx, id, abs, list);
             }
             for cr in clip.iter() {
-                list.replay_clipped(lcd, *cr, start);
+                list.replay_clipped(lcd, &ctx.refs(), *cr, start);
             }
             lcd.set_scissor(list.end_scissor(start));
             return;
@@ -1806,7 +1806,7 @@ fn draw_cached<P: Platform, C: Canvas>(ctx: &Ctx<P>, lcd: &C, id: WidgetId, abs:
     rec.end();
     let list = rec.list().compact();
     for cr in clip.iter() {
-        list.replay_clipped(lcd, *cr, start);
+        list.replay_clipped(lcd, &ctx.refs(), *cr, start);
     }
     lcd.set_scissor(list.end_scissor(start));
     state.dl_cache.borrow_mut().insert(key, list);
@@ -2739,7 +2739,7 @@ fn draw_bg_image<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, image_id: u8, inne
         return;
     }
     if let Some(img) = ctx.images.find(image_id) {
-        img.draw(c, &ctx.flash, inner.x, inner.y);
+        c.draw_image(img, &ctx.flash, inner.x, inner.y);
     }
 }
 
@@ -2766,7 +2766,7 @@ fn draw_widget_image<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, abs: &Rect, ex
         };
         // May be negative: a widget partly off the top/left edge (a page
         // sliding out) shows the part of its image that is on screen.
-        img.draw(c, &ctx.flash, dx, dy);
+        c.draw_image(img, &ctx.flash, dx, dy);
     }
 }
 
@@ -2783,7 +2783,7 @@ fn draw_label_text<P: Platform, C: Canvas>(
 ) {
     let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
     label_lines_text(ctx, widget, abs, ext, text, |font, line, x, y| {
-        font.draw_str(c, &ctx.flash, line, x, y, ext.text_color, bg);
+        c.draw_text(font, &ctx.flash, line, x, y, ext.text_color, bg);
     });
 }
 
@@ -2937,7 +2937,7 @@ fn draw_field<P: Platform, C: Canvas>(ctx: &Ctx<P>, c: &C, id: WidgetId, widget:
     let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
     field_contents_text(ctx, widget, abs, ext, text, |item| match item {
         FieldItem::Text { font, line, x, y, bg } => {
-            font.draw_str(c, &ctx.flash, line, x, y, ext.text_color, bg);
+            c.draw_text(font, &ctx.flash, line, x, y, ext.text_color, bg);
         }
         FieldItem::Part(p) => draw_round_part(c, p),
     });
@@ -4649,7 +4649,7 @@ mod shift_tests {
                 assert!(rec.begin(&ctx.lcd));
                 draw_widget_body(ctx, &rec, id, &abs, clip);
                 assert!(!rec.list().is_empty() || id != ctx.objs.root);
-                rec.end_replay(&ctx.lcd);
+                rec.end_replay(&ctx.lcd, &ctx.refs());
             } else {
                 draw_widget_body(ctx, &ctx.lcd, id, &abs, clip);
             }
@@ -4719,7 +4719,7 @@ mod shift_tests {
         rec.write_run(0xBEEF, 8);
         rec.end();
         let clip = Rect::new(12, 21, 3, 4);
-        rec.list().replay_clipped(&c.lcd, clip, None);
+        rec.list().replay_clipped(&c.lcd, &c.refs(), clip, None);
         let fb = c.lcd.backend().px.borrow();
         for y in 0..S as i16 {
             for x in 0..S as i16 {
@@ -4781,7 +4781,7 @@ mod shift_tests {
         draw(&rec);
         rec.end();
         assert!(rec.list().ops().any(|op| matches!(op, crate::dl::Op::ThinArc { .. })));
-        rec.list().replay(&replayed.lcd);
+        rec.list().replay(&replayed.lcd, &replayed.refs());
         let (a, b) = (direct.lcd.backend().px.borrow(), replayed.lcd.backend().px.borrow());
         assert!(a.iter().filter(|&&p| p != 0).count() > 1000);
         let diff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();

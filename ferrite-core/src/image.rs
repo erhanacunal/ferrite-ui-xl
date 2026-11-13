@@ -356,6 +356,11 @@ impl Image {
         }
     }
 
+    /// Whether `draw(c, …, x, y)` would draw anything (inside `c`'s scissor).
+    pub fn visible<B: Canvas>(&self, c: &B, x: i16, y: i16) -> bool {
+        self.window(c, x, y).is_some()
+    }
+
     /// Part of the image at (x, y) inside the LCD scissor (or the screen,
     /// without one), in image coordinates; `None` when nothing is visible.
     fn window<B: Canvas>(&self, lcd: &B, x: i16, y: i16) -> Option<Window> {
@@ -759,6 +764,12 @@ impl ImageList {
             }
         }
         None
+    }
+
+    /// Find a loaded image by the flash address of its pixel data
+    /// (`Image::data_addr`: what a display list refers to it by).
+    pub fn find_addr(&self, data_addr: u32) -> Option<&Image> {
+        self.images[..self.count as usize].iter().find(|i| i.data_addr == data_addr)
     }
 
     /// Find an image by image_id. If not already loaded, search flash

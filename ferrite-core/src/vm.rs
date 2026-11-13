@@ -1361,7 +1361,7 @@ impl Vm {
                 ctx.objs.render.draws.push(crate::view::Draw::Paint(id, list));
                 continue;
             }
-            list.replay(&ctx.lcd);
+            list.replay(&ctx.lcd, &ctx.refs());
             ctx.objs.screen_touched();
             let state = &ctx.objs.render;
             let mut paints = state.paints.borrow_mut();
@@ -1423,7 +1423,7 @@ impl Vm {
                 let (x, y) = unpack_pair(xy);
                 let image_id = image_id as u8;
                 if let Some(img) = ctx.images.find(image_id) {
-                    img.draw(c, &ctx.flash, x as i16, y as i16);
+                    c.draw_image(img, &ctx.flash, x as i16, y as i16);
                 }
             }),
             OP_DRAW_TEXT_LIT => canvas!(ctx, |c| {
@@ -1439,7 +1439,7 @@ impl Vm {
                     if let Some(font) = ctx.fonts.resolve(font_id) {
                         let bg_opt = if bg == 0 { None } else { Some(bg) };
                         self.code.with_bytes(start, len, |text| {
-                            font.draw_str(c, &ctx.flash, text, x as i16, y as i16, fg, bg_opt);
+                            c.draw_text(font, &ctx.flash, text, x as i16, y as i16, fg, bg_opt);
                         });
                     }
                 } else {
@@ -1455,7 +1455,7 @@ impl Vm {
                 let data = ctx.objs.str_get(str_id);
                 if let Some(font) = ctx.fonts.resolve(font_id) {
                     let bg_opt = if bg == 0 { None } else { Some(bg) };
-                    font.draw_str(c, &ctx.flash, data, x as i16, y as i16, fg, bg_opt);
+                    c.draw_text(font, &ctx.flash, data, x as i16, y as i16, fg, bg_opt);
                 }
             }),
             OP_ROUNDED_RECT => canvas!(ctx, |c| {

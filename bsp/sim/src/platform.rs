@@ -337,6 +337,11 @@ fn print_snapshot_stats() {
                 p[2].load(Relaxed)
             );
         }
+        // Lists that referred to an image or font the replaying side didn't hold.
+        let misses = ferrite_core::dl::REF_MISSES.load(Relaxed);
+        if misses != 0 {
+            eprintln!("sim: dl ref misses {misses}");
+        }
     }
     use ferrite_core::scene;
     eprintln!(

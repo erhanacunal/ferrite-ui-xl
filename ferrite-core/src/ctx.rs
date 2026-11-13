@@ -64,4 +64,10 @@ impl<P: Platform> Ctx<P> {
             None => &self.view,
         }
     }
+
+    /// Where list replays here find the images and fonts they refer to.
+    #[inline]
+    pub fn refs(&self) -> crate::dl::Resources<'_, P::FlashB> {
+        crate::dl::Resources { images: &self.images, fonts: &self.fonts, flash: &self.flash }
+    }
 }

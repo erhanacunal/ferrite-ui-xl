@@ -10,6 +10,9 @@
 //! The methods mirror `LcdImpl`'s, with the same arguments and semantics
 //! (see `lcd.rs` / `lcd/smooth.rs`).
 
+use crate::flash::{FlashBackend, FlashImpl};
+use crate::font::Font;
+use crate::image::Image;
 use crate::lcd::{LcdBackend, LcdImpl, LinePen};
 use crate::types::{Offset, Rect};
 
@@ -85,6 +88,38 @@ pub trait Canvas {
     fn fill_rounded_rect_at(&self, x: i16, y: i16, w: u16, h: u16, r: u16, color: u16, alpha: u8);
     fn fill_gradient_rounded_rect_at(&self, x: i16, y: i16, w: u16, h: u16, r: u16, c1: u16, c2: u16, dir: u8);
     fn stroke_rounded_rect(&self, x: i16, y: i16, w: u16, h: u16, r: u16, t: u16, color: u16);
+
+    // --- Images ---
+    /// `img.draw(self, flash, x, y)`: the image decoded into this canvas's
+    /// primitives now. A recording canvas keeps a reference instead (the
+    /// image's flash address), which the replay resolves (`dl::Images`).
+    fn draw_image<F: FlashBackend>(&self, img: &Image, flash: &FlashImpl<F>, x: i16, y: i16)
+    where
+        Self: Sized,
+    {
+        img.draw(self, flash, x, y)
+    }
+
+    // --- Text ---
+    /// `font.draw_str(self, flash, text, x, y, fg, bg)`: the glyphs drawn now;
+    /// returns the pen's x after the text. A recording canvas keeps the font
+    /// by reference and the text instead.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text<F: FlashBackend>(
+        &self,
+        font: &Font,
+        flash: &FlashImpl<F>,
+        text: &[u8],
+        x: i16,
+        y: i16,
+        fg: u16,
+        bg: Option<u16>,
+    ) -> i16
+    where
+        Self: Sized,
+    {
+        font.draw_str(self, flash, text, x, y, fg, bg)
+    }
 }
 
 /// The immediate canvas: everything goes straight to the backend.

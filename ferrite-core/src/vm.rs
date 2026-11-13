@@ -2801,14 +2801,9 @@ impl Vm {
                     args[i] = self.pop();
                 }
                 let fmt_id = self.pop() as ObjPtr;
-                let mut fmt_buf = [0u8; 128];
-                let fmt_len = {
-                    let fmt = ctx.objs.str_get(fmt_id);
-                    let n = fmt.len().min(128);
-                    fmt_buf[..n].copy_from_slice(&fmt[..n]);
-                    n
-                };
-                match strpool::sprintf(&mut ctx.objs, &fmt_buf[..fmt_len], &args[..actual]) {
+                // Copied: `sprintf` allocates in the pool the format lives in.
+                let fmt = ctx.objs.str_get(fmt_id).to_vec();
+                match strpool::sprintf(&mut ctx.objs, &fmt, &args[..actual]) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::STR_ALLOC),
                 }

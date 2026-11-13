@@ -525,18 +525,16 @@ fn pad_write(digits: &[u8], width: u8, zero_pad: bool, out: &mut [u8]) -> usize 
 
 /// Format a string using printf-style specifiers.
 /// Supported: `%[0][width]d/i/u/x/X`, `%[.N]f`, `%s`, `%%`
-/// `%s` args are str_ids resolved from pool. Output is capped at 128 bytes.
+/// `%s` args are str_ids resolved from pool. No length limit: the result is
+/// built on the heap (was 128 bytes, `%s` 64 each, from the GD32's RAM).
 pub fn sprintf(pool: &mut ObjPool, fmt: &[u8], args: &[i32]) -> Option<ObjPtr> {
-    const OUT_SIZE: usize = 128;
-    let mut out = [0u8; OUT_SIZE];
-    let mut out_pos = 0;
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(fmt.len() + 16);
     let mut arg_idx = 0;
     let mut i = 0;
 
-    while i < fmt.len() && out_pos < OUT_SIZE {
+    while i < fmt.len() {
         if fmt[i] != b'%' {
-            out[out_pos] = fmt[i];
-            out_pos += 1;
+            out.push(fmt[i]);
             i += 1;
             continue;
         }
@@ -575,72 +573,42 @@ pub fn sprintf(pool: &mut ObjPool, fmt: &[u8], args: &[i32]) -> Option<ObjPtr> {
         let spec = fmt[i];
         i += 1;
 
-        match spec {
-            b'd' | b'i' => {
-                if arg_idx < args.len() {
-                    let mut tmp = [0u8; 16];
-                    let n = format_i32(args[arg_idx], &mut tmp);
-                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
-                    arg_idx += 1;
-                }
+        let arg = args.get(arg_idx).copied();
+        let mut tmp = [0u8; 32];
+        match (spec, arg) {
+            (b'd' | b'i', Some(v)) => {
+                let n = format_i32(v, &mut tmp);
+                push_padded(&mut out, &tmp[..n], width, zero_pad);
             }
-            b'u' => {
-                if arg_idx < args.len() {
-                    let mut tmp = [0u8; 12];
-                    let n = format_u32(args[arg_idx] as u32, &mut tmp);
-                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
-                    arg_idx += 1;
-                }
+            (b'u', Some(v)) => {
+                let n = format_u32(v as u32, &mut tmp);
+                push_padded(&mut out, &tmp[..n], width, zero_pad);
             }
-            b'x' => {
-                if arg_idx < args.len() {
-                    let mut tmp = [0u8; 10];
-                    let n = format_hex(args[arg_idx] as u32, false, &mut tmp);
-                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
-                    arg_idx += 1;
-                }
+            (b'x' | b'X', Some(v)) => {
+                let n = format_hex(v as u32, spec == b'X', &mut tmp);
+                push_padded(&mut out, &tmp[..n], width, zero_pad);
             }
-            b'X' => {
-                if arg_idx < args.len() {
-                    let mut tmp = [0u8; 10];
-                    let n = format_hex(args[arg_idx] as u32, true, &mut tmp);
-                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
-                    arg_idx += 1;
-                }
+            (b'f', Some(v)) => {
+                let n = format_f32_prec(f32::from_bits(v as u32), precision.unwrap_or(2), &mut tmp);
+                out.extend_from_slice(&tmp[..n]);
             }
-            b'f' => {
-                if arg_idx < args.len() {
-                    let v = f32::from_bits(args[arg_idx] as u32);
-                    out_pos += format_f32_prec(v, precision.unwrap_or(2), &mut out[out_pos..]);
-                    arg_idx += 1;
-                }
-            }
-            b's' => {
-                if arg_idx < args.len() {
-                    let str_id = args[arg_idx] as ObjPtr;
-                    let mut tmp = [0u8; 64];
-                    let copy_n = {
-                        let s = pool.str_get(str_id);
-                        let n = s.len().min(OUT_SIZE - out_pos).min(tmp.len());
-                        tmp[..n].copy_from_slice(&s[..n]);
-                        n
-                    };
-                    out[out_pos..out_pos + copy_n].copy_from_slice(&tmp[..copy_n]);
-                    out_pos += copy_n;
-                    arg_idx += 1;
-                }
-            }
-            b'%' => {
-                if out_pos < OUT_SIZE {
-                    out[out_pos] = b'%';
-                    out_pos += 1;
-                }
-            }
+            (b's', Some(v)) => out.extend_from_slice(pool.str_get(v as ObjPtr)),
+            (b'%', _) => out.push(b'%'),
             _ => {}
+        }
+        if arg.is_some() && matches!(spec, b'd' | b'i' | b'u' | b'x' | b'X' | b'f' | b's') {
+            arg_idx += 1;
         }
     }
 
-    pool.str_alloc(&out[..out_pos])
+    pool.str_alloc(&out)
+}
+
+/// Appends `digits` padded to `width` (as [`pad_write`]).
+fn push_padded(out: &mut alloc::vec::Vec<u8>, digits: &[u8], width: u8, zero_pad: bool) {
+    let mut buf = [0u8; 256];
+    let n = pad_write(digits, width, zero_pad, &mut buf);
+    out.extend_from_slice(&buf[..n]);
 }
 
 /// Parse a string (by ID) as f32. Returns f32 bits. Returns 0.0 bits on failure.
@@ -687,6 +655,30 @@ pub fn parse_float(pool: &ObjPool, id: ObjPtr) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sprintf_has_no_length_limit() {
+        let mut pool = ObjPool::new();
+        // Formats and strings far past the old limits (output 128, `%s` 64).
+        let long: alloc::vec::Vec<u8> = (0..300).map(|i| b'a' + (i % 26) as u8).collect();
+        let a = pool.str_alloc(&long).unwrap();
+        let mut fmt = alloc::vec![b'.'; 200];
+        fmt.extend_from_slice(b"[%s|%s]");
+        let r = sprintf(&mut pool, &fmt, &[a as i32, a as i32]).unwrap();
+        let mut want = alloc::vec![b'.'; 200];
+        want.push(b'[');
+        want.extend_from_slice(&long);
+        want.push(b'|');
+        want.extend_from_slice(&long);
+        want.push(b']');
+        assert_eq!(pool.str_get(r), &want[..]);
+
+        // The number formats are unchanged.
+        let r = sprintf(&mut pool, b"%d|%05d|%4u|%x|%X|%.3f|%f|%%|%q|%d", &[
+            -42, -42, 9, 0xbeef, 0xbeef, 1.5f32.to_bits() as i32, 2.25f32.to_bits() as i32,
+        ]).unwrap();
+        assert_eq!(pool.str_get(r), b"-42|-0042|   9|beef|BEEF|1.500|2.25|%||");
+    }
 
     #[test]
     fn strings_keep_ids_across_edits_and_compaction() {

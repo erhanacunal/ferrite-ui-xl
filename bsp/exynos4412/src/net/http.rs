@@ -9,6 +9,7 @@
 //! | `POST /flash` (or `/fs`, or `PUT`) | an FS image (or a whole `FLASH.BIN`): checked, saved as `FERRITE/FLASH.BIN`, then a restart |
 //! | `POST /save` (or `PUT`) | a firmware `.bin`: checked, saved as `FERRITE/FERRITE.BIN` (uart_boot's file, with its `EXYNBOOT` header), then a restart, so uart_boot boots it |
 //! | `POST /restart` | restarts the board |
+//! | `GET /api/wifi` | JSON: what the last scan saw of the configured network (BSSIDs, channels, their information elements as hex), the BSSID joined, the last RSN mismatch (diagnostics) |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?merge=0\|1` pieces merged into fewer draws / a draw per run of pieces; `?round_px=N` largest `ui_round` box drawn as four quarters (0 = always nine pieces); `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
@@ -220,6 +221,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
     match (method, path) {
         (b"GET", b"/") => answer(socket, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()).await?,
         (b"GET", b"/api/status") => json(socket, "200 OK", &status_json()).await?,
+        (b"GET", b"/api/wifi") => json(socket, "200 OK", &wifi_json()).await?,
         (b"GET", b"/api/mem") => match bridged(TAG_MEMDETAIL, TAG_MEMDETAIL_RESP, None).await {
             Ok(p) => json(socket, "200 OK", &mem_json(&p)).await?,
             Err(e) => api_error(socket, e).await?,
@@ -833,6 +835,49 @@ fn hex6(s: &mut String, b: &[u8; 6]) {
     for (i, x) in b.iter().enumerate() {
         let _ = write!(s, "{}{:02x}", if i > 0 { ":" } else { "" }, x);
     }
+}
+
+/// `GET /api/wifi`: what the last scan saw of the configured network (each BSSID with its
+/// information elements, one entry per distinct set: beacons and probe responses may differ),
+/// the BSSID joined, and the last RSN mismatch of a handshake (diagnostics).
+fn wifi_json() -> String {
+    use alloc::format;
+    use core::fmt::Write;
+    let mac = |b: &[u8; 6]| format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2], b[3], b[4], b[5]);
+    let hex = |bytes: &[u8]| bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    super::DIAG.lock(|d| {
+        let d = d.borrow();
+        let mut out = format!(
+            "{{\"scans\":{},\"target\":\"{}\",\"target_channel\":{},\"seen\":[",
+            d.scans,
+            mac(&d.target.0),
+            d.target.1
+        );
+        for (i, s) in d.seen.iter().flatten().enumerate() {
+            let _ = write!(
+                out,
+                "{}{{\"bssid\":\"{}\",\"channel\":{},\"rssi\":{},\"count\":{},\"ie\":\"{}\"}}",
+                if i > 0 { "," } else { "" },
+                mac(&s.bssid),
+                s.channel,
+                s.rssi,
+                s.count,
+                hex(&s.ie[..usize::from(s.ie_length)])
+            );
+        }
+        let _ = write!(
+            out,
+            "],\"mismatches\":{},\"mismatch_bssid\":\"{}\",\"rsn_expected\":\"{}\",\"rsn_message3\":\"{}\"}}",
+            d.mismatches,
+            mac(&d.mismatch_bssid),
+            hex(&d.expected.0[..d.expected.1]),
+            hex(&d.carried.0[..d.carried.1])
+        );
+        out
+    })
 }
 
 fn status_json() -> String {

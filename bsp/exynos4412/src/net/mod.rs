@@ -284,6 +284,57 @@ pub fn state_code() -> i32 {
     i32::from(STATE.load(Ordering::Acquire))
 }
 
+// --- what scans saw of the configured network (diagnostics, `GET /api/wifi`) ----------------
+
+/// Results kept: one per (BSSID, elements) pair, so a beacon and a probe response that differ
+/// both show.
+pub const SEEN_MAX: usize = 12;
+/// Elements kept of a result (the rest cut).
+pub const SEEN_IE_MAX: usize = 640;
+
+#[derive(Clone, Copy)]
+pub struct Seen {
+    pub bssid: [u8; 6],
+    pub channel: u8,
+    pub rssi: i16,
+    /// Results of this BSSID with these elements.
+    pub count: u16,
+    pub ie_length: u16,
+    pub ie: [u8; SEEN_IE_MAX],
+}
+
+/// The last scan's results of the configured network, and the last RSN mismatch
+/// (expected, carried by message 3, BSSID).
+pub struct Diag {
+    pub seen: [Option<Seen>; SEEN_MAX],
+    pub scans: u32,
+    pub mismatches: u32,
+    pub expected: ([u8; wpa::RSN_MAX], usize),
+    pub carried: ([u8; wpa::RSN_MAX], usize),
+    pub mismatch_bssid: [u8; 6],
+    /// The BSSID the last join went to, its channel.
+    pub target: ([u8; 6], u8),
+}
+
+pub static DIAG: CriticalSectionMutex<RefCell<Diag>> = CriticalSectionMutex::new(RefCell::new(Diag {
+    seen: [None; SEEN_MAX],
+    scans: 0,
+    mismatches: 0,
+    expected: ([0; wpa::RSN_MAX], 0),
+    carried: ([0; wpa::RSN_MAX], 0),
+    mismatch_bssid: [0; 6],
+    target: ([0; 6], 0),
+}));
+
+fn hex(bytes: &[u8]) -> String {
+    use core::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 // --- scan results, read by the setup screen ---------------------------------------------------
 
 struct Scans {
@@ -427,11 +478,25 @@ fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Re
     let mut target: Option<Target> = None;
     let mut pool = Hmac::new(&own).sign(&[&mct.count().to_le_bytes()[..]]);
     let mut found = ScanList::<SCAN_MAX>::new();
-    chip.scan(SCAN_TIMEOUT_MS, |bss, rsn| {
+    // On the heap: ~8 KB.
+    let mut seen: Vec<Option<Seen>> = alloc::vec![None; SEEN_MAX];
+    chip.scan_elements(SCAN_TIMEOUT_MS, |bss, rsn, elements| {
         pool = Hmac::new(&pool).sign(&[&mct.count().to_le_bytes()[..], &bss.bssid, &bss.rssi.to_le_bytes()]);
         let name = &bss.ssid[..usize::from(bss.ssid_length).min(bss.ssid.len())];
         found.add(name, bss.rssi, bss.channel, wpa::rsn_supported(rsn) && rsn.len() <= wpa::RSN_MAX);
         let named = !cfg.ssid().is_empty() && cfg.ssid().as_bytes() == name;
+        if named {
+            let ie = &elements[..elements.len().min(SEEN_IE_MAX)];
+            let same = |s: &Seen| s.bssid == bss.bssid && &s.ie[..usize::from(s.ie_length)] == ie;
+            if let Some(s) = seen.iter_mut().flatten().find(|s| same(s)) {
+                s.count = s.count.saturating_add(1);
+                s.rssi = s.rssi.max(bss.rssi);
+            } else if let Some(slot) = seen.iter_mut().find(|s| s.is_none()) {
+                let mut copy = [0; SEEN_IE_MAX];
+                copy[..ie.len()].copy_from_slice(ie);
+                *slot = Some(Seen { bssid: bss.bssid, channel: bss.channel, rssi: bss.rssi, count: 1, ie_length: ie.len() as u16, ie: copy });
+            }
+        }
         if named
             && band_allows(bss.channel)
             && wpa::rsn_supported(rsn)
@@ -445,6 +510,20 @@ fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Re
     })?;
     found.finish();
     publish_scan(found);
+    if !cfg.ssid().is_empty() {
+        DIAG.lock(|d| {
+            let mut d = d.borrow_mut();
+            d.seen.copy_from_slice(&seen);
+            d.scans = d.scans.wrapping_add(1);
+        });
+        for s in seen.iter().flatten() {
+            let b = s.bssid;
+            println!(
+                "ferrite: wifi seen {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch {} {} dBm x{} ({} element bytes: /api/wifi)",
+                b[0], b[1], b[2], b[3], b[4], b[5], s.channel, s.rssi, s.count, s.ie_length
+            );
+        }
+    }
     if cfg.ssid().is_empty() {
         return Ok(None);
     }
@@ -461,7 +540,28 @@ fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Re
         println!("ferrite: wifi access point asks for what this cannot do");
         return Ok(None);
     };
-    chip.connect(cfg.ssid().as_bytes(), &mut supplicant, JOIN_TIMEOUT_MS, report)?;
+    let b = target.bssid;
+    println!(
+        "ferrite: wifi joining {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch {} {} dBm",
+        b[0], b[1], b[2], b[3], b[4], b[5], target.channel, target.rssi
+    );
+    DIAG.lock(|d| d.borrow_mut().target = (target.bssid, target.channel));
+    let joined = chip.connect(cfg.ssid().as_bytes(), &mut supplicant, JOIN_TIMEOUT_MS, report);
+    if let Err(Error::Wpa(wpa::Error::RsnMismatch)) = joined {
+        let (expected, carried) = (supplicant.network_rsn(), supplicant.mismatched_rsn());
+        println!("ferrite: wifi RSN expected {}", hex(expected));
+        println!("ferrite: wifi RSN message 3 {}", hex(carried));
+        DIAG.lock(|d| {
+            let mut d = d.borrow_mut();
+            d.mismatches = d.mismatches.wrapping_add(1);
+            d.expected.0[..expected.len()].copy_from_slice(expected);
+            d.expected.1 = expected.len();
+            d.carried.0[..carried.len()].copy_from_slice(carried);
+            d.carried.1 = carried.len();
+            d.mismatch_bssid = target.bssid;
+        });
+    }
+    joined?;
     update_link(|l| {
         l.bssid = target.bssid;
         l.channel = target.channel;

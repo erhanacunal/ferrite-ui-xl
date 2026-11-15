@@ -22,6 +22,7 @@ use ferrite_core::pool::ObjPool;
 mod audio;
 mod backlight;
 mod eeprom;
+mod setup;
 mod storage;
 mod flash;
 mod gpio;

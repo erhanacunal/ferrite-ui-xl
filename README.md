@@ -98,11 +98,11 @@ python ..\ferrite-ui\tools\ferrite_cli.py -p tcp://192.168.88.120 writefs fs.bin
 python ..\ferrite-ui\tools\ferrite_cli.py -p COMx monitor            # watch the console
 ```
 
-Wi-Fi needs a `wifi_cfg` file in the image (`ssid=`, `password=`, optional `band=2.4|5`, `hostname=`) plus the chip firmware (`wifi_fw`, `wifi_nvram`) the first time; the board keeps a copy on CACHE, so later images don't need them. Don't commit a `wifi_cfg`: it holds the passphrase.
+Wi-Fi settings and the chip firmware live in `SYSTEM/` on the CACHE partition, shared with uart_boot: `WIFI.TXT` (`ssid=`, `password=`, optional `band=2.4|5`, `hostname=`), `WIFIFW.BIN` and `WIFINV.TXT` (the BCM4334 `brcmfmac4334-sdio….bin` / `.txt`). Hold **volume up** while the board starts (or have no program saved) for the setup screen: it scans for networks and saves `WIFI.TXT`. Copy files into `SYSTEM/` with `ferrite_cli --host H system FILE [NAME]` (or `POST /api/system?name=NAME`), or from uart_boot with `uartboot.py`/`httpboot.py --system FILE`. Don't commit a `WIFI.TXT`: it holds the passphrase. The setup program is `system/setup/` (`python scripts/build_setup.py` rebuilds the embedded `setup.img`).
 
 ### HTTP API (Wi-Fi)
 
-`GET /` is a dashboard. `GET /api/status` (link, heap, frames, render core, compositor, CPU, battery, JPEG…), `/api/mem`, `/api/perf?ms=N`, `/api/screen` (a BMP of the screen). Uploads: `POST /flash` (filesystem image, saved and restarted), `POST /save` (firmware), `POST /restart`. Switches for A/B measurements: `/api/cpu?mhz=N`, `/api/backlight?percent=N`, `/api/rcore`, `/api/compose`, `/api/dl`, `/api/idle`, `/api/snapshot`, `/api/layerblit`, `/api/layercache`.
+`GET /` is a dashboard. `GET /api/status` (link, heap, frames, render core, compositor, CPU, battery, JPEG…), `/api/mem`, `/api/perf?ms=N`, `/api/screen` (a BMP of the screen). Uploads: `POST /flash` (filesystem image, saved and restarted), `POST /save` (firmware), `POST /api/system?name=NAME` (a file into `SYSTEM/`, e.g. `WIFIFW.BIN`), `POST /restart`. Switches for A/B measurements: `/api/cpu?mhz=N`, `/api/backlight?percent=N`, `/api/rcore`, `/api/compose`, `/api/dl`, `/api/idle`, `/api/snapshot`, `/api/layerblit`, `/api/layercache`.
 
 ### Simulator
 

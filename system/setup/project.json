@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "device": "exynos4412-xl",
+  "screen": [1280, 800],
+  "include_dirs": ["../../../ferrite-ui/lib"],
+  "fonts": [
+    {"name": "f20", "font_id": 1, "file": "build/f20.font"},
+    {"name": "f26", "font_id": 2, "file": "build/f26.font"},
+    {"name": "f36", "font_id": 3, "file": "build/f36.font"}
+  ],
+  "programs": [
+    {"name": "main", "source": "main.fl"}
+  ]
+}

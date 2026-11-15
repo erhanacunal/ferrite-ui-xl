@@ -245,6 +245,23 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let early = &request[head_end..filled];
             upload(socket, super::Upload::Firmware, length, want, expect, early).await?;
         }
+        // `/api/system?name=NAME`, or uart_boot's `/system/NAME` (one client for both).
+        (b"POST" | b"PUT", _) if path == b"/api/system" || path.starts_with(b"/system/") => {
+            let mut name = [0u8; 12];
+            let raw = match path.strip_prefix(b"/system/") {
+                Some(n) => Some(n),
+                None => query_param(query, b"name"),
+            };
+            let Some(len) = raw.and_then(|n| crate::setup::system_name(n, &mut name)) else {
+                text(socket, "400 Bad Request", "/api/system?name=NAME or /system/NAME (8.3): WIFI.TXT, WIFIFW.BIN, WIFINV.TXT\n").await?;
+                return Ok(false);
+            };
+            let length = header(head, b"content-length").and_then(parse_decimal);
+            let want = header(head, b"x-crc32").and_then(parse_hex);
+            let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
+            let early = &request[head_end..filled];
+            upload(socket, super::Upload::System(name, len as u8), length, want, expect, early).await?;
+        }
         (b"GET", b"/api/dl") => {
             let id = match query_param(query, b"id") {
                 None => Some(super::DL_ALL),
@@ -823,7 +840,14 @@ fn status_json() -> String {
     let w = wifi::stats();
     let h = heap::stats();
     let mut s = String::new();
-    let _ = write!(s, "{{\"state\":\"{}\",\"hostname\":\"{}\",\"mac\":\"", super::state_name(), super::config().hostname);
+    let _ = write!(
+        s,
+        "{{\"state\":\"{}\",\"setup\":{},\"system_files\":{},\"hostname\":\"{}\",\"mac\":\"",
+        super::state_name(),
+        crate::setup::reason(),
+        crate::setup::files(),
+        super::config().hostname()
+    );
     hex6(&mut s, &l.mac);
     s.push_str("\",\"bssid\":\"");
     hex6(&mut s, &l.bssid);
@@ -831,7 +855,7 @@ fn status_json() -> String {
     let _ = write!(
         s,
         "\",\"ssid\":\"{}\",\"channel\":{},\"rssi\":{},\"address\":\"{}.{}.{}.{}/{}\",\"bridge_port\":{},\"bridge\":\"{}\"",
-        super::config().ssid.replace('"', "'"),
+        super::config().ssid().replace('"', "'"),
         l.channel,
         l.rssi,
         a,
@@ -1078,6 +1102,8 @@ const ZIMAGE_MAGIC: u32 = 0x016f_2818;
 const ZIMAGE_MAGIC_OFFSET: usize = 0x24;
 /// The largest firmware uart_boot takes (its `MAX_LEN`).
 const FIRMWARE_MAX: usize = 64 << 20;
+/// The largest `SYSTEM/` file taken (the chip firmware is ~0.5 MiB).
+const SYSTEM_MAX: usize = 4 << 20;
 
 async fn upload(
     socket: &mut TcpSocket<'_>,
@@ -1090,12 +1116,13 @@ async fn upload(
     let Some(length) = length else {
         return text(socket, "411 Length Required", "Send a Content-Length\n").await;
     };
-    let max = match kind {
-        super::Upload::Fs => crate::flash::SIZE,
-        super::Upload::Firmware => FIRMWARE_MAX,
+    let (min, max) = match kind {
+        super::Upload::Fs => (16, crate::flash::SIZE),
+        super::Upload::Firmware => (16, FIRMWARE_MAX),
+        super::Upload::System(..) => (1, SYSTEM_MAX),
     };
-    if !(16..=max).contains(&length) {
-        return text(socket, "413 Content Too Large", "16 B .. 64 MiB\n").await;
+    if !(min..=max).contains(&length) {
+        return text(socket, "413 Content Too Large", "16 B .. 64 MiB (SYSTEM/ files: 1 B .. 4 MiB)\n").await;
     }
     if super::flash_status() != super::FLASH_IDLE {
         return text(socket, "409 Conflict", "Busy: another upload is being saved\n").await;
@@ -1151,10 +1178,12 @@ async fn upload(
         Timer::after(Duration::from_millis(10)).await;
     };
     let result = match status {
+        super::FLASH_KEPT => text(socket, "200 OK", "CRC OK, saved in SYSTEM/; it counts from the next start\n").await,
         super::FLASH_SAVED => {
             let answer = match kind {
                 super::Upload::Fs => "CRC OK, saved FERRITE/FLASH.BIN; restarting\n",
                 super::Upload::Firmware => "CRC OK, saved FERRITE/FERRITE.BIN; restarting into it\n",
+                super::Upload::System(..) => "CRC OK, saved in SYSTEM/\n",
             };
             text(socket, "200 OK", answer).await
         }

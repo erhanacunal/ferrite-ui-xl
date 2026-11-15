@@ -52,6 +52,17 @@ pub fn init() {
     unsafe { USED = n };
 }
 
+/// Puts `data` at `addr` in the region for this boot only: not a change to
+/// save, so `FERRITE/FLASH.BIN` keeps what it holds (the setup screen's
+/// program, `setup::install`). A later write (a `writefs`) is saved as
+/// usual. Call before the runtime mounts the region.
+pub fn overlay(addr: usize, data: &[u8]) {
+    let s = shadow();
+    let end = (addr + data.len()).min(s.len());
+    s[addr.min(end)..end].copy_from_slice(&data[..end - addr.min(end)]);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Bumped by every write or erase: data handed to a device by address
 /// (`phys`) and cleaned from the cache for it must be cleaned again after.
 static GENERATION: AtomicU32 = AtomicU32::new(0);

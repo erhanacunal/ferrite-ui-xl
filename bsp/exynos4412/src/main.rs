@@ -19,8 +19,12 @@
 //!   interrupt goes to CPU0).
 //! - CPU3 (`wifi` feature, net/): the BCM4334 WiFi chip, embassy-net, an
 //!   HTTP server (status / memory / profile / FS upload) and a TCP bridge to
-//!   the USART protocol (bridge.rs). Started only when FERRITE/WIFI.CFG
-//!   names a network; parked otherwise.
+//!   the USART protocol (bridge.rs). Started only when SYSTEM/WIFI.TXT on
+//!   CACHE names a network (or on the setup screen, to scan); parked
+//!   otherwise.
+//!
+//! Volume up held at start (or no saved program): the built-in setup screen
+//! (setup.rs) runs instead of the saved program.
 //! Audio is refilled from the `pdma0` interrupt (audio.rs).
 //!
 //! Build (from this directory): `cargo build --release`
@@ -85,6 +89,7 @@ mod platform;
 mod rcore;
 mod renderer;
 mod rtc;
+mod setup;
 mod storage;
 mod systick;
 mod touch;
@@ -152,6 +157,8 @@ fn main(_args: BootArgs) -> ! {
     // Resources: the CACHE partition's FAT32 (FERRITE/FLASH.BIN) → RAM region.
     storage::init();
     flash::init();
+    // Volume up held, or nothing saved: the setup screen's program instead.
+    setup::install(mct);
     // The user EEPROM: FERRITE/EEPROM.BIN → RAM.
     eeprom::load();
 
@@ -185,7 +192,7 @@ fn main(_args: BootArgs) -> ! {
     }
     // WiFi: CPU0 powers the chip (PMIC on I2C0), CPU3 joins and serves.
     #[cfg(feature = "wifi")]
-    net::start(pmic, mct);
+    net::start(pmic, mct, setup::active());
     println!("ferrite: up, entering runtime");
 
     // The render side's own context (plan step 3c): same LCD and flash

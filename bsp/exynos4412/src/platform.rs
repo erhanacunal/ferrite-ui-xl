@@ -15,9 +15,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use ferrite_core::pool::ObjPool;
 use ferrite_core::sysinfo;
-use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
-use ferrite_core::touch::{TouchBackend, TouchImpl};
-use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
+use ferrite_core::runtime::{FullInput, PlatformRuntime};
+use ferrite_core::touch::TouchImpl;
+use ferrite_core::types::{COLOR_BLACK, COLOR_WHITE};
 
 use crate::lcd::{self, PANEL};
 
@@ -187,6 +187,9 @@ impl PlatformRuntime for Exynos4412Platform {
                 crate::battery::syscall(id)
             }
             crate::model3d::SYS_SHAPE..=crate::model3d::SYS_MESH => crate::model3d::syscall(id, args, objs),
+            ferrite_core::setup::SYS_WIFI_STATE..=ferrite_core::setup::SYS_WIFI_SCANS => {
+                crate::setup::syscall(id, args, objs)
+            }
             _ => sysinfo::syscall(id, args, objs, || {
                 let heap = heap::stats();
                 sysinfo::Info {
@@ -236,13 +239,9 @@ impl PlatformRuntime for Exynos4412Platform {
         // their own with `setBrightness`.
         lcd::flush_wait();
         ctx.backlight.set_brightness(BOOT_BRIGHTNESS);
-
-        // Nothing saved on CACHE yet (or storage off): recovery, so the host
-        // can writefs.
-        if recovery_requested(ctx) || !fs_present(ctx) {
-            recovery_screen(ctx);
-            return ERR_EMPTY_RUN;
-        }
+        // Nothing saved, or volume up held: the region holds the setup
+        // screen's program instead (`setup::install`, before the runtime),
+        // which replaced the recovery screen.
         0
     }
 
@@ -371,48 +370,4 @@ fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
         }
         Err(e) => println!("ferrite: standby ERROR {:?}", e),
     }
-}
-
-fn fs_present(ctx: &Ctx<Exynos4412Platform>) -> bool {
-    let mut magic = [0u8; 4];
-    ctx.flash.read(Exynos4412Platform::FS_BASE, &mut magic);
-    &magic == b"FERR"
-}
-
-/// Top-left 80×80 held for 3 s at boot.
-fn recovery_requested(ctx: &mut Ctx<Exynos4412Platform>) -> bool {
-    let be = crate::touch::MxtTouch;
-    let cal = crate::touch::CAL;
-    let held = || be.is_active() && matches!(be.read_screen(&cal), Some((x, y)) if x < 80 && y < 80);
-    if !held() {
-        return false;
-    }
-    let start = ctx.systick.millis();
-    loop {
-        let t = ctx.systick.millis().wrapping_sub(start);
-        if t >= 3000 {
-            return true;
-        }
-        ctx.lcd.fill_rect(440, 390, (t * 400 / 3000) as u16, 8, COLOR_RED);
-        lcd::flush();
-        if !held() {
-            ctx.lcd.fill_rect(440, 390, 400, 8, COLOR_BLACK);
-            lcd::flush();
-            return false;
-        }
-        ctx.systick.delay_ms(20);
-    }
-}
-
-fn recovery_screen(ctx: &mut Ctx<Exynos4412Platform>) {
-    let (w, h) = (PANEL.width as i16, PANEL.height as i16);
-    ctx.lcd.fill_rect(0, 0, w as u16, h as u16, COLOR_BLACK);
-    let font = ctx.fonts.embedded();
-    let line = |text: &[u8], y: i16, color: u16| {
-        let x = w / 2 - font.text_width(text) as i16 / 2;
-        font.draw_str(&ctx.lcd, &ctx.flash, text, x, y, color, Some(COLOR_BLACK));
-    };
-    line(b"RECOVERY MODE", h / 2 - 10, COLOR_RED);
-    line(b"Use writefs to flash a new program", h / 2 + 20, 0x8410);
-    lcd::flush_wait();
 }

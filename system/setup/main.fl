@@ -1,0 +1,468 @@
+// main.fl — the board's setup screen (ferrite-ui-xl, exynos4412).
+//
+// Built into the firmware (scripts/build_setup.py -> setup.img, embedded by
+// bsp/exynos4412/src/setup.rs). It runs instead of the saved program when
+// volume up is held as the firmware starts, or when nothing is saved
+// (it replaced the recovery screen: writefs / bootflash still work meanwhile).
+//
+// Left: the networks around (a scan every few seconds while not joined; tap
+// one to take its name). Right: the WiFi settings (name, passphrase, band,
+// hostname), saved as SYSTEM/WIFI.TXT on CACHE, which uart_boot reads too;
+// they count from the next start (Save & restart). Below: what the board has.
+
+#include "core.fl"
+#include "color.fl"
+#include "system.fl"
+
+const F20 = 1;
+const F26 = 2;
+const F36 = 3;
+
+const BG         = 0x10A3;
+const PANEL      = 0x18E4;
+const ROW        = 0x2145;
+const ROW_HI     = 0x31E8;
+const ACCENT     = 0x2C7F;
+const ACCENT_HI  = 0x4D7F;
+const OK_COLOR   = 0x3666;
+const WARN_COLOR = 0xFD20;
+const BAD_COLOR  = 0xF9A6;
+const TEXT       = 0xEF7D;
+const DIM        = 0x9CF3;
+const FIELD      = 0x0861;
+
+const ROWS = 7;
+const ROW_H = 64;
+const LIST_X = 40;
+const LIST_Y = 180;
+const LIST_W = 560;
+const FORM_X = 664;
+const FORM_W = 576;
+
+// Array sizes must be literals: keep 7 = ROWS. The row buttons are also
+// file-scope vars (row0..row6) so set(on_click) can wire them.
+var row_btn[7];
+var row_name[7];
+var row_sig[7];
+var row0;
+var row1;
+var row2;
+var row3;
+var row4;
+var row5;
+var row6;
+var scan_btn;
+var save_btn;
+var restart_btn;
+var rows_shown = 0;
+
+var ssid_in;
+var pass_in;
+var host_in;
+var band_any;
+var band_2g;
+var band_5g;
+var msg_lbl;
+var wifi_lbl;
+var files_lbl;
+var scan_lbl;
+var shown_scans = -1;
+var shown_state = -1;
+var last_poll = 0;
+var last_scan = 0;
+var saved = 0;
+
+// The helpers fill a widget the caller allocated: the compiler treats a
+// variable as a widget only when it is assigned from alloc().
+fn label(l: widget, x, y, w, h, font, color, align, txt) {
+    target(l);
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(font_id, font);
+    set(text_color, color);
+    set(text_align, align);
+    set(text, txt);
+    parent(0);
+    return 0;
+}
+
+fn panel(p: widget, x, y, w, h) {
+    target(p);
+    set(location, x, y);
+    set(size, w, h);
+    set(bg_color, PANEL);
+    set(border_radius, 20);
+    parent(0);
+    return 0;
+}
+
+fn text_button(b: widget, x, y, w, h, color, txt) {
+    target(b);
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(bg_color, color);
+    set(press_color, ACCENT_HI);
+    set(border_radius, h / 2);
+    set(clickable, ON);
+    set(font_id, F26);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, txt);
+    parent(0);
+    return 0;
+}
+
+fn input(f: widget, x, y, w, value, maxlen) {
+    target(f);
+    set(kind, KIND_INPUT);
+    set(location, x, y);
+    set(size, w, 60);
+    set(bg_color, FIELD);
+    set(border_color, ROW_HI);
+    set(border, 2, 2, 2, 2);
+    set(border_radius, 12);
+    set(padding, 16, 12, 16, 12);
+    set(font_id, F26);
+    set(text_color, TEXT);
+    set(max_length, maxlen);
+    set(clickable, ON);
+    set(text, value);
+    parent(0);
+    return 0;
+}
+
+fn band_button(b: widget, x, txt, checked_now) {
+    target(b);
+    set(kind, KIND_BUTTON_GROUP);
+    set(location, x, 520);
+    set(size, 176, 56);
+    set(bg_color, ROW);
+    set(press_color, ACCENT);
+    set(border_radius, 12);
+    set(clickable, ON);
+    set(group_id, 1);
+    if (checked_now) {
+        set(checked, 1);
+    }
+    parent(0);
+    // A button group draws no text of its own: a label inside it does.
+    var t = alloc();
+    target(t);
+    set(kind, KIND_LABEL);
+    set(size, 176, 56);
+    set(font_id, F26);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, txt);
+    parent(b);
+    return 0;
+}
+
+fn say(txt, color) {
+    target(msg_lbl);
+    set(text, txt);
+    set(text_color, color);
+}
+
+fn state_text(st) -> string {
+    if (st == WIFI_OFF) { return "off (no network named)"; }
+    if (st == WIFI_JOINING) { return sprintf("joining %s", wifiInfo(INFO_SSID)); }
+    if (st == WIFI_DHCP) { return sprintf("joined %s, waiting for DHCP", wifiInfo(INFO_JOINED)); }
+    if (st == WIFI_UP) { return sprintf("up: %s, http://%s/", wifiInfo(INFO_JOINED), wifiInfo(INFO_ADDRESS)); }
+    if (st == WIFI_FAILED) { return "failed (see the console)"; }
+    if (st == WIFI_DOWN) { return "link lost"; }
+    if (st == WIFI_SCANNING) { return "scanning (no network named)"; }
+    if (st == WIFI_NO_FIRMWARE) { return "no chip firmware: copy WIFIFW.BIN + WIFINV.TXT to SYSTEM/"; }
+    return "asleep";
+}
+
+fn yes_no(bits, bit) -> string {
+    if (bits & bit) { return "yes"; }
+    return "no";
+}
+
+fn show_status() {
+    var st = wifiState();
+    target(wifi_lbl);
+    var mac = wifiInfo(INFO_MAC);
+    if (strLen(mac) > 0) {
+        set(text, sprintf("WiFi: %s\nMAC %s", state_text(st), mac));
+    } else {
+        set(text, sprintf("WiFi: %s", state_text(st)));
+    }
+    if (st == WIFI_UP) {
+        set(text_color, OK_COLOR);
+    } else if (st == WIFI_FAILED || st == WIFI_NO_FIRMWARE) {
+        set(text_color, BAD_COLOR);
+    } else {
+        set(text_color, TEXT);
+    }
+    var f = systemFiles();
+    target(files_lbl);
+    set(text, sprintf("WIFI.TXT %s, firmware %s, NVRAM %s\nSaved program %s, storage %s",
+        yes_no(f, FILE_SETTINGS), yes_no(f, FILE_FIRMWARE), yes_no(f, FILE_NVRAM),
+        yes_no(f, FILE_PROGRAM), yes_no(f, FILE_STORAGE)));
+    shown_state = st;
+}
+
+fn show_networks() {
+    var n = wifiScanCount();
+    shown_scans = wifiScans();
+    target(scan_lbl);
+    if (n < 0) {
+        if (wifiState() == WIFI_NO_FIRMWARE || wifiState() == WIFI_OFF) {
+            set(text, "No scan: WiFi is off");
+        } else {
+            set(text, "Scanning...");
+        }
+    } else if (n == 0) {
+        set(text, "No networks found");
+    } else {
+        set(text, sprintf("%d networks", n));
+    }
+    rows_shown = 0;
+    for (var i = 0; i < ROWS; i++) {
+        target(row_btn[i]);
+        if (i < n) {
+            var info = wifiScanInfo(i);
+            set(visible, ON);
+            target(row_name[i]);
+            set(text, wifiScanSsid(i));
+            target(row_sig[i]);
+            if (info & SCAN_JOINABLE) {
+                set(text, sprintf("%d dBm  ch %d", wifiScanRssi(i), info & 0xFF));
+                set(text_color, DIM);
+            } else {
+                set(text, sprintf("%d dBm  not WPA2", wifiScanRssi(i)));
+                set(text_color, WARN_COLOR);
+            }
+            rows_shown++;
+        } else {
+            set(visible, OFF);
+        }
+    }
+}
+
+fn row_index(w) {
+    for (var i = 0; i < ROWS; i++) {
+        if (row_btn[i] == w || row_name[i] == w || row_sig[i] == w) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fn on_row(w) {
+    var i = row_index(w);
+    if (i < 0 || i >= rows_shown) {
+        return 0;
+    }
+    target(ssid_in);
+    set(text, wifiScanSsid(i));
+    dirty();
+    if ((wifiScanInfo(i) & SCAN_JOINABLE) == 0) {
+        say("This network is not WPA2-PSK: the board cannot join it.", WARN_COLOR);
+    } else {
+        say("Network name taken; type its passphrase.", DIM);
+    }
+    return 0;
+}
+
+fn on_scan(w) {
+    if (wifiScan()) {
+        target(scan_lbl);
+        set(text, "Scanning...");
+        last_scan = millis();
+    } else {
+        say("No scan now: WiFi is joined or off (scans run before it joins).", DIM);
+    }
+    return 0;
+}
+
+fn chosen_band() {
+    target(band_2g);
+    if (get(checked)) { return BAND_2G; }
+    target(band_5g);
+    if (get(checked)) { return BAND_5G; }
+    return BAND_ANY;
+}
+
+fn on_save(w) {
+    target(ssid_in);
+    var s = get(text);
+    target(pass_in);
+    var p = get(text);
+    target(host_in);
+    var h = get(text);
+    var r = wifiSave(s, p, chosen_band(), h);
+    if (r == SAVE_OK) {
+        saved = 1;
+        say("Saved as SYSTEM/WIFI.TXT. Restart to join.", OK_COLOR);
+    } else if (r == SAVE_INVALID) {
+        say("Not saved: name 1-32 characters, passphrase 8-63, hostname letters/digits/-", BAD_COLOR);
+    } else {
+        say("Not saved: CACHE could not be written (see the console).", BAD_COLOR);
+    }
+    show_status();
+    return 0;
+}
+
+fn on_restart(w) {
+    say("Restarting...", DIM);
+    render();
+    delay(200);
+    sysRestart();
+    return 0;
+}
+
+fn setup() {
+    target(0);
+    set(bg_color, BG);
+
+    label(alloc(), 40, 24, 700, 56, F36, WHITE, ALIGN_LEFT, "Setup");
+    var why = "Volume up was held at start";
+    if (setupReason() == SETUP_NO_PROGRAM) {
+        why = "No saved program: send one with writefs / bootflash";
+    }
+    label(alloc(), 640, 24, 600, 56, F20, DIM, ALIGN_RIGHT, why);
+
+    // Networks
+    panel(alloc(), 24, 96, 600, 680);
+    label(alloc(), LIST_X, 112, 300, 48, F26, WHITE, ALIGN_LEFT, "Networks");
+    scan_lbl = alloc();
+    label(scan_lbl, LIST_X + 180, 124, 190, 36, F20, DIM, ALIGN_LEFT, "");
+    scan_btn = alloc();
+    text_button(scan_btn, LIST_X + 376, 116, 184, 56, ACCENT, "Scan");
+    target(scan_btn);
+    set(on_click, @on_scan);
+    row0 = alloc();
+    row1 = alloc();
+    row2 = alloc();
+    row3 = alloc();
+    row4 = alloc();
+    row5 = alloc();
+    row6 = alloc();
+    row_btn[0] = row0;
+    row_btn[1] = row1;
+    row_btn[2] = row2;
+    row_btn[3] = row3;
+    row_btn[4] = row4;
+    row_btn[5] = row5;
+    row_btn[6] = row6;
+    for (var i = 0; i < ROWS; i++) {
+        var b: widget = row_btn[i];
+        target(b);
+        set(location, LIST_X, LIST_Y + i * ROW_H);
+        set(size, LIST_W, ROW_H - 8);
+        set(bg_color, ROW);
+        set(press_color, ROW_HI);
+        set(border_radius, 12);
+        set(clickable, ON);
+        set(visible, OFF);
+        parent(0);
+        row_btn[i] = b;
+        var nl = alloc();
+        target(nl);
+        set(kind, KIND_LABEL);
+        set(location, 16, 0);
+        set(size, 270, ROW_H - 8);
+        set(font_id, F26);
+        set(text_color, TEXT);
+        set(text_align, ALIGN_LEFT);
+        parent(b);
+        row_name[i] = nl;
+        var sl = alloc();
+        target(sl);
+        set(kind, KIND_LABEL);
+        set(location, 286, 0);
+        set(size, 260, ROW_H - 8);
+        set(font_id, F20);
+        set(text_color, DIM);
+        set(text_align, ALIGN_RIGHT);
+        parent(b);
+        row_sig[i] = sl;
+    }
+    target(row0);
+    set(on_click, @on_row);
+    target(row1);
+    set(on_click, @on_row);
+    target(row2);
+    set(on_click, @on_row);
+    target(row3);
+    set(on_click, @on_row);
+    target(row4);
+    set(on_click, @on_row);
+    target(row5);
+    set(on_click, @on_row);
+    target(row6);
+    set(on_click, @on_row);
+
+    // Settings
+    panel(alloc(), 648, 96, 608, 680);
+    label(alloc(), FORM_X, 112, 400, 48, F26, WHITE, ALIGN_LEFT, "WiFi settings");
+    label(alloc(), FORM_X, 168, 400, 32, F20, DIM, ALIGN_LEFT, "Network name");
+    ssid_in = alloc();
+    input(ssid_in, FORM_X, 200, FORM_W, wifiInfo(INFO_SSID), 32);
+    label(alloc(), FORM_X, 272, 400, 32, F20, DIM, ALIGN_LEFT, "Passphrase");
+    pass_in = alloc();
+    input(pass_in, FORM_X, 304, FORM_W, wifiInfo(INFO_PASSWORD), 64);
+    label(alloc(), FORM_X, 376, 400, 32, F20, DIM, ALIGN_LEFT, "Hostname (DHCP, optional)");
+    host_in = alloc();
+    input(host_in, FORM_X, 408, FORM_W, wifiInfo(INFO_HOSTNAME), 32);
+    label(alloc(), FORM_X, 484, 400, 32, F20, DIM, ALIGN_LEFT, "Band");
+    var band = wifiInfo(INFO_BAND);
+    band_any = alloc();
+    band_button(band_any, FORM_X, "Any", strLen(band) == 0);
+    band_2g = alloc();
+    band_button(band_2g, FORM_X + 200, "2.4 GHz", strcmp(band, "2.4") == 0);
+    band_5g = alloc();
+    band_button(band_5g, FORM_X + 400, "5 GHz", strcmp(band, "5") == 0);
+    save_btn = alloc();
+    text_button(save_btn, FORM_X, 604, 280, 64, ACCENT, "Save");
+    target(save_btn);
+    set(on_click, @on_save);
+    restart_btn = alloc();
+    text_button(restart_btn, FORM_X + 296, 604, 280, 64, ROW_HI, "Restart");
+    target(restart_btn);
+    set(on_click, @on_restart);
+    msg_lbl = alloc();
+    label(msg_lbl, FORM_X, 680, FORM_W, 80, F20, DIM, ALIGN_LEFT,
+        "Tap a field to type. Saved settings count from the next start.");
+    target(msg_lbl);
+    set(multi_line, ON);
+
+    // Board
+    wifi_lbl = alloc();
+    label(wifi_lbl, LIST_X, 628, LIST_W, 64, F20, TEXT, ALIGN_LEFT, "");
+    target(wifi_lbl);
+    set(multi_line, ON);
+    files_lbl = alloc();
+    label(files_lbl, LIST_X, 696, LIST_W, 72, F20, DIM, ALIGN_LEFT, "");
+    target(files_lbl);
+    set(multi_line, ON);
+
+    show_status();
+    show_networks();
+    return 0;
+}
+
+fn loop() {
+    var now = millis();
+    if (now - last_poll >= 500) {
+        last_poll = now;
+        if (wifiScans() != shown_scans) {
+            show_networks();
+        }
+        if (wifiState() != shown_state) {
+            show_status();
+        }
+        // Ask for a fresh list now and then while the board is not joined.
+        if (now - last_scan >= 15000 && (wifiState() == WIFI_SCANNING || wifiState() == WIFI_JOINING)) {
+            last_scan = now;
+            wifiScan();
+        }
+    }
+    delay(100);
+}

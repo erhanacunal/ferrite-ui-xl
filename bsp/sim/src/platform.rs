@@ -214,6 +214,8 @@ impl PlatformRuntime for SimPlatform {
             // so a model widget shows its background; setters succeed, stats are 0.
             0x60..=0x63 | 0x65 => Some(1),
             0x64 => Some(0),
+            // The setup screen's WiFi / settings syscalls (lib/system.fl): a fake chip.
+            0x70..=0x7A => crate::setup::syscall(id, args, objs),
             // No heap figures on the host; frames = passes.
             _ => ferrite_core::sysinfo::syscall(id, args, objs, || {
                 let passes = PASSES.load(Ordering::Relaxed);

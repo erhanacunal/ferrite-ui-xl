@@ -47,6 +47,9 @@ pub const DIR: &str = "FERRITE";
 pub const FILE: &str = "FLASH.BIN";
 /// Programs' files: `DIR/USER_DIR`.
 pub const USER_DIR: &str = "USER";
+/// The board's own settings, shared with uart_boot (`uart_boot/src/settings.rs`, keep in
+/// sync): `WIFI.TXT`, the WiFi chip's firmware and NVRAM (`net`). Out of programs' reach.
+pub const SYSTEM_DIR: &str = "SYSTEM";
 /// Save this long after the last write (a writefs in progress keeps writing
 /// every chunk, so it is not saved half done unless the host stalls).
 pub const IDLE_SAVE_MS: u32 = 1500;
@@ -173,7 +176,7 @@ impl Mounted {
 /// Reads the image file into `region`; returns its length (0 = no file yet).
 pub fn load(region: &mut [u8]) -> usize {
     let Some(m) = mounted() else { return 0 };
-    match read_file(m, FILE, region) {
+    match read_file(m, DIR, FILE, region) {
         Ok(n) => {
             println!("ferrite: loaded {}/{}, {} bytes", DIR, FILE, n);
             n
@@ -190,8 +193,8 @@ pub fn load(region: &mut [u8]) -> usize {
 }
 
 /// Reads [`DIR`]/`name` into `region`, at most its length; the bytes read.
-fn read_file(m: &Mounted, name: &str, region: &mut [u8]) -> Result<usize, FsError> {
-    m.in_dir([DIR], |v, dir| {
+fn read_file(m: &Mounted, dir: &str, name: &str, region: &mut [u8]) -> Result<usize, FsError> {
+    m.in_dir([dir], |v, dir| {
         let file = v.open_file_in_dir(dir, name, Mode::ReadOnly)?;
         let len = (v.file_length(file)? as usize).min(region.len());
         let mut done = 0;
@@ -211,8 +214,8 @@ fn read_file(m: &Mounted, name: &str, region: &mut [u8]) -> Result<usize, FsErro
 }
 
 /// The length of [`DIR`]/`name`.
-fn file_len(m: &Mounted, name: &str) -> Result<usize, FsError> {
-    m.in_dir([DIR], |v, dir| {
+fn file_len(m: &Mounted, dir: &str, name: &str) -> Result<usize, FsError> {
+    m.in_dir([dir], |v, dir| {
         let file = v.open_file_in_dir(dir, name, Mode::ReadOnly)?;
         let len = v.file_length(file);
         v.close_file(file)?;
@@ -220,18 +223,18 @@ fn file_len(m: &Mounted, name: &str) -> Result<usize, FsError> {
     })
 }
 
-/// Reads [`DIR`]/`name` (an 8.3 name) whole, if it exists and is at most
-/// `max` bytes.
+/// Reads `dir`/`name` (8.3 names) whole, if it exists and is at most `max`
+/// bytes.
 #[cfg(feature = "wifi")]
-pub fn read_named(name: &str, max: usize) -> Option<Vec<u8>> {
+pub fn read_in(dir: &str, name: &str, max: usize) -> Option<Vec<u8>> {
     let m = mounted()?;
-    let len = file_len(m, name).ok()?;
+    let len = file_len(m, dir, name).ok()?;
     if len > max {
-        println!("ferrite: {}/{} too large ({} bytes)", DIR, name, len);
+        println!("ferrite: {}/{} too large ({} bytes)", dir, name, len);
         return None;
     }
     let mut buf = alloc::vec![0u8; len];
-    let n = read_file(m, name, &mut buf).ok()?;
+    let n = read_file(m, dir, name, &mut buf).ok()?;
     buf.truncate(n);
     Some(buf)
 }
@@ -239,7 +242,7 @@ pub fn read_named(name: &str, max: usize) -> Option<Vec<u8>> {
 /// Reads [`DIR`]/`name` into `buf` if it exists and is exactly its size.
 pub fn read_exact(name: &str, buf: &mut [u8]) -> bool {
     let Some(m) = mounted() else { return false };
-    file_len(m, name).is_ok_and(|len| len == buf.len()) && read_file(m, name, buf).is_ok_and(|n| n == buf.len())
+    file_len(m, DIR, name).is_ok_and(|len| len == buf.len()) && read_file(m, DIR, name, buf).is_ok_and(|n| n == buf.len())
 }
 
 /// Writes `data` as the image file (made or truncated), then flushes the
@@ -250,19 +253,25 @@ pub fn save(data: &[u8]) -> bool {
 
 /// Writes [`DIR`]/`name` (an 8.3 name, made or truncated) and flushes.
 pub fn save_named(name: &str, data: &[u8]) -> bool {
+    save_in(DIR, name, data)
+}
+
+/// Writes `dir`/`name` (8.3 names; `dir` made if needed, the file made or
+/// truncated) and flushes.
+pub fn save_in(dir: &str, name: &str, data: &[u8]) -> bool {
     let Some(m) = mounted() else { return false };
-    match write_file(m, name, data).and_then(|()| m.flush_device()) {
+    match write_file(m, dir, name, data).and_then(|()| m.flush_device()) {
         Ok(()) => true,
         Err(e) => {
-            println!("ferrite: save {}/{} ERROR {:?}", DIR, name, e);
+            println!("ferrite: save {}/{} ERROR {:?}", dir, name, e);
             false
         }
     }
 }
 
-fn write_file(m: &Mounted, name: &str, data: &[u8]) -> Result<(), FsError> {
-    m.ensure_dir(&[], DIR)?;
-    m.in_dir([DIR], |v, dir| {
+fn write_file(m: &Mounted, dir: &str, name: &str, data: &[u8]) -> Result<(), FsError> {
+    m.ensure_dir(&[], dir)?;
+    m.in_dir([dir], |v, dir| {
         let file = v.open_file_in_dir(dir, name, Mode::ReadWriteCreateOrTruncate)?;
         let r = v.write(file, data);
         v.close_file(file)?;

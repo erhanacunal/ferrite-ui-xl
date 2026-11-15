@@ -3,12 +3,14 @@
 //! The HAL's `uart_boot` / `wifi_async_test` steps, as a service next to the
 //! runtime:
 //!
-//! 1. CPU0 at boot ([`start`]): reads the settings (and, if the firmware
-//!    image embeds no chip firmware, the firmware + NVRAM) ([`wifi_file`]),
-//!    powers the chip (`bcm4334::power_on`: PMIC over I2C0, which CPU0 owns, ~0.5 s),
-//!    then starts CPU3. Nothing configured → no WiFi, no delay.
+//! 1. CPU0 at boot ([`start`]): reads the settings and the chip's firmware +
+//!    NVRAM ([`load_config`]), powers the chip (`bcm4334::power_on`: PMIC over
+//!    I2C0, which CPU0 owns, ~0.5 s), then starts CPU3. Nothing configured →
+//!    no WiFi, no delay (except on the setup screen, which scans).
 //! 2. CPU3, polled ([`cpu3`]): SDIO + firmware, scan, WPA2 join (retried
-//!    every [`RETRY_MS`] until the network is there).
+//!    every [`RETRY_MS`] until the network is there, sooner when the setup
+//!    screen asks for a scan). Every scan's networks are kept ([`scan`]); with
+//!    no network named (setup screen) it only scans.
 //! 3. CPU3, Embassy: the WiFi runner (host wake interrupt routed to CPU3),
 //!    embassy-net with DHCP (hostname from the config, default
 //!    [`DEFAULT_HOSTNAME`], as uart_boot, so `ferrite_cli --host` finds
@@ -18,20 +20,18 @@
 //! rings (`bridge.rs`) and, once per pass, [`service`] (an uploaded FS image
 //! to save, a restart request).
 //!
-//! The files are `RES_FILE`s of the FS image (`"files"` in project.json, so
-//! they arrive with `writefs` / `bootflash`): [`CFG_RES`], [`FW_RES`],
-//! [`NVRAM_RES`]. An image that has them also leaves a copy on CACHE
-//! (`FERRITE/`[`CFG_FILE`] …, written by the firmware), and an image without
-//! them uses that copy: WiFi survives uploading an app that doesn't carry
-//! them. The settings file is text, `key=value` per line, `#` comments:
-//! ```text
-//! ssid=MyNetwork
-//! password=passphrase
-//! band=2.4          # optional: 2.4 or 5, only join an AP on that band
-//! hostname=exynos   # optional DHCP hostname
-//! ```
-//! Build-time `WIFI_SSID` / `WIFI_PASSWORD` / `WIFI_BAND` (and
-//! `WIFI_FIRMWARE_DIR`, build.rs) are the last fallback.
+//! The files are the board's, in `SYSTEM/` on CACHE ([`storage::SYSTEM_DIR`]),
+//! shared with uart_boot (`uart_boot/src/settings.rs`): [`WIFI_FILE`] (the
+//! settings, format in `ferrite_core::setup`), [`FW_FILE`] and [`NVRAM_FILE`]
+//! (the brcmfmac firmware and NVRAM). They come from the setup screen
+//! (volume up held at start: `setup.rs`), `POST /api/system?name=` here or
+//! `/system/<NAME>` in uart_boot (`ferrite_cli system`, `httpboot.py
+//! --system`), or `uartboot.py --system`. Each falls back to the copy this
+//! firmware used to keep in `FERRITE/` (`WIFI.CFG`, `WIFIFW.BIN`,
+//! `WIFINV.TXT`), then to build-time `WIFI_SSID` / `WIFI_PASSWORD` /
+//! `WIFI_BAND` (and `WIFI_FIRMWARE_DIR`, build.rs).
+//!
+//! [`storage::SYSTEM_DIR`]: crate::storage::SYSTEM_DIR
 //! A lost link is not rejoined (the runner ends; restart the board, or go
 //! through standby).
 //!
@@ -62,20 +62,22 @@ use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::embassy::wifi;
 use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{cpu, embassy, println, smp, soc};
+use ferrite_core::setup::{self as fsetup, Network, ScanList, WifiSettings};
 
 use crate::bridge;
 use crate::hotplug::Group;
 
-/// Network settings / chip firmware / NVRAM as FS image resources
-/// (`RES_FILE`, ≤ 15 characters) …
-pub const CFG_RES: &str = "wifi_cfg";
-pub const FW_RES: &str = "wifi_fw";
-pub const NVRAM_RES: &str = "wifi_nvram";
-/// … and their copies on CACHE, in `storage::DIR` (8.3 names).
-pub const CFG_FILE: &str = "WIFI.CFG";
+/// The settings, chip firmware and NVRAM in `SYSTEM/` (8.3 names; uart_boot's
+/// `settings.rs` reads the same files — keep in sync) …
+pub const WIFI_FILE: &str = "WIFI.TXT";
 pub const FW_FILE: &str = "WIFIFW.BIN";
 pub const NVRAM_FILE: &str = "WIFINV.TXT";
-pub const DEFAULT_HOSTNAME: &str = "exynos";
+/// … and what this firmware called the settings in `FERRITE/` before.
+const LEGACY_WIFI_FILE: &str = "WIFI.CFG";
+const FW_MAX: usize = 2 << 20;
+const NVRAM_MAX: usize = 64 << 10;
+/// Networks kept from a scan.
+pub const SCAN_MAX: usize = 32;
 /// The USART protocol as a raw TCP stream (`ferrite_cli -p tcp://HOST:7000`).
 pub const BRIDGE_PORT: u16 = 7000;
 pub const HTTP_PORT: u16 = 80;
@@ -108,127 +110,122 @@ const BRIDGE_IDLE: Duration = Duration::from_secs(120);
 
 static mut WIFI_STATE: wifi::State<RX_FRAMES, TX_FRAMES> = wifi::State::new();
 static mut RESOURCES: StackResources<SOCKETS> = StackResources::new();
+/// CPU3: the chip, given back by its runner when the connection was lost, so that
+/// [`cpu3`] joins again with it (instead of stopping) once the tasks have ended.
+static mut LOST_CHIP: Option<Bcm4334> = None;
+/// Set by [`suspend`] (CPU0) while CPU3's tasks end for standby: a connection lost meanwhile
+/// is not joined again. Cleared by [`resume`].
+static STANDBY: AtomicBool = AtomicBool::new(false);
 
 // --- configuration (CPU0 at boot) ---------------------------------------------------------
 
-struct WifiConfig {
-    ssid: String,
-    password: String,
-    /// 2 = 2.4 GHz only, 5 = 5 GHz only, 0 = either.
-    band: u8,
-    hostname: String,
+pub(crate) struct WifiConfig {
+    pub(crate) settings: WifiSettings,
+    /// Empty: none found (no WiFi).
     firmware: &'static [u8],
     nvram: &'static [u8],
+    /// Which files were found in `SYSTEM/` (`fsetup::FILE_*` bits).
+    pub(crate) files: i32,
 }
 
-/// Written once by CPU0 before CPU3 starts, only read after.
+impl WifiConfig {
+    fn ssid(&self) -> &str {
+        &self.settings.ssid
+    }
+
+    fn hostname(&self) -> &str {
+        self.settings.hostname()
+    }
+}
+
+/// Written once by CPU0 at boot (before CPU3 starts), only read after.
 static mut CONFIG: Option<WifiConfig> = None;
 
-fn config() -> &'static WifiConfig {
+pub(crate) fn config() -> &'static WifiConfig {
     // SAFETY: see CONFIG.
-    unsafe { (*(&raw const CONFIG)).as_ref().expect("set before CPU3 starts") }
+    unsafe { (*(&raw const CONFIG)).as_ref().expect("set at boot") }
 }
 
-fn parse_band(v: &str) -> u8 {
-    match v.trim() {
-        "2.4" | "2" => 2,
-        "5" => 5,
-        _ => 0,
+/// The config, if [`start`] read it (false on a build or boot without it).
+pub(crate) fn config_loaded() -> Option<&'static WifiConfig> {
+    // SAFETY: see CONFIG.
+    unsafe { (*(&raw const CONFIG)).as_ref() }
+}
+
+/// `SYSTEM/name`, else `FERRITE/legacy`: its content and where it came from.
+fn wifi_file(name: &str, legacy: &str, max: usize) -> Option<(Vec<u8>, &'static str)> {
+    use crate::storage::{DIR, SYSTEM_DIR, read_in};
+    if let Some(data) = read_in(SYSTEM_DIR, name, max) {
+        return Some((data, SYSTEM_DIR));
     }
+    read_in(DIR, legacy, max).map(|data| (data, DIR))
 }
 
-/// RES_FILE `name` of the FS image in the RAM region, if present and at
-/// most `max` bytes.
-fn image_file(name: &str, max: usize) -> Option<Vec<u8>> {
-    use ferrite_core::platform::Platform;
-    let flash = ferrite_core::flash::FlashImpl::with_backend(crate::flash::RamFlash);
-    let fs = ferrite_core::fs::Fs::mount(&flash, crate::platform::Exynos4412Platform::FS_BASE).ok()?;
-    let entry = fs.find_kind(&flash, name.as_bytes(), ferrite_core::fs::RES_FILE)?;
-    if entry.size as usize > max {
-        println!("ferrite: {} too large ({} bytes)", name, entry.size);
-        return None;
-    }
-    let mut buf = alloc::vec![0u8; entry.size as usize];
-    fs.read_resource(&flash, &entry, 0, &mut buf);
-    Some(buf)
-}
-
-/// A WiFi file: the FS image's `res` (copied to CACHE `file` when it
-/// differs, so later images without it keep WiFi), else that CACHE copy.
-fn wifi_file(res: &str, file: &str, max: usize) -> Option<Vec<u8>> {
-    let cached = crate::storage::read_named(file, max);
-    match image_file(res, max) {
-        Some(data) => {
-            if cached.as_deref() != Some(&data[..]) && crate::storage::available() {
-                if crate::storage::save_named(file, &data) {
-                    println!("ferrite: {} kept as {}/{}", res, crate::storage::DIR, file);
-                }
+/// Reads the settings and the chip's files (CPU0, boot).
+fn load_config() -> WifiConfig {
+    let mut cfg = WifiConfig { settings: WifiSettings::default(), firmware: FIRMWARE, nvram: NVRAM, files: 0 };
+    match wifi_file(WIFI_FILE, LEGACY_WIFI_FILE, 4096) {
+        Some((text, from)) => {
+            cfg.settings = WifiSettings::parse(&text);
+            if from == crate::storage::SYSTEM_DIR {
+                cfg.files |= fsetup::FILE_SETTINGS;
             }
-            Some(data)
-        }
-        None => cached,
-    }
-}
-
-fn load_config() -> Option<WifiConfig> {
-    let mut cfg = WifiConfig {
-        ssid: String::new(),
-        password: String::new(),
-        band: option_env!("WIFI_BAND").map_or(0, parse_band),
-        hostname: String::from(DEFAULT_HOSTNAME),
-        firmware: FIRMWARE,
-        nvram: NVRAM,
-    };
-    match wifi_file(CFG_RES, CFG_FILE, 4096) {
-        Some(text) => {
-            for line in text.split(|&b| b == b'\n') {
-                let Ok(line) = core::str::from_utf8(line) else { continue };
-                let line = line.split('#').next().unwrap_or("").trim();
-                let Some((key, value)) = line.split_once('=') else { continue };
-                let value = value.trim();
-                match key.trim().to_ascii_lowercase().as_str() {
-                    "ssid" => cfg.ssid = String::from(value),
-                    "password" | "psk" => cfg.password = String::from(value),
-                    "band" => cfg.band = parse_band(value),
-                    "hostname" if !value.is_empty() => cfg.hostname = String::from(value),
-                    _ => {}
-                }
-            }
+            println!("ferrite: wifi settings from {}/", from);
         }
         None => {
-            cfg.ssid = String::from(option_env!("WIFI_SSID").unwrap_or(""));
-            cfg.password = String::from(option_env!("WIFI_PASSWORD").unwrap_or(""));
+            cfg.settings.ssid = String::from(option_env!("WIFI_SSID").unwrap_or(""));
+            cfg.settings.password = String::from(option_env!("WIFI_PASSWORD").unwrap_or(""));
+            cfg.settings.band = option_env!("WIFI_BAND").map_or(0, fsetup::parse_band);
         }
     }
-    if cfg.ssid.is_empty() {
-        println!("ferrite: wifi off (no {} file in the FS image)", CFG_RES);
-        return None;
+    let fw = wifi_file(FW_FILE, FW_FILE, FW_MAX);
+    let nv = wifi_file(NVRAM_FILE, NVRAM_FILE, NVRAM_MAX);
+    for (file, bit) in [(&fw, fsetup::FILE_FIRMWARE), (&nv, fsetup::FILE_NVRAM)] {
+        if file.as_ref().is_some_and(|(_, from)| *from == crate::storage::SYSTEM_DIR) {
+            cfg.files |= bit;
+        }
     }
-    if cfg.firmware.is_empty() {
-        let fw = wifi_file(FW_RES, FW_FILE, 2 << 20);
-        let nv = wifi_file(NVRAM_RES, NVRAM_FILE, 64 << 10);
-        let (Some(fw), Some(nv)) = (fw, nv) else {
-            println!("ferrite: wifi off (no chip firmware: add {} + {} to the FS image, or build with WIFI_FIRMWARE_DIR)", FW_RES, NVRAM_RES);
-            return None;
-        };
+    if let (Some((fw, _)), Some((nv, _))) = (fw, nv)
+        && !fw.is_empty()
+        && !nv.is_empty()
+    {
         cfg.firmware = Box::leak(fw.into_boxed_slice());
         cfg.nvram = Box::leak(nv.into_boxed_slice());
     }
-    Some(cfg)
+    cfg
 }
 
 /// CPU0, at boot after `storage::init`, `Gic::init` and `embassy::init`:
-/// powers the chip and hands the rest to CPU3. Not fatal on any error.
-pub fn start(pmic: Max77686, mct: Mct) {
-    let Some(cfg) = load_config() else { return };
+/// reads the settings, powers the chip and hands the rest to CPU3. `setup`:
+/// the setup screen runs, which scans even with no network named. Not fatal
+/// on any error.
+pub fn start(pmic: Max77686, mct: Mct, setup: bool) {
+    let cfg = load_config();
+    let named = !cfg.ssid().is_empty();
+    let has_firmware = !cfg.firmware.is_empty();
+    // SAFETY: CPU3 is not running yet; set once.
+    unsafe { *(&raw mut CONFIG) = Some(cfg) };
+    if !has_firmware {
+        println!(
+            "ferrite: wifi off (no chip firmware: {}/{} + {})",
+            crate::storage::SYSTEM_DIR,
+            FW_FILE,
+            NVRAM_FILE
+        );
+        set_state(State::NoFirmware);
+        return;
+    }
+    if !named && !setup {
+        println!("ferrite: wifi off ({}/{} names no network)", crate::storage::SYSTEM_DIR, WIFI_FILE);
+        return;
+    }
     // PMIC rails + 32 kHz clock over I2C0: on CPU0, which owns that bus.
     if let Err(e) = bcm4334::power_on(pmic, mct) {
         println!("ferrite: wifi power ERROR {:?}", e);
         return;
     }
-    // SAFETY: CPU3 is not running yet.
-    unsafe { *(&raw mut CONFIG) = Some(cfg) };
     set_state(State::Joining);
+    STANDBY.store(false, Ordering::Release);
     GROUP.arm();
     if let Err(e) = smp::start_cpu(CORE, cpu3) {
         println!("ferrite: CPU{} ERROR {:?}, wifi off", CORE, e);
@@ -251,6 +248,10 @@ pub enum State {
     Down = 5,
     /// Off for standby ([`suspend`]).
     Asleep = 6,
+    /// Chip up, no network named: scanning only (setup screen).
+    Scanning = 7,
+    /// No firmware for the chip.
+    NoFirmware = 8,
 }
 
 static STATE: AtomicU8 = AtomicU8::new(State::Off as u8);
@@ -272,7 +273,64 @@ pub fn state_name() -> &'static str {
         3 => "up",
         4 => "failed",
         5 => "down",
-        _ => "asleep",
+        6 => "asleep",
+        7 => "scanning",
+        _ => "no firmware",
+    }
+}
+
+/// `ferrite_core::setup::WIFI_*` (the same numbers as [`State`]).
+pub fn state_code() -> i32 {
+    i32::from(STATE.load(Ordering::Acquire))
+}
+
+// --- scan results, read by the setup screen ---------------------------------------------------
+
+struct Scans {
+    list: ScanList<SCAN_MAX>,
+    /// Completed scans; 0 = no list yet.
+    done: u32,
+}
+
+static SCANS: CriticalSectionMutex<RefCell<Scans>> =
+    CriticalSectionMutex::new(RefCell::new(Scans { list: ScanList::new(), done: 0 }));
+/// The setup screen asked for a scan (CPU3 takes it while it may scan).
+static SCAN_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// Calls `f` with the last scan's networks (None before the first) and the
+/// number of scans done.
+pub fn with_scan(f: &mut dyn FnMut(Option<&[Network]>, u32)) {
+    SCANS.lock(|s| {
+        let s = s.borrow();
+        f((s.done > 0).then(|| &s.list.nets[..s.list.count]), s.done)
+    })
+}
+
+/// Asks CPU3 for a scan; false when it can't scan (not joining or scanning).
+pub fn request_scan() -> bool {
+    let can = matches!(STATE.load(Ordering::Acquire), 1 | 7);
+    if can {
+        SCAN_WANTED.store(true, Ordering::Release);
+    }
+    can
+}
+
+fn publish_scan(list: ScanList<SCAN_MAX>) {
+    SCANS.lock(|s| {
+        let mut s = s.borrow_mut();
+        s.list = list;
+        s.done = s.done.wrapping_add(1).max(1);
+    });
+}
+
+/// CPU3: waits up to `ms`, less if a scan is asked for.
+fn wait_or_scan_request(mct: Mct, ms: u64) {
+    let start = mct.count();
+    while mct.count() - start < ms * COUNTS_PER_MS {
+        if SCAN_WANTED.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -312,17 +370,19 @@ fn update_link(f: impl FnOnce(&mut Link)) {
 // --- CPU3: polled bring-up + join -----------------------------------------------------------
 
 fn report(activity: Activity) {
-    if let Activity::Event(event) = activity
-        && (event.code == bcm4334::EVENT_DEAUTH_IND || event.code == bcm4334::EVENT_DISASSOC_IND)
-    {
-        println!("ferrite: wifi event {}, reason {}", event.code, event.reason);
-    }
-}
-
-fn delay_ms(mct: Mct, ms: u64) {
-    let start = mct.count();
-    while mct.count() - start < ms * COUNTS_PER_MS {
-        core::hint::spin_loop();
+    match activity {
+        Activity::Event(event)
+            if event.code == bcm4334::EVENT_DEAUTH_IND || event.code == bcm4334::EVENT_DISASSOC_IND =>
+        {
+            println!("ferrite: wifi event {}, reason {}", event.code, event.reason);
+        }
+        // After the join: a rekey (4-way again) or a new group key. Rare, and what a reason 15
+        // (handshake timeout) from the access point needs explaining with.
+        Activity::Handshake(message) if matches!(STATE.load(Ordering::Acquire), 2 | 3) => {
+            println!("ferrite: wifi handshake {:?} answered", message);
+        }
+        Activity::Ignored(error) => println!("ferrite: wifi handshake frame ignored: {:?}", error),
+        _ => {}
     }
 }
 
@@ -359,16 +419,19 @@ fn bring_up(cfg: &WifiConfig, mct: Mct) -> Result<(Bcm4334, [u8; 6]), Error> {
 /// One scan + join. `Ok(None)`: the network is not there (or asks for what
 /// this cannot do): try again later.
 fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Result<Option<(Supplicant, u64)>, Error> {
-    let band_allows = |channel: u8| match cfg.band {
+    let band_allows = |channel: u8| match cfg.settings.band {
         2 => channel <= LAST_2G_CHANNEL,
         5 => channel > LAST_2G_CHANNEL,
         _ => true,
     };
     let mut target: Option<Target> = None;
     let mut pool = Hmac::new(&own).sign(&[&mct.count().to_le_bytes()[..]]);
+    let mut found = ScanList::<SCAN_MAX>::new();
     chip.scan(SCAN_TIMEOUT_MS, |bss, rsn| {
         pool = Hmac::new(&pool).sign(&[&mct.count().to_le_bytes()[..], &bss.bssid, &bss.rssi.to_le_bytes()]);
-        let named = cfg.ssid.as_bytes() == &bss.ssid[..usize::from(bss.ssid_length)];
+        let name = &bss.ssid[..usize::from(bss.ssid_length).min(bss.ssid.len())];
+        found.add(name, bss.rssi, bss.channel, wpa::rsn_supported(rsn) && rsn.len() <= wpa::RSN_MAX);
+        let named = !cfg.ssid().is_empty() && cfg.ssid().as_bytes() == name;
         if named
             && band_allows(bss.channel)
             && wpa::rsn_supported(rsn)
@@ -380,11 +443,16 @@ fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Re
             target = Some(Target { bssid: bss.bssid, rssi: bss.rssi, channel: bss.channel, rsn: copy, rsn_length: rsn.len() });
         }
     })?;
+    found.finish();
+    publish_scan(found);
+    if cfg.ssid().is_empty() {
+        return Ok(None);
+    }
     let Some(target) = target else {
-        println!("ferrite: wifi network {} not found", cfg.ssid);
+        println!("ferrite: wifi network {} not found", cfg.ssid());
         return Ok(None);
     };
-    let key = crypto::wpa_key(cfg.password.as_bytes(), cfg.ssid.as_bytes());
+    let key = crypto::wpa_key(cfg.settings.password.as_bytes(), cfg.ssid().as_bytes());
     let mut nonce = [0; 32];
     crypto::prf(&pool, b"Init Counter", &mct.count().to_le_bytes(), &mut nonce);
     let mut seed = [0; 8];
@@ -393,7 +461,7 @@ fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Re
         println!("ferrite: wifi access point asks for what this cannot do");
         return Ok(None);
     };
-    chip.connect(cfg.ssid.as_bytes(), &mut supplicant, JOIN_TIMEOUT_MS, report)?;
+    chip.connect(cfg.ssid().as_bytes(), &mut supplicant, JOIN_TIMEOUT_MS, report)?;
     update_link(|l| {
         l.bssid = target.bssid;
         l.channel = target.channel;
@@ -404,27 +472,38 @@ fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Re
 
 fn join(cfg: &WifiConfig, mct: Mct) -> Result<Joined, Error> {
     let begin = mct.count();
-    let (mut chip, own) = bring_up(cfg, mct)?;
+    let (chip, own) = bring_up(cfg, mct)?;
     println!("ferrite: wifi chip up in {} ms", (mct.count() - begin) / COUNTS_PER_MS);
     update_link(|l| l.mac = own);
+    if cfg.ssid().is_empty() {
+        // The setup screen with no network named: scan, now and then or when asked.
+        set_state(State::Scanning);
+        println!("ferrite: wifi scanning only (no network named)");
+    }
+    Ok(associate_until_joined(cfg, chip, own, mct, begin))
+}
+
+/// Scans and joins until it works (the chip is up, its radio prepared): at start, and again
+/// after the connection was lost.
+fn associate_until_joined(cfg: &WifiConfig, mut chip: Bcm4334, own: [u8; 6], mct: Mct, begin: u64) -> Joined {
     loop {
         match associate(cfg, &mut chip, own, mct) {
             Ok(Some((supplicant, seed))) => {
                 let l = link();
                 println!(
                     "ferrite: wifi joined {} in {} ms, channel {}, {} dBm",
-                    cfg.ssid,
+                    cfg.ssid(),
                     (mct.count() - begin) / COUNTS_PER_MS,
                     l.channel,
                     l.rssi
                 );
-                return Ok(Joined { chip, supplicant, seed });
+                return Joined { chip, supplicant, seed };
             }
             Ok(None) => {}
             // A refused / timed-out handshake: the chip is still usable.
             Err(e) => println!("ferrite: wifi join ERROR {:?}", e),
         }
-        delay_ms(mct, RETRY_MS);
+        wait_or_scan_request(mct, RETRY_MS);
     }
 }
 
@@ -434,7 +513,8 @@ fn cpu3(_core: usize) -> ! {
     Gic::new().init_this_cpu();
     cpu::enable_irq();
     let cfg = config();
-    let joined = match join(cfg, Mct::new()) {
+    let mct = Mct::new();
+    let mut joined = match join(cfg, mct) {
         Ok(j) => j,
         Err(e) => {
             println!("ferrite: wifi ERROR {:?}, wifi off", e);
@@ -442,11 +522,42 @@ fn cpu3(_core: usize) -> ! {
             cpu::halt();
         }
     };
+    loop {
+        serve(cfg, joined);
+        // The tasks have ended: for standby, or because the connection was lost and the runner
+        // gave the chip back (`wifi_task`): then join again with it, and serve anew.
+        // SAFETY: CPU3 only, and its tasks (`wifi_task`) have ended.
+        let lost = unsafe { (*addr_of_mut!(LOST_CHIP)).take() };
+        let Some(chip) = lost.filter(|_| !STANDBY.load(Ordering::Acquire)) else {
+            break;
+        };
+        update_link(|l| {
+            l.address = [0; 4];
+            l.prefix = 0;
+        });
+        set_state(State::Joining);
+        println!("ferrite: wifi joining again");
+        GROUP.arm();
+        let own = link().mac;
+        joined = associate_until_joined(cfg, chip, own, mct, mct.count());
+    }
+    bcm4334::power_off();
+    update_link(|l| {
+        l.address = [0; 4];
+        l.prefix = 0;
+    });
+    set_state(State::Asleep);
+    println!("ferrite: wifi off, CPU{} stopping", CORE);
+    smp::stop_this_cpu()
+}
+
+/// CPU3: the network tasks over a joined chip, until they have all ended.
+fn serve(cfg: &WifiConfig, joined: Joined) {
     set_state(State::Joined);
     update_link(|l| l.joined_ms = embassy::now() / 1000);
 
     let mut dhcp = DhcpConfig::default();
-    dhcp.hostname = cfg.hostname.as_str().try_into().ok();
+    dhcp.hostname = cfg.hostname().try_into().ok();
     // SAFETY: the only references to these, taken here once per start of this core; the last
     // start's tasks have ended (`GROUP`), and with them every use of the old ones.
     let (state, resources) = unsafe {
@@ -483,14 +594,6 @@ fn cpu3(_core: usize) -> ! {
             }
         },
     );
-    bcm4334::power_off();
-    update_link(|l| {
-        l.address = [0; 4];
-        l.prefix = 0;
-    });
-    set_state(State::Asleep);
-    println!("ferrite: wifi off, CPU{} stopping", CORE);
-    smp::stop_this_cpu()
 }
 
 /// CPU0, entering standby: ends CPU3's tasks and waits for it to stop. True
@@ -500,6 +603,7 @@ pub fn suspend() -> bool {
     if !matches!(STATE.load(Ordering::Acquire), 2 | 3 | 5) {
         return false;
     }
+    STANDBY.store(true, Ordering::Release);
     GROUP.stop();
     match smp::wait_offline(CORE, STOP_MS) {
         Ok(_) => true,
@@ -520,6 +624,7 @@ pub fn resume(pmic: Max77686, mct: Mct) {
         return;
     }
     set_state(State::Joining);
+    STANDBY.store(false, Ordering::Release);
     GROUP.arm();
     if let Err(e) = smp::start_cpu(CORE, cpu3) {
         println!("ferrite: CPU{} ERROR {:?}, wifi off", CORE, e);
@@ -531,9 +636,17 @@ pub fn resume(pmic: Max77686, mct: Mct) {
 async fn wifi_task(runner: wifi::Runner<'static>) {
     GROUP
         .run(async {
-            let error = runner.run().await;
+            let (error, chip) = runner.run_keeping_chip().await;
             set_state(State::Down);
             println!("ferrite: wifi stopped: {:?}", error);
+            // A lost connection (the access point left, a handshake it gave up on): end the
+            // other tasks so that `cpu3` joins again with the chip. Other errors are of the
+            // chip or its bus: it stays down, as before.
+            if matches!(error, Error::Disconnected { .. }) && !STANDBY.load(Ordering::Acquire) {
+                // SAFETY: CPU3 only; `cpu3` reads it after every task has ended.
+                unsafe { *addr_of_mut!(LOST_CHIP) = Some(chip) };
+                GROUP.stop();
+            }
         })
         .await
 }
@@ -566,7 +679,7 @@ async fn dhcp_loop(stack: Stack<'static>) {
             println!(
                 "ferrite: http://{}/ ({}), protocol bridge tcp://{}:{}",
                 c.address.address(),
-                config().hostname,
+                config().hostname(),
                 c.address.address(),
                 BRIDGE_PORT
             );
@@ -667,6 +780,9 @@ pub enum Upload {
     Fs,
     /// `POST /save`: a firmware `.bin`, saved as `FERRITE/FERRITE.BIN` for uart_boot to boot.
     Firmware,
+    /// `POST /api/system?name=`: a file for `SYSTEM/` (its checked 8.3 name and length),
+    /// saved without a restart.
+    System([u8; 12], u8),
 }
 
 impl Upload {
@@ -674,6 +790,7 @@ impl Upload {
         match self {
             Upload::Fs => "flash",
             Upload::Firmware => "firmware",
+            Upload::System(..) => "system",
         }
     }
 }
@@ -691,6 +808,8 @@ pub const FLASH_BAD_IMAGE: u8 = 3;
 pub const FLASH_TOO_LARGE: u8 = 4;
 pub const FLASH_NO_STORAGE: u8 = 5;
 pub const FLASH_SAVE_FAILED: u8 = 6;
+/// Saved, and no restart follows (a `SYSTEM/` file).
+pub const FLASH_KEPT: u8 = 7;
 /// The HTTP answer has gone out: CPU0 may restart.
 static ANSWERED: AtomicBool = AtomicBool::new(false);
 /// `POST /restart` (set after its answer has gone out).
@@ -876,6 +995,17 @@ pub fn service(screen_ok: bool) {
         let status = match kind {
             Upload::Fs => install(image),
             Upload::Firmware => install_firmware(image, crc),
+            Upload::System(name, len) => {
+                let name = core::str::from_utf8(&name[..usize::from(len)]).unwrap_or("");
+                if !crate::storage::available() {
+                    FLASH_NO_STORAGE
+                } else if crate::storage::save_in(crate::storage::SYSTEM_DIR, name, &image) {
+                    println!("ferrite: saved {}/{}", crate::storage::SYSTEM_DIR, name);
+                    FLASH_KEPT
+                } else {
+                    FLASH_SAVE_FAILED
+                }
+            }
         };
         println!("ferrite: HTTP {} upload, {} bytes: status {}", kind.name(), len, status);
         FLASH_STATUS.store(status, Ordering::Release);

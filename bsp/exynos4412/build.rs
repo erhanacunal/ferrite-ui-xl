@@ -3,10 +3,11 @@
 //! WiFi (`wifi` feature, `src/net/`): the BCM4334 firmware + NVRAM are not in
 //! this repository. `WIFI_FIRMWARE_DIR` (the directory the HAL's `uart_boot`
 //! uses) embeds them; without it the image gets empty files and the firmware
-//! is read from CACHE at boot (`FERRITE/WIFIFW.BIN`, `FERRITE/WIFINV.TXT`).
-//! The network comes from `FERRITE/WIFI.CFG` on CACHE; `WIFI_SSID` /
-//! `WIFI_PASSWORD` / `WIFI_BAND` at build time are only a fallback (they end
-//! up in the image: don't publish such a build).
+//! is read from CACHE at boot (`SYSTEM/WIFIFW.BIN`, `SYSTEM/WIFINV.TXT`,
+//! which uart_boot reads too). The network comes from `SYSTEM/WIFI.TXT` on
+//! CACHE (the setup screen writes it); `WIFI_SSID` / `WIFI_PASSWORD` /
+//! `WIFI_BAND` at build time are only a fallback (they end up in the image:
+//! don't publish such a build).
 
 use std::{env, fs, path::PathBuf};
 

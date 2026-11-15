@@ -25,9 +25,21 @@
 ///     [7+N*9..]      bitmap data (2bpp packed, MSB first; 4 pixels per byte;
 ///                    each pixel = 2 bits: 0=0%, 1=33%, 2=67%, 3=100%)
 ///
-/// GfxGlyph (7 bytes, packed):
+///   V3 (wide metrics, 1 or 2 bpp; what ferrite_build writes for ferrite-ui-xl devices):
+///     [0..1]           magic: 0x00, 0x03
+///     [2..3]           num_glyphs: u16 LE
+///     [4..5]           y_advance: u16 LE
+///     [6]              font_id: u8
+///     [7]              bpp: u8 (1 or 2)
+///     [8..8+N*2]       codepoints[] (N × u16 LE, sorted ascending)
+///     [8+N*2..8+N*16]  glyphs[] (N × 14 bytes)
+///     [8+N*16..]       bitmap data (as V1 / V2 for its bpp)
+///
+/// GfxGlyph on flash, V1/V2 (7 bytes, packed):
 ///   bitmapOffset: u16, width: u8, height: u8,
 ///   xAdvance: u8, xOffset: i8, yOffset: i8
+/// V3 (14 bytes, LE): bitmapOffset: u32, width: u16, height: u16,
+///   xAdvance: u16, xOffset: i16, yOffset: i16
 extern crate alloc;
 
 use crate::fs::{Fs, RES_FONT};
@@ -84,7 +96,7 @@ pub struct Font {
     pub font_id: u8,
     /// Bits per pixel: 1 = monochrome, 2 = 2bpp anti-aliased
     pub bpp: u8,
-    y_advance: u8,
+    y_advance: u16,
     glyphs: GlyphData,
     /// Absolute flash address of bitmap data
     bitmap_addr: u32,
@@ -111,6 +123,48 @@ impl Font {
     /// fonts apart (a board renderer keying cached drawings by appearance).
     pub fn bitmap_addr(&self) -> u32 {
         self.bitmap_addr
+    }
+}
+
+/// Bytes of one glyph record on flash: V1/V2, V3.
+const GLYPH_V2: usize = 7;
+const GLYPH_V3: usize = 14;
+
+/// A font resource's header, whichever version.
+struct Header {
+    num_glyphs: usize,
+    y_advance: u16,
+    font_id: u8,
+    bpp: u8,
+    /// Header bytes (where the codepoints start).
+    len: u32,
+    /// Bytes of a glyph record: [`GLYPH_V2`] or [`GLYPH_V3`].
+    glyph_bytes: u8,
+}
+
+impl Header {
+    fn read<F: FlashBackend>(flash: &FlashImpl<F>, entry: &crate::fs::ResourceEntry) -> Option<Self> {
+        if entry.size < 4 {
+            return None;
+        }
+        let mut h = [0u8; 8];
+        let n = 8.min(entry.size as usize);
+        flash.read(entry.offset, &mut h[..n]);
+        let u16_at = |i: usize| u16::from_le_bytes([h[i], h[i + 1]]);
+        // A V1 font's glyph count is in the magic's place: 0x0200 / 0x0300 glyphs would read as
+        // V2 / V3. V3 is told apart by its bpp (byte 7 is the high byte of a V1 font's second
+        // codepoint, 0 below U+0100) and its tables fitting; V2 never was (128 KB boards).
+        if h[0] == 0x00 && h[1] == 0x03 && entry.size >= 8 && matches!(h[7], 1 | 2) {
+            let g = u16_at(2) as usize;
+            if entry.size as usize >= 8 + g * (2 + GLYPH_V3) {
+                return Some(Header { num_glyphs: g, y_advance: u16_at(4), font_id: h[6], bpp: h[7], len: 8, glyph_bytes: GLYPH_V3 as u8 });
+            }
+        }
+        Some(if h[0] == 0x00 && h[1] == 0x02 && entry.size >= 7 {
+            Header { num_glyphs: u16_at(2) as usize, y_advance: h[4] as u16, font_id: h[5], bpp: h[6], len: 7, glyph_bytes: GLYPH_V2 as u8 }
+        } else {
+            Header { num_glyphs: u16_at(0) as usize, y_advance: h[2] as u16, font_id: h[3], bpp: 1, len: 4, glyph_bytes: GLYPH_V2 as u8 }
+        })
     }
 }
 
@@ -144,31 +198,12 @@ impl Font {
         entry: &crate::fs::ResourceEntry,
         cache_bitmap: bool,
     ) -> Option<Self> {
-        if entry.size < 4 {
-            return None;
-        }
-
-        // Read first 7 bytes (max header size); V1 only uses first 4.
-        let mut hdr = [0u8; 7];
-        let read_len = 7.min(entry.size as usize);
-        flash.read(entry.offset, &mut hdr[..read_len]);
-
-        // Detect V2: magic bytes [0x00, 0x02] at positions 0-1.
-        // A V1 font with 512 glyphs (0x0200 LE) would collide, but this is
-        // impossible on 128 KB flash (512×9B table = 4608B alone).
-        let (num_glyphs, y_advance, font_id, bpp, hdr_len): (usize, u8, u8, u8, u32) =
-            if hdr[0] == 0x00 && hdr[1] == 0x02 && entry.size >= 7 {
-                // V2: 7-byte header
-                let n = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
-                (n, hdr[4], hdr[5], hdr[6], 7)
-            } else {
-                // V1: 4-byte header (bpp=1 legacy)
-                let n = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
-                (n, hdr[2], hdr[3], 1, 4)
-            };
+        let h = Header::read(flash, entry)?;
+        let (num_glyphs, y_advance, font_id, bpp, hdr_len) = (h.num_glyphs, h.y_advance, h.font_id, h.bpp, h.len);
+        let rec = h.glyph_bytes as usize;
 
         let cp_bytes = (num_glyphs * 2) as u32;
-        let gl_bytes = (num_glyphs * 7) as u32;
+        let gl_bytes = (num_glyphs * rec) as u32;
 
         if entry.size < hdr_len + cp_bytes + gl_bytes {
             return None;
@@ -176,11 +211,11 @@ impl Font {
 
         // Tables are read in chunks — one flash read per entry is one SPI
         // transaction each on SPI-NOR boards.
-        const TABLE_CHUNK: usize = 10; // entries per read (70 B of glyphs)
+        const TABLE_CHUNK: usize = 10; // entries per read (140 B of V3 glyphs)
 
         let cp_base = entry.offset + hdr_len;
         let mut codepoints = Vec::with_capacity(num_glyphs);
-        let mut buf = [0u8; TABLE_CHUNK * 7];
+        let mut buf = [0u8; TABLE_CHUNK * GLYPH_V3];
         let mut i = 0;
         while i < num_glyphs {
             let n = (num_glyphs - i).min(TABLE_CHUNK);
@@ -196,15 +231,27 @@ impl Font {
         let mut i = 0;
         while i < num_glyphs {
             let n = (num_glyphs - i).min(TABLE_CHUNK);
-            flash.read(gl_base + i as u32 * 7, &mut buf[..n * 7]);
-            for g in buf[..n * 7].chunks_exact(7) {
-                glyphs.push(GfxGlyph {
-                    bitmap_offset: u16::from_le_bytes([g[0], g[1]]),
-                    width: g[2],
-                    height: g[3],
-                    x_advance: g[4],
-                    x_offset: g[5] as i8,
-                    y_offset: g[6] as i8,
+            flash.read(gl_base + (i * rec) as u32, &mut buf[..n * rec]);
+            for g in buf[..n * rec].chunks_exact(rec) {
+                let u16_at = |i: usize| u16::from_le_bytes([g[i], g[i + 1]]);
+                glyphs.push(if rec == GLYPH_V3 {
+                    GfxGlyph {
+                        bitmap_offset: u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+                        width: u16_at(4),
+                        height: u16_at(6),
+                        x_advance: u16_at(8),
+                        x_offset: u16_at(10) as i16,
+                        y_offset: u16_at(12) as i16,
+                    }
+                } else {
+                    GfxGlyph {
+                        bitmap_offset: u16_at(0) as u32,
+                        width: g[2] as u16,
+                        height: g[3] as u16,
+                        x_advance: g[4] as u16,
+                        x_offset: g[5] as i8 as i16,
+                        y_offset: g[6] as i8 as i16,
+                    }
                 });
             }
             i += n;
@@ -254,19 +301,7 @@ impl Font {
         let count = fs.count_by_kind(flash, RES_FONT);
         for i in 0..count {
             if let Some(entry) = fs.find_nth_by_kind(flash, RES_FONT, i) {
-                if entry.size < 4 {
-                    continue;
-                }
-                // Read enough bytes to check font_id in both V1 and V2 layouts
-                let mut hdr = [0u8; 7];
-                let read_len = 7.min(entry.size as usize);
-                flash.read(entry.offset, &mut hdr[..read_len]);
-                let id = if hdr[0] == 0x00 && hdr[1] == 0x02 && entry.size >= 7 {
-                    hdr[5] // V2: font_id at byte 5
-                } else {
-                    hdr[3] // V1: font_id at byte 3
-                };
-                if id == font_id {
+                if Header::read(flash, &entry).is_some_and(|h| h.font_id == font_id) {
                     return Self::load_from_entry(flash, &entry, cache_bitmap);
                 }
             }
@@ -287,7 +322,7 @@ impl Font {
         Font {
             font_id: EMBEDDED_FONT_ID,
             bpp,
-            y_advance,
+            y_advance: y_advance as u16,
             glyphs: GlyphData::Static { glyphs, codepoints },
             bitmap_addr: 0,
             embedded_bitmap: bitmap.as_ptr(),
@@ -296,7 +331,7 @@ impl Font {
     }
 
     /// Line height in pixels
-    pub fn line_height(&self) -> u8 {
+    pub fn line_height(&self) -> u16 {
         self.y_advance
     }
 
@@ -367,12 +402,12 @@ impl Font {
     }
 
     /// Advance width for a BMP codepoint (0 if not in font).
-    pub fn char_width_cp(&self, cp: u16) -> u8 {
+    pub fn char_width_cp(&self, cp: u16) -> u16 {
         self.find_glyph(cp).map(|g| g.x_advance).unwrap_or(0)
     }
 
     /// Advance width for a char (0 if out of BMP or not in font).
-    pub fn char_width(&self, ch: char) -> u8 {
+    pub fn char_width(&self, ch: char) -> u16 {
         let cp = ch as u32;
         if cp > 0xFFFF {
             return 0;
@@ -386,7 +421,7 @@ impl Font {
         let mut pos = 0;
         while let Some(cp) = utf8_next(text, &mut pos) {
             if cp != 0xFFFF {
-                w = w.saturating_add(self.char_width_cp(cp) as u16);
+                w = w.saturating_add(self.char_width_cp(cp));
             }
         }
         w
@@ -412,7 +447,7 @@ impl Font {
                 Some(cp) => cp,
                 None => break,
             };
-            let cw = if cp == 0xFFFF { 0 } else { self.char_width_cp(cp) as u16 };
+            let cw = if cp == 0xFFFF { 0 } else { self.char_width_cp(cp) };
             if cp == b' ' as u16 {
                 // A space may hang past the edge: the line breaks there.
                 space = Some(at);
@@ -437,7 +472,7 @@ impl Font {
         cy: i16,
         fg: u16,
         bg: Option<u16>,
-    ) -> u8 {
+    ) -> u16 {
         let cp = ch as u32;
         if cp > 0xFFFF {
             return 0;
@@ -476,7 +511,7 @@ impl Font {
         cy: i16,
         fg: u16,
         bg: Option<u16>,
-    ) -> u8 {
+    ) -> u16 {
         let glyph = match self.find_glyph(cp) {
             Some(g) => g,
             None => return 0,
@@ -595,11 +630,11 @@ impl Font {
     fn read_bitmap<F: FlashBackend>(
         &self,
         flash: &FlashImpl<F>,
-        glyph_offset: u16,
+        glyph_offset: u32,
         byte_offset: u32,
         buf: &mut [u8],
     ) {
-        let addr = glyph_offset as u32 + byte_offset;
+        let addr = glyph_offset + byte_offset;
         if !self.embedded_bitmap.is_null() {
             unsafe {
                 let src = self.embedded_bitmap.add(addr as usize);
@@ -619,9 +654,9 @@ impl Font {
         lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
-        bitmap_offset: u16,
-        width: u8,
-        height: u8,
+        bitmap_offset: u32,
+        width: u16,
+        height: u16,
         draw_x: i16,
         draw_y: i16,
         fg: u16,
@@ -662,9 +697,9 @@ impl Font {
         lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
-        bitmap_offset: u16,
-        width: u8,
-        height: u8,
+        bitmap_offset: u32,
+        width: u16,
+        height: u16,
         draw_x: i16,
         draw_y: i16,
         fg: u16,
@@ -715,9 +750,9 @@ impl Font {
         lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
-        bitmap_offset: u16,
-        width: u8,
-        height: u8,
+        bitmap_offset: u32,
+        width: u16,
+        height: u16,
         draw_x: i16,
         draw_y: i16,
         fg: u16,
@@ -766,9 +801,9 @@ impl Font {
         lcd: &L,
         flash: &FlashImpl<F>,
         total_bytes: u32,
-        bitmap_offset: u16,
-        width: u8,
-        height: u8,
+        bitmap_offset: u32,
+        width: u16,
+        height: u16,
         draw_x: i16,
         draw_y: i16,
         fg: u16,
@@ -1004,6 +1039,47 @@ mod tests {
         drop(f);
         assert_eq!(unsafe { *g.embedded_bitmap }, 0xFF);
         assert_eq!(g.glyph(65).map(|x| x.x_advance), Some(9));
+    }
+
+    /// A V3 font keeps what V1/V2 can't: glyphs over 255 px, offsets below −128, a line
+    /// height over 255 and bitmaps past 64 KB.
+    #[test]
+    fn v3_fonts_hold_wide_metrics() {
+        let wide = 300u16; // 1bpp, one row: 38 bytes, 0xFF … then the last 4 bits set
+        let at = 70_000u32;
+        let mut img = alloc::vec![0x00, 0x03];
+        img.extend_from_slice(&2u16.to_le_bytes());
+        img.extend_from_slice(&310u16.to_le_bytes());
+        img.extend_from_slice(&[7, 1]);
+        for cp in [b' ' as u16, b'W' as u16] {
+            img.extend_from_slice(&cp.to_le_bytes());
+        }
+        for (off, w, h, adv, xo, yo) in [(0u32, 0u16, 0u16, 60u16, 0i16, 0i16), (at, wide, 1, 320, -3, -200)] {
+            img.extend_from_slice(&off.to_le_bytes());
+            for v in [w, h, adv, xo as u16, yo as u16] {
+                img.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let bitmap_at = img.len();
+        img.resize(bitmap_at + at as usize, 0);
+        img.extend_from_slice(&[0xFF; 37]);
+        img.push(0xF0);
+        crate::mock::set_flash_image(img.clone());
+        let flash = FlashImpl::with_backend(crate::mock::MockFlash);
+        let entry = crate::fs::ResourceEntry { kind: RES_FONT, flags: 0, offset: 0, size: img.len() as u32 };
+        for cache in [false, true] {
+            let f = Font::load_from_entry(&flash, &entry, cache).unwrap();
+            assert_eq!((f.font_id, f.bpp, f.line_height()), (7, 1, 310));
+            assert_eq!(f.bitmap_addr() as usize, bitmap_at);
+            assert_eq!(f.glyph(b'W' as u16), Some(GfxGlyph::new(at, wide, 1, 320, -3, -200)));
+            assert_eq!(f.text_width(b"W W"), 700);
+            let mut cov = alloc::vec![0u8; wide as usize];
+            f.glyph_coverage(&flash, &f.glyph(b'W' as u16).unwrap(), &mut cov);
+            assert!(cov.iter().all(|&c| c == 255), "cache {cache}");
+            let mut tops = alloc::vec::Vec::new();
+            f.for_each_glyph(b"W", 10, 250, |_, _, x, y| tops.push((x, y)));
+            assert_eq!(tops, [(7, 50)]);
+        }
     }
 
     /// All lines of `text` wrapped to the width of `fit` in the ROM font.

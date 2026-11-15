@@ -477,6 +477,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **API:** `draw_char(ch: char)`, `draw_str(text: &[u8])` (UTF-8), `char_width()`, `char_width_cp(u16)`, `text_width()`, `line_height()`
 - **UTF-8:** `font::utf8_next(bytes, pos)` decodes one BMP codepoint; returns `Some(0xFFFF)` for invalid sequences
 - **Tool:** `tools/ferrite_font_converter.py` — TrueType → sparse binary; supports `-r` range spec (e.g. `32-127,0x011E-0x011F`)
+- **XL:** V2 (`00 02`, 2bpp) and V3 (`00 03`, wide 14-byte glyphs, u16 line height; what `ferrite_build` writes for `caps.font_v3` devices) too — see `docs/notes/xl.md` "V3 fonts"
 - **RAM cost:** N × 9B (codepoints + glyphs) per font; bitmap read in 128B chunks
 
 ## Project Name

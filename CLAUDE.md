@@ -26,7 +26,7 @@ Working branch: `main` (commit and push there).
 - Firmware: `cd bsp/exynos4412 && cargo build --release` (or `./exynos4412.ps1` from the repo root)
 - After changing `lib/flex.fl`: `python ferrite-core/testdata/flex/gen.py`
 - After changing `system/setup/main.fl` or ferrite-ui `lib/system.fl`: `python scripts/build_setup.py` (rebuilds the embedded `system/setup/setup.img`; `--check` compares), then the firmware
-- Board: `192.168.88.120` (HTTP API `/api/status`, `/api/screen`, `/api/perf`; protocol bridge `tcp://HOST:7000`; `ferrite_cli --host H savefw` / `bootflash`).
+- Board: `192.168.1.55` (HTTP API `/api/status`, `/api/screen`, `/api/perf`; protocol bridge `tcp://HOST:7000`; `ferrite_cli --host H savefw` / `bootflash`).
 
 ## Rules and invariants
 
@@ -44,7 +44,7 @@ Working branch: `main` (commit and push there).
 ## Board pitfalls
 
 - Boot keys: **volume up** held at start → ferrite's setup screen (WiFi settings → `SYSTEM/WIFI.TXT`; also shown when no program is saved); **volume down** → uart_boot stays in its loader (no autoboot). WiFi settings / chip firmware come only from `SYSTEM/` on CACHE (`WIFI.TXT`, `WIFIFW.BIN`, `WIFINV.TXT`), not from the FS image.
-- uart_boot on the board's boot partition is not yet updated: don't poll `/api/status` during its 5 s autoboot window after `savefw` (or start with `POST /boot`).
+- uart_boot is installed with fastboot only (`fastboot flash boot uart_boot.img`; power + volume down held 2 s under ferrite restarts into fastboot). The one on the board (2026-11-15) autoboots even while polled.
 - A program with an empty `fn loop() {}` keeps the runtime busy (no idle sleep).
 - G2D/GIC: `Gic::enable` routes an SPI to the calling core; code enabling interrupts on CPU1–3 must set the target explicitly where CPU0 should take it.
 - `.fl` pitfalls: a generated `on_click` dispatcher calls every handler registered for a widget; arrays can't be passed to functions; a global may not share a name with any function's param/local.

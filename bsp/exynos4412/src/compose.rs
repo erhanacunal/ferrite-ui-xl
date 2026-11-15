@@ -1095,11 +1095,19 @@ impl State {
         if self.put_picture(picture, &r) && e.border_radius == 0 {
             opaque = Some(r);
         }
-        let color = Lin::flat(rgb(e.text_color, 1.0));
         let tex = self.atlas.tex();
         let a = ATLAS as f32;
         let mut ok = true;
-        render::label_lines(ctx, id, w, abs, &e, |font, line, x, y| {
+        render::label_lines(ctx, id, w, abs, &e, |item| {
+            let (font, line, x, y, color) = match item {
+                render::LabelItem::Text { font, text, x, y, color } => (font, text, x, y, color),
+                // An underline (rich text), after its line's glyphs as the passes draw it.
+                render::LabelItem::Rule { rect, color } => {
+                    self.solid(R::of(&rect).meet(&r), Lin::flat(rgb(color, 1.0)));
+                    return;
+                }
+            };
+            let color = Lin::flat(rgb(color, 1.0));
             font.for_each_glyph(line, x, y, |cp, g, gx, gy| {
                 let (gx, gy) = (gx as i32, gy as i32);
                 let at = R { x0: gx, y0: gy, x1: gx + g.width as i32, y1: gy + g.height as i32 };

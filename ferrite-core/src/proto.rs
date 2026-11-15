@@ -69,6 +69,8 @@ pub const PROP_FLEX_GROW: u8 = 0x35; // child: share of the leftover main-axis s
 // Retained layers (`layer.rs`, `layers` feature; elsewhere ignored, read 0 / 255).
 pub const PROP_LAYER: u8 = 0x36; // subtree root: layer 1..=4 it is drawn into, 0 = none
 pub const PROP_LAYER_ALPHA: u8 = 0x37; // layer root: plane alpha 0..255
+// Rich text (`rich.rs`, ferrite-ui-xl; caps.rich_text): labels and buttons read their text as HTML.
+pub const PROP_RICH_TEXT: u8 = 0x38;
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

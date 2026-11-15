@@ -31,9 +31,12 @@
 ///     [4..5]           y_advance: u16 LE
 ///     [6]              font_id: u8
 ///     [7]              bpp: u8 (1 or 2)
-///     [8..8+N*2]       codepoints[] (N × u16 LE, sorted ascending)
-///     [8+N*2..8+N*16]  glyphs[] (N × 14 bytes)
-///     [8+N*16..]       bitmap data (as V1 / V2 for its bpp)
+///     [8..10]          variants: bold, italic, bold italic font_id (0 = none; the
+///                      project's font families, set by ferrite_build; rich text)
+///     [11]             reserved (0)
+///     [12..12+N*2]     codepoints[] (N × u16 LE, sorted ascending)
+///     [12+N*2..12+N*16] glyphs[] (N × 14 bytes)
+///     [12+N*16..]      bitmap data (as V1 / V2 for its bpp)
 ///
 /// GfxGlyph on flash, V1/V2 (7 bytes, packed):
 ///   bitmapOffset: u16, width: u8, height: u8,
@@ -97,6 +100,9 @@ pub struct Font {
     /// Bits per pixel: 1 = monochrome, 2 = 2bpp anti-aliased
     pub bpp: u8,
     y_advance: u16,
+    /// Bold, italic, bold italic variants' font ids (0 = none): what rich text draws its
+    /// `<b>` / `<i>` parts with (`variant`).
+    variants: [u8; 3],
     glyphs: GlyphData,
     /// Absolute flash address of bitmap data
     bitmap_addr: u32,
@@ -140,6 +146,8 @@ struct Header {
     len: u32,
     /// Bytes of a glyph record: [`GLYPH_V2`] or [`GLYPH_V3`].
     glyph_bytes: u8,
+    /// V3: bold, italic, bold italic variants' font ids (0 = none).
+    variants: [u8; 3],
 }
 
 impl Header {
@@ -147,23 +155,31 @@ impl Header {
         if entry.size < 4 {
             return None;
         }
-        let mut h = [0u8; 8];
-        let n = 8.min(entry.size as usize);
+        let mut h = [0u8; 12];
+        let n = 12.min(entry.size as usize);
         flash.read(entry.offset, &mut h[..n]);
         let u16_at = |i: usize| u16::from_le_bytes([h[i], h[i + 1]]);
         // A V1 font's glyph count is in the magic's place: 0x0200 / 0x0300 glyphs would read as
         // V2 / V3. V3 is told apart by its bpp (byte 7 is the high byte of a V1 font's second
         // codepoint, 0 below U+0100) and its tables fitting; V2 never was (128 KB boards).
-        if h[0] == 0x00 && h[1] == 0x03 && entry.size >= 8 && matches!(h[7], 1 | 2) {
+        if h[0] == 0x00 && h[1] == 0x03 && entry.size >= 12 && matches!(h[7], 1 | 2) {
             let g = u16_at(2) as usize;
-            if entry.size as usize >= 8 + g * (2 + GLYPH_V3) {
-                return Some(Header { num_glyphs: g, y_advance: u16_at(4), font_id: h[6], bpp: h[7], len: 8, glyph_bytes: GLYPH_V3 as u8 });
+            if entry.size as usize >= 12 + g * (2 + GLYPH_V3) {
+                return Some(Header {
+                    num_glyphs: g,
+                    y_advance: u16_at(4),
+                    font_id: h[6],
+                    bpp: h[7],
+                    len: 12,
+                    glyph_bytes: GLYPH_V3 as u8,
+                    variants: [h[8], h[9], h[10]],
+                });
             }
         }
         Some(if h[0] == 0x00 && h[1] == 0x02 && entry.size >= 7 {
-            Header { num_glyphs: u16_at(2) as usize, y_advance: h[4] as u16, font_id: h[5], bpp: h[6], len: 7, glyph_bytes: GLYPH_V2 as u8 }
+            Header { num_glyphs: u16_at(2) as usize, y_advance: h[4] as u16, font_id: h[5], bpp: h[6], len: 7, glyph_bytes: GLYPH_V2 as u8, variants: [0; 3] }
         } else {
-            Header { num_glyphs: u16_at(0) as usize, y_advance: h[2] as u16, font_id: h[3], bpp: 1, len: 4, glyph_bytes: GLYPH_V2 as u8 }
+            Header { num_glyphs: u16_at(0) as usize, y_advance: h[2] as u16, font_id: h[3], bpp: 1, len: 4, glyph_bytes: GLYPH_V2 as u8, variants: [0; 3] }
         })
     }
 }
@@ -174,6 +190,7 @@ impl Font {
             font_id: 0xFF,
             bpp: 1,
             y_advance: 0,
+            variants: [0; 3],
             glyphs: GlyphData::Heap {
                 glyphs: Arc::from([]),
                 codepoints: Arc::from([]),
@@ -280,6 +297,7 @@ impl Font {
             font_id,
             bpp,
             y_advance,
+            variants: h.variants,
             glyphs: GlyphData::Heap { glyphs: Arc::from(glyphs), codepoints: Arc::from(codepoints) },
             bitmap_addr,
             embedded_bitmap,
@@ -323,10 +341,25 @@ impl Font {
             font_id: EMBEDDED_FONT_ID,
             bpp,
             y_advance: y_advance as u16,
+            variants: [0; 3],
             glyphs: GlyphData::Static { glyphs, codepoints },
             bitmap_addr: 0,
             embedded_bitmap: bitmap.as_ptr(),
             bitmap_ram: None,
+        }
+    }
+
+    /// The font id of the variant drawing `style` (`rich::BOLD` | `rich::ITALIC`; other bits
+    /// ignored), None for the font itself (plain style, or no such variant). Bold italic
+    /// without its own variant takes the bold one, then the italic one.
+    pub fn variant(&self, style: u8) -> Option<u8> {
+        let [b, i, bi] = self.variants;
+        let pick = |id: u8| (id != 0).then_some(id);
+        match style & (crate::rich::BOLD | crate::rich::ITALIC) {
+            crate::rich::BOLD => pick(b),
+            crate::rich::ITALIC => pick(i),
+            0 => None,
+            _ => pick(bi).or(pick(b)).or(pick(i)),
         }
     }
 
@@ -963,7 +996,16 @@ impl FontList {
             return true;
         }
         if let Some(font) = Font::load_by_id(fs, flash, font_id, cache_bitmap) {
-            return self.add(font);
+            // Its family's variants too: rich text picks them while laying out, where
+            // nothing loads (the render context only gets fonts loaded here).
+            let variants = font.variants;
+            self.add(font);
+            for v in variants {
+                if v != 0 && v != EMBEDDED_FONT_ID {
+                    self.find_or_load(v, fs, flash, cache_bitmap);
+                }
+            }
+            return true;
         }
         false
     }
@@ -1050,7 +1092,7 @@ mod tests {
         let mut img = alloc::vec![0x00, 0x03];
         img.extend_from_slice(&2u16.to_le_bytes());
         img.extend_from_slice(&310u16.to_le_bytes());
-        img.extend_from_slice(&[7, 1]);
+        img.extend_from_slice(&[7, 1, 8, 0, 9, 0]);
         for cp in [b' ' as u16, b'W' as u16] {
             img.extend_from_slice(&cp.to_le_bytes());
         }
@@ -1070,6 +1112,8 @@ mod tests {
         for cache in [false, true] {
             let f = Font::load_from_entry(&flash, &entry, cache).unwrap();
             assert_eq!((f.font_id, f.bpp, f.line_height()), (7, 1, 310));
+            use crate::rich::{BOLD, ITALIC, UNDERLINE};
+            assert_eq!([0, BOLD, ITALIC, BOLD | ITALIC, UNDERLINE].map(|s| f.variant(s)), [None, Some(8), None, Some(9), None]);
             assert_eq!(f.bitmap_addr() as usize, bitmap_at);
             assert_eq!(f.glyph(b'W' as u16), Some(GfxGlyph::new(at, wide, 1, 320, -3, -200)));
             assert_eq!(f.text_width(b"W W"), 700);

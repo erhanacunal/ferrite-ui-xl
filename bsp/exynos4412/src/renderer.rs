@@ -58,7 +58,7 @@ use ferrite_core::render;
 use ferrite_core::renderer::WidgetRenderer;
 use ferrite_core::types::{Edges, Rect};
 use ferrite_core::widget::{
-    FLAG_CHECKED, FLAG_MULTI_LINE, FLAG_PRESSED, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_CIRCLE, KIND_ELLIPSE,
+    FLAG_CHECKED, FLAG_MULTI_LINE, FLAG_PRESSED, FLAG_RICH_TEXT, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_CIRCLE, KIND_ELLIPSE,
     FLAG_HAS_ON_PAINT, KIND_GRAPH, KIND_IMAGE, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
 };
 
@@ -463,7 +463,9 @@ pub(crate) fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
         }
     }
     if w.kind == KIND_LABEL {
-        h.u32(e.text_color as u32 | (e.text_align as u32) << 16 | ((w.flags & FLAG_MULTI_LINE != 0) as u32) << 24);
+        // Rich text draws in the font's variants too: fixed once it is loaded (the font's
+        // address below stands for them).
+        h.u32(e.text_color as u32 | (e.text_align as u32) << 16 | ((w.flags & FLAG_MULTI_LINE != 0) as u32) << 24 | ((w.flags & FLAG_RICH_TEXT != 0) as u32) << 25);
         match ctx.fonts.resolve(e.font_id) {
             Some(f) if e.font_id != 0xFF => {
                 h.u32(f.font_id as u32 | (f.bpp as u32) << 8);

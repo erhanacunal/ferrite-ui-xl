@@ -18,7 +18,9 @@ pub const FLAG_PRESSED: u16 = 1 << 4;
 pub const FLAG_CHECKED: u16 = 1 << 5;
 pub const FLAG_FOCUSED: u16 = 1 << 6;
 pub const FLAG_CLIP_CHILDREN: u16 = 1 << 7;
-// Bit 8 (was FLAG_DIRTY_B, buffered mode's second buffer): unused.
+/// Label / button text is rich text: a small HTML subset (`rich.rs`): `<b>`, `<i>`, `<u>`,
+/// `<font color>`, `<br>`, entities. Bit 8 was FLAG_DIRTY_B (buffered mode's second buffer).
+pub const FLAG_RICH_TEXT: u16 = 1 << 8;
 
 // Bit 9 (was FLAG_RENDERED) and bit 15 (was FLAG_PAINTED): unused. What the
 // renderer knows of a widget lives in `RenderRec`, not in the tree.

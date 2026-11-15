@@ -44,6 +44,7 @@ pub mod layer;
 pub mod proto;
 pub mod protocol;
 pub mod render;
+pub mod rich;
 pub mod snapshot;
 pub mod renderer;
 pub mod runtime;

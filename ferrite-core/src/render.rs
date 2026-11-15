@@ -8,7 +8,7 @@ use crate::lcd::LcdBackend;
 use crate::platform::Platform;
 use crate::renderer::WidgetRenderer;
 use crate::widget::{
-    ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
+    ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE, FLAG_RICH_TEXT,
     FLAG_DIRTY, FLAG_HAS_ON_PAINT, FLAG_PRESSED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
     KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
@@ -2853,13 +2853,31 @@ fn draw_label_text<P: Platform, C: Canvas>(
     bg: Option<Color>,
 ) {
     let text = ctx.objs.render_text(id, ext.text_id).unwrap_or(&[]);
-    label_lines_text(ctx, widget, abs, ext, text, |font, line, x, y| {
-        c.draw_text(font, &ctx.flash, line, x, y, ext.text_color, bg);
+    label_lines_text(ctx, widget, abs, ext, text, |item| match item {
+        LabelItem::Text { font, text, x, y, color } => {
+            c.draw_text(font, &ctx.flash, text, x, y, color, bg);
+        }
+        LabelItem::Rule { rect, color } => {
+            let screen = Rect::new(0, 0, c.width(), c.height());
+            if let Some(r) = rect.intersection(&screen) {
+                c.fill_rect(r.x as u16, r.y as u16, r.w, r.h, color);
+            }
+        }
     });
 }
 
-/// A label's text as its drawing lays it out: `f(font, line, pen x, baseline y)` for each
-/// line drawn (one unless multi-line). The glyphs are drawn clipped to the label's box.
+/// A piece of a label's text as [`label_lines`] lays it out.
+pub enum LabelItem<'f, 't> {
+    /// `text` (UTF-8) in `font`, pen at `x`, baseline `y`, in `color`.
+    Text { font: &'f crate::font::Font, text: &'t [u8], x: i16, y: i16, color: Color },
+    /// An underline (rich text): `rect` filled with `color`. Not cut to the label (as the
+    /// glyphs aren't): the drawing's scissor does that. After the line's text.
+    Rule { rect: Rect, color: Color },
+}
+
+/// A label's text as its drawing lays it out: `f(item)` for each piece drawn (a line's
+/// text, one unless multi-line; rich text: each run of one font and colour, then the line's
+/// underlines). The glyphs are drawn clipped to the label's box.
 /// Public for board renderers that draw text their own way (exynos4412's GPU compositor).
 pub fn label_lines<P: Platform>(
     ctx: &Ctx<P>,
@@ -2867,7 +2885,7 @@ pub fn label_lines<P: Platform>(
     widget: &Widget,
     abs: &Rect,
     ext: &WidgetExt,
-    f: impl FnMut(&crate::font::Font, &[u8], i16, i16),
+    f: impl FnMut(LabelItem<'_, '_>),
 ) {
     if ctx.objs.render_text(id, ext.text_id).is_none() || ext.font_id == 0xFF {
         return;
@@ -2882,7 +2900,7 @@ fn label_lines_text<P: Platform>(
     abs: &Rect,
     ext: &WidgetExt,
     text: &[u8],
-    mut f: impl FnMut(&crate::font::Font, &[u8], i16, i16),
+    mut f: impl FnMut(LabelItem<'_, '_>),
 ) {
     if ext.font_id == 0xFF {
         return;
@@ -2911,6 +2929,13 @@ fn label_lines_text<P: Platform>(
     }
 
     let lh = font.line_height() as i16;
+
+    if widget.flags & FLAG_RICH_TEXT != 0 {
+        rich_label(ctx, widget, ext, font, text, (cx, cy, cw, ch), lh, f);
+        return;
+    }
+    let color = ext.text_color;
+    let mut f = |font: &crate::font::Font, line: &[u8], x: i16, y: i16| f(LabelItem::Text { font, text: line, x, y, color });
 
     // Multi-line mode: newlines and word wrap, block centred vertically.
     if widget.flags & FLAG_MULTI_LINE != 0 {
@@ -2956,6 +2981,204 @@ fn label_lines_text<P: Platform>(
         let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
         f(font, text, tx, ty);
     }
+}
+
+/// Rich text (`FLAG_RICH_TEXT`, `rich.rs`) laid out as [`label_lines_text`] lays plain text
+/// out: the same wrapping, alignment and vertical placement, in `font`'s line height;
+/// `<b>` / `<i>` runs in its variants.
+fn rich_label<P: Platform>(
+    ctx: &Ctx<P>,
+    widget: &Widget,
+    ext: &WidgetExt,
+    font: &crate::font::Font,
+    text: &[u8],
+    (cx, cy, cw, ch): (i16, i16, u16, u16),
+    lh: i16,
+    mut f: impl FnMut(LabelItem<'_, '_>),
+) {
+    let rich = Rich { fonts: &ctx.fonts, base: font, color: ext.text_color, lh };
+    let x_of = |lw: u16| match ext.text_align {
+        ALIGN_CENTER => cx + (cw as i16 - lw as i16) / 2,
+        ALIGN_RIGHT => cx + cw as i16 - lw as i16,
+        _ => cx,
+    };
+    if widget.flags & FLAG_MULTI_LINE != 0 {
+        let mut line_count: i16 = 0;
+        let mut at = Some(crate::rich::Cursor::new(text));
+        while let Some(c) = at {
+            at = rich.wrap(&c, cw).1;
+            line_count += 1;
+        }
+        let block_h = line_count.saturating_mul(lh);
+        let base_y = cy + ((ch as i16 - block_h) / 2).max(0);
+        let mut li: i16 = 0;
+        let mut at = Some(crate::rich::Cursor::new(text));
+        while let Some(c) = at {
+            let (line, next) = rich.wrap(&c, cw);
+            let ly = base_y + li * lh;
+            // Only lines that fit completely.
+            if line.end > c.pos() && ly >= cy && ly + lh <= cy + ch as i16 {
+                rich.draw(&line, x_of(line.width), ly + (lh * 3) / 4, &mut f);
+            }
+            li += 1;
+            at = next;
+        }
+    } else {
+        let line = rich.whole(text);
+        rich.draw(&line, x_of(line.width), cy + (ch as i16 - lh) / 2 + (lh * 3) / 4, &mut f);
+    }
+}
+
+/// A line of rich text: from `start` up to the character at byte `end`, `width` px.
+struct RichLine<'a> {
+    start: crate::rich::Cursor<'a>,
+    end: usize,
+    width: u16,
+}
+
+/// Lays rich text out in a label font and its variants.
+struct Rich<'f> {
+    fonts: &'f crate::font::FontList,
+    base: &'f crate::font::Font,
+    /// The widget's text colour.
+    color: Color,
+    lh: i16,
+}
+
+impl<'f> Rich<'f> {
+    /// The font a character in `style` draws with: the variant, else the label font.
+    fn font(&self, style: u8) -> &'f crate::font::Font {
+        let fonts = self.fonts;
+        self.base.variant(style).and_then(|id| fonts.find(id)).unwrap_or(self.base)
+    }
+
+    /// The codepoint drawn for `cp`: `&nbsp;` as a space in a font without U+00A0.
+    fn shown(font: &crate::font::Font, cp: u16) -> u16 {
+        if cp == 0xA0 && font.glyph(0xA0).is_none() { b' ' as u16 } else { cp }
+    }
+
+    fn advance(&self, cp: u16, style: u8) -> u16 {
+        if cp == 0xFFFF {
+            return 0;
+        }
+        let font = self.font(style);
+        font.char_width_cp(Self::shown(font, cp))
+    }
+
+    /// The whole text as one line (line breaks left out).
+    fn whole<'a>(&self, text: &'a [u8]) -> RichLine<'a> {
+        let start = crate::rich::Cursor::new(text);
+        let mut c = start.clone();
+        let mut width: u16 = 0;
+        while let Some(item) = c.next() {
+            if let crate::rich::Item::Char { cp, style, .. } = item {
+                width = width.saturating_add(self.advance(cp, style.flags));
+            }
+        }
+        RichLine { start, end: text.len(), width }
+    }
+
+    /// The line starting at `start` that fits in `max_w` px, and where the next one starts
+    /// (None after the last), as `Font::wrap_line` breaks: at a line break (left out), after
+    /// the last space that fits (left out), or inside a word too long for a line.
+    fn wrap<'a>(&self, start: &crate::rich::Cursor<'a>, max_w: u16) -> (RichLine<'a>, Option<crate::rich::Cursor<'a>>) {
+        use crate::rich::Item;
+        let mut c = start.clone();
+        let mut w: u16 = 0;
+        let mut first = true;
+        // The last space: where it is, the place after it, the width before it.
+        let mut space: Option<(usize, crate::rich::Cursor<'a>, u16)> = None;
+        loop {
+            let before = c.clone();
+            match c.next() {
+                None => return (RichLine { start: start.clone(), end: usize::MAX, width: w }, None),
+                Some(Item::Break { at }) => return (RichLine { start: start.clone(), end: at, width: w }, Some(c)),
+                Some(Item::Char { cp, style, at }) => {
+                    let cw = self.advance(cp, style.flags);
+                    if cp == b' ' as u16 {
+                        // A space may hang past the edge: the line breaks there.
+                        space = Some((at, c.clone(), w));
+                    } else if w.saturating_add(cw) > max_w && !first {
+                        let line = |end, width| RichLine { start: start.clone(), end, width };
+                        return match space {
+                            Some((s, after, sw)) => (line(s, sw), Some(after)),
+                            None => (line(at, w), Some(before)),
+                        };
+                    }
+                    w = w.saturating_add(cw);
+                    first = false;
+                }
+            }
+        }
+    }
+
+    /// Draws `line`, pen from `x`, baseline `y`: a [`LabelItem::Text`] for each run of one
+    /// font and colour, then the underlines.
+    fn draw(&self, line: &RichLine<'_>, x: i16, y: i16, f: &mut impl FnMut(LabelItem<'_, '_>)) {
+        use crate::rich::{Item, UNDERLINE};
+        // A run's UTF-8 (a full buffer is drawn and continues where it ends: the same pixels).
+        let mut buf = [0u8; 120];
+        let mut n = 0;
+        let mut run: (&crate::font::Font, Color, i16) = (self.base, self.color, x);
+        let mut pen = x;
+        // Underlines (x0, x1, colour), drawn after the text: an opaque glyph cell drawn later
+        // would cover them.
+        let mut rules = [(0i16, 0i16, 0 as Color); 16];
+        let mut nr = 0;
+        let thick = (self.lh / 20).max(1);
+        let below = (self.lh / 12).max(1);
+        let rule = |r: &(i16, i16, Color)| LabelItem::Rule { rect: Rect::new(r.0, y + below, (r.1 - r.0) as u16, thick as u16), color: r.2 };
+        let mut c = line.start.clone();
+        while let Some(item) = c.next() {
+            let Item::Char { cp, style, at } = item else { continue };
+            if at >= line.end {
+                break;
+            }
+            if cp == 0xFFFF {
+                continue;
+            }
+            let font = self.font(style.flags);
+            let color = style.color.unwrap_or(self.color);
+            let cp = Self::shown(font, cp);
+            if n > 0 && (!core::ptr::eq(font, run.0) || color != run.1 || n + 3 > buf.len()) {
+                f(LabelItem::Text { font: run.0, text: &buf[..n], x: run.2, y, color: run.1 });
+                n = 0;
+            }
+            if n == 0 {
+                run = (font, color, pen);
+            }
+            n += encode_utf8(cp, &mut buf[n..]);
+            let adv = font.char_width_cp(cp) as i16;
+            if style.flags & UNDERLINE != 0 && adv > 0 {
+                if nr > 0 && rules[nr - 1].1 == pen && rules[nr - 1].2 == color {
+                    rules[nr - 1].1 = pen + adv;
+                } else {
+                    if nr == rules.len() {
+                        // Out of room: the ones so far now (rare: 16 colour changes a line).
+                        if n > 0 {
+                            f(LabelItem::Text { font: run.0, text: &buf[..n], x: run.2, y, color: run.1 });
+                            n = 0;
+                            run.2 = pen;
+                        }
+                        rules.iter().for_each(|r| f(rule(r)));
+                        nr = 0;
+                    }
+                    rules[nr] = (pen, pen + adv, color);
+                    nr += 1;
+                }
+            }
+            pen += adv;
+        }
+        if n > 0 {
+            f(LabelItem::Text { font: run.0, text: &buf[..n], x: run.2, y, color: run.1 });
+        }
+        rules[..nr].iter().for_each(|r| f(rule(r)));
+    }
+}
+
+/// `cp` (BMP) as UTF-8 into `out`; its length.
+fn encode_utf8(cp: u16, out: &mut [u8]) -> usize {
+    char::from_u32(cp as u32).unwrap_or('\u{FFFD}').encode_utf8(out).len()
 }
 
 /// Multi-line input: the first line to show (word-wrapped to `cw`), so the
@@ -4859,5 +5082,78 @@ mod shift_tests {
         assert!(a.iter().filter(|&&p| p != 0).count() > 1000);
         let diff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
         assert_eq!(diff, 0, "{diff} pixels differ");
+    }
+}
+
+#[cfg(test)]
+mod rich_tests {
+    use super::*;
+    use crate::font::{Font, FontList};
+
+    fn rom() -> Font {
+        Font::from_embedded(
+            &crate::embedded_font::GLYPHS,
+            &crate::embedded_font::CODEPOINTS,
+            &crate::embedded_font::BITMAP,
+            crate::embedded_font::Y_ADVANCE,
+            crate::embedded_font::BPP,
+        )
+    }
+
+    /// Text without markup wraps as plain text does (`Font::wrap_line`), at any width.
+    #[test]
+    fn plain_text_wraps_the_same_as_rich_text() {
+        let font = rom();
+        let fonts = FontList::new();
+        let rich = Rich { fonts: &fonts, base: &font, color: 0xFFFF, lh: font.line_height() as i16 };
+        for text in ["one two three four", "a\nbb ccc\n", "averyveryverylongword and more", "", "x  y   z"] {
+            let b = text.as_bytes();
+            for w in [0u16, 8, 20, 40, 64, 100, 400] {
+                let mut plain = alloc::vec::Vec::new();
+                let mut i = 0;
+                while i <= b.len() {
+                    let (end, next) = font.wrap_line(b, i, w);
+                    plain.push((i, end.min(b.len()), font.text_width(&b[i..end])));
+                    i = next;
+                }
+                let mut ours = alloc::vec::Vec::new();
+                let mut at = Some(crate::rich::Cursor::new(b));
+                while let Some(c) = at {
+                    let (line, next) = rich.wrap(&c, w);
+                    ours.push((c.pos(), line.end.min(b.len()), line.width));
+                    at = next;
+                }
+                assert_eq!(ours, plain, "{text:?} at {w}");
+            }
+        }
+    }
+
+    /// A rich line draws its runs where one `draw_str` of the plain text would put the glyphs,
+    /// splits runs at colour changes and draws underlines after the text.
+    #[test]
+    fn runs_continue_the_pen_and_underlines_come_last() {
+        let font = rom();
+        let fonts = FontList::new();
+        let rich = Rich { fonts: &fonts, base: &font, color: 0xFFFF, lh: 15 };
+        let text = b"ab <u>cd</u><font color=red>ef</font> &lt;g";
+        let line = rich.whole(text);
+        let mut items = alloc::vec::Vec::new();
+        rich.draw(&line, 10, 20, &mut |item| {
+            items.push(match item {
+                LabelItem::Text { text, x, color, .. } => (alloc::string::String::from_utf8(text.to_vec()).unwrap(), x, color),
+                LabelItem::Rule { rect, color } => (alloc::format!("rule {} {}", rect.w, rect.y), rect.x, color),
+            });
+        });
+        let w = |s: &str| font.text_width(s.as_bytes()) as i16;
+        assert_eq!(line.width as i16, w("ab cdef <g"));
+        assert_eq!(
+            items,
+            [
+                ("ab cd".into(), 10, 0xFFFF),
+                ("ef".into(), 10 + w("ab cd"), 0xF800),
+                (" <g".into(), 10 + w("ab cdef"), 0xFFFF),
+                (alloc::format!("rule {} 21", w("cd")), 10 + w("ab "), 0xFFFF),
+            ]
+        );
     }
 }

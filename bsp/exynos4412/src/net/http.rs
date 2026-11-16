@@ -300,6 +300,26 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", if on { "Pieces merged into fewer draws\n" } else { "A draw per run of pieces\n" }).await?;
                 return Ok(false);
             }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"cull") {
+                let on = v == b"1";
+                crate::compose::CULL.store(on, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", if on { "Pieces under opaque pieces left out
+" } else { "Every piece drawn
+" }).await?;
+                return Ok(false);
+            }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"overdraw") {
+                let on = v == b"1";
+                if on {
+                    for n in &crate::compose::OVERDRAW {
+                        n.store(0, Ordering::Relaxed);
+                    }
+                }
+                crate::compose::OVERDRAW_ON.store(on, Ordering::Relaxed);
+                text(socket, "200 OK", if on { "Overdraw measured (counters zeroed)\n" } else { "Overdraw not measured\n" }).await?;
+                return Ok(false);
+            }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"glyphs") {
                 let on = v == b"1";
                 crate::compose::GLYPHS.store(on, Ordering::Relaxed);
@@ -949,6 +969,16 @@ fn status_json() -> String {
     s.push_str(",\"time\":{");
     for (i, (name, n)) in crate::compose::TIME_NAMES.iter().zip(&crate::compose::TIMES).enumerate() {
         let _ = write!(s, "{}\"{}\":{}", if i == 0 { "" } else { "," }, name, n.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    s.push('}');
+    let _ = write!(
+        s,
+        ",\"cull\":{},\"overdraw\":{{\"on\":{}",
+        crate::compose::CULL.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::OVERDRAW_ON.load(core::sync::atomic::Ordering::Relaxed)
+    );
+    for (name, n) in crate::compose::OVERDRAW_NAMES.iter().zip(&crate::compose::OVERDRAW) {
+        let _ = write!(s, ",\"{}\":{}", name, n.load(core::sync::atomic::Ordering::Relaxed));
     }
     s.push('}');
     s.push('}');

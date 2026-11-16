@@ -285,6 +285,12 @@ struct State {
     /// One opaque white texel (heap, 64-byte aligned, cleaned): solid pieces are `ui_flat`
     /// with it, times their colour. 0 until the first render.
     white: usize,
+    /// [`OVERDRAW_ON`]: per cell of the frame, 1 + the last opaque piece covering it whole.
+    od_cells: Vec<u32>,
+    /// The frame's pieces from its first ([`CULL`]): left out.
+    culled: Vec<bool>,
+    /// The frame's opaque pieces that may hide others: index, rect in the frame.
+    occluders: Vec<(u32, R)>,
 }
 
 static mut STATE: State = State {
@@ -313,6 +319,9 @@ static mut STATE: State = State {
     told: false,
     groups: Vec::new(),
     white: 0,
+    od_cells: Vec::new(),
+    culled: Vec::new(),
+    occluders: Vec::new(),
 };
 
 /// Triangles of round parts (`tess::oval`/`wedge`) by the part, colour aside: the clock
@@ -601,6 +610,30 @@ pub static GRAPHS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// `tess::oval`/`wedge`) rather than sprites. On by default; HTTP `POST /api/compose?shapes=0|1`
 /// switches it for A/B runs.
 pub static SHAPES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Overdraw measurement (HTTP `POST /api/compose?overdraw=0|1`, off at boot; switching it on
+/// zeroes [`OVERDRAW`]): each frame also works out, in 4×4-pixel cells, how much of what it
+/// draws ends up under a later opaque piece — what drawing the opaque pieces first with a
+/// depth test (Impeller's `DrawOrderResolver`) would leave unshaded. CPU time per frame.
+pub static OVERDRAW_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The names of [`OVERDRAW`]'s slots, pixels summed over frames (`/api/status`
+/// `compositor.overdraw`): the frames' pixels; pixels the pieces drawn shade (triangles: their
+/// area); of those, pixels of opaque pieces (solids at alpha 1, raw RGB565 pictures); pixels
+/// under a later opaque piece (whole cells only, so a little low); pixels of the pieces the
+/// frame skips (before the last widget covering it opaquely, `Item::opaque`); pixels of the
+/// pieces [`CULL`] leaves out (not in the others).
+pub const OVERDRAW_NAMES: [&str; 6] = ["frame_px", "shaded_px", "opaque_px", "hidden_px", "skipped_px", "culled_px"];
+pub static OVERDRAW: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+/// A piece wholly inside a later opaque piece (a solid at alpha 1 or a raw RGB565 picture, at
+/// least [`CULL_MIN_PX`] pixels in the frame) is left out of the frame: "over" at alpha 1
+/// leaves nothing of what is under it, so the pixels are the same. Board, tablet home: the
+/// only such pieces were the background widget's fill under its own picture, a whole screen
+/// of the ~2.1 the frames shaded (`?overdraw=1`), which is what drawing opaque pieces first
+/// with a depth test would have saved too. HTTP `POST /api/compose?cull=0|1`.
+pub static CULL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Smaller opaque pieces are not checked as occluders (pieces × occluders a frame).
+const CULL_MIN_PX: i32 = 4096;
+/// Cell side of the overdraw measurement, pixels.
+const OD_CELL: i32 = 4;
 /// [`ENABLED`] changed: the whole screen is repainted the new way ([`service`]).
 pub static REPAINT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -1695,6 +1728,10 @@ impl State {
         let started = now_us();
         let first = self.items.iter().rposition(|it| it.opaque.is_some_and(|o| o.contains(c))).unwrap_or(0);
         let from = self.items.get(first).map_or(self.prims.len(), |it| it.start);
+        self.cull(from, c);
+        if OVERDRAW_ON.load(core::sync::atomic::Ordering::Relaxed) {
+            self.overdraw(from, c);
+        }
         let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), 0xFF00_0000);
         add_time(T_BEGIN, now_us() - started);
         let scale = [2.0 / c.w() as f32, 2.0 / c.h() as f32];
@@ -1706,7 +1743,7 @@ impl State {
         for at in from..self.prims.len() {
             let p = self.prims[at];
             let rect = p.rect().meet(c);
-            if rect.is_empty() {
+            if rect.is_empty() || self.culled[at - from] {
                 continue;
             }
             let b = p.batch();
@@ -1776,6 +1813,125 @@ impl State {
         add_time(T_FRAME, now_us() - started);
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
         shown.map(|_| ())
+    }
+
+    /// Whether `p` paints every pixel of its rect opaquely: a solid at alpha 1, or a raw RGB565
+    /// picture not faded.
+    fn is_opaque(&self, p: &Prim) -> bool {
+        match *p {
+            Prim::Flat { color, tex, .. } => {
+                color.dx[3] == 0.0 && color.dy[3] == 0.0 && color.v[3] >= 1.0 && (tex.addr == self.white || tex.fmt == Fmt::Rgb565)
+            }
+            _ => false,
+        }
+    }
+
+    /// [`CULL`]: marks the pieces of frame `c` from `from` that a later opaque piece hides
+    /// whole (`culled`).
+    fn cull(&mut self, from: usize, c: &R) {
+        self.culled.clear();
+        self.culled.resize(self.prims.len() - from, false);
+        if !CULL.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut occ = core::mem::take(&mut self.occluders);
+        occ.clear();
+        for at in from..self.prims.len() {
+            let p = self.prims[at];
+            let r = p.rect().meet(c);
+            if !r.is_empty() && r.w() * r.h() >= CULL_MIN_PX && self.is_opaque(&p) {
+                occ.push((at as u32, r));
+            }
+        }
+        if !occ.is_empty() {
+            for at in from..self.prims.len() {
+                let r = self.prims[at].rect().meet(c);
+                if r.is_empty() {
+                    continue;
+                }
+                // Occluders after this piece, latest first.
+                self.culled[at - from] = occ.iter().rev().take_while(|(i, _)| *i as usize > at).any(|(_, o)| o.contains(&r));
+            }
+        }
+        self.occluders = occ;
+    }
+
+    /// [`OVERDRAW_ON`]: the frame `c`'s overdraw into [`OVERDRAW`]; its pieces start at `from`.
+    fn overdraw(&mut self, from: usize, c: &R) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let area = |r: &R| if r.is_empty() { 0u64 } else { (r.w() * r.h()) as u64 };
+        let skipped: u64 = self.prims[..from].iter().map(|p| area(&p.rect().meet(c))).sum();
+        let cols = ((c.w() + OD_CELL - 1) / OD_CELL) as usize;
+        let rows = ((c.h() + OD_CELL - 1) / OD_CELL) as usize;
+        let mut cells = core::mem::take(&mut self.od_cells);
+        cells.clear();
+        cells.resize(cols * rows, 0);
+        // The last opaque piece covering each cell whole.
+        for at in from..self.prims.len() {
+            let p = self.prims[at];
+            let r = p.rect().meet(c);
+            if r.is_empty() || self.culled[at - from] || !self.is_opaque(&p) {
+                continue;
+            }
+            let x0 = (r.x0 - c.x0 + OD_CELL - 1) / OD_CELL;
+            let x1 = (r.x1 - c.x0) / OD_CELL;
+            let y0 = (r.y0 - c.y0 + OD_CELL - 1) / OD_CELL;
+            let y1 = (r.y1 - c.y0) / OD_CELL;
+            for y in y0..y1 {
+                let row = y as usize * cols;
+                cells[row + x0 as usize..row + x1.max(x0) as usize].fill(at as u32 + 1);
+            }
+        }
+        let (mut shaded, mut opaque, mut hidden, mut culled) = (0u64, 0u64, 0u64, 0u64);
+        for at in from..self.prims.len() {
+            let p = self.prims[at];
+            let r = p.rect().meet(c);
+            if r.is_empty() {
+                continue;
+            }
+            if self.culled[at - from] {
+                culled += area(&r);
+                continue;
+            }
+            // Pixels of `r` in cells a later opaque piece covers.
+            let mut under = 0u64;
+            let (x0, x1) = ((r.x0 - c.x0) / OD_CELL, (r.x1 - c.x0 + OD_CELL - 1) / OD_CELL);
+            let (y0, y1) = ((r.y0 - c.y0) / OD_CELL, (r.y1 - c.y0 + OD_CELL - 1) / OD_CELL);
+            for y in y0..y1 {
+                let cy0 = (c.y0 + y * OD_CELL).max(r.y0);
+                let cy1 = (c.y0 + (y + 1) * OD_CELL).min(r.y1);
+                let row = y as usize * cols;
+                for x in x0..x1 {
+                    if cells[row + x as usize] > at as u32 + 1 {
+                        let cx0 = (c.x0 + x * OD_CELL).max(r.x0);
+                        let cx1 = (c.x0 + (x + 1) * OD_CELL).min(r.x1);
+                        under += ((cx1 - cx0) * (cy1 - cy0)) as u64;
+                    }
+                }
+            }
+            let px = area(&r);
+            match p {
+                Prim::Tris { bbox, start, len, .. } => {
+                    // The triangles' area, the part of the box in the frame of it.
+                    let t = &self.tverts[start as usize..(start + len) as usize];
+                    let tri: f32 = t.chunks_exact(3).map(|v| ((v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[2].x - v[0].x) * (v[1].y - v[0].y)).abs() * 0.5).sum();
+                    let fill = (tri / area(&bbox).max(1) as f32).min(1.0);
+                    shaded += (px as f32 * fill) as u64;
+                    hidden += (under as f32 * fill) as u64;
+                }
+                _ => {
+                    shaded += px;
+                    hidden += under;
+                    if self.is_opaque(&p) {
+                        opaque += px;
+                    }
+                }
+            }
+        }
+        self.od_cells = cells;
+        for (slot, n) in [area(c), shaded, opaque, hidden, skipped, culled].into_iter().enumerate() {
+            OVERDRAW[slot].fetch_add(n, Relaxed);
+        }
     }
 
     /// Two triangles of `p` over `rect` (inside the frame `c`) into the batch's vertices; a

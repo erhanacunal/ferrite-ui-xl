@@ -1,0 +1,103 @@
+// Classes (runtime::class_tests): results go to `r`, the first global, which
+// the test reads back; r[0] counts the setup steps that ran.
+
+var r[24];
+var drops = 0;
+
+class Vec2 {
+    var x = 0.0;
+    var y: float;
+    fn init(x0: float, y0: float) {
+        self.x = x0;
+        self.y = y0;
+    }
+    fn len2() -> float {
+        return self.x * self.x + self.y * self.y;
+    }
+    fn add(o: Vec2) {
+        self.x += o.x;
+        self.y += o.y;
+    }
+    fn scaled(k: float) -> Vec2 {
+        return Vec2(self.x * k, self.y * k);
+    }
+}
+
+class Counter {
+    var n;
+    var step = 3;
+    var hist[4];
+    var seed[3] = [7, 8, 9];
+    var name = str("counter");
+    var pos: Vec2;
+    fn bump() -> int {
+        var h = self.hist;
+        h[self.n % 4] = self.n;
+        self.n += self.step;
+        return self.n;
+    }
+    fn drop() {
+        drops += 1;
+        if (self.pos != 0) {
+            free(self.pos);
+        }
+    }
+}
+
+// A class used by a function before its declaration.
+fn makeCounter(step) -> Counter {
+    var c = Counter();
+    c.step = step;
+    return c;
+}
+
+fn setup() {
+    var a = Vec2(3, 4);            // int args promoted to float
+    r[1] = ftoi(a.len2());         // 25
+    var b = Vec2(1.5, 0.5);
+    a.add(b);                      // (4.5, 4.5)
+    r[2] = ftoi(a.x * 10.0);       // 45
+    r[3] = ftoi(a.y * 10.0);       // 45
+    var c = a.scaled(2.0);         // (9, 9)
+    r[4] = ftoi(c.x + c.y);        // 18
+    a.x = 1;                       // int → float field
+    r[5] = ftoi(a.x * 100.0);      // 100
+
+    var k = makeCounter(5);
+    r[6] = k.bump();               // 5
+    r[7] = k.bump();               // 10
+    var h = k.hist;
+    r[8] = h[0] + h[1];            // 0 + 5
+    var s = k.seed;
+    r[9] = s[0] * 100 + s[1] * 10 + s[2];   // 789
+    r[10] = arrLen(h);             // 4
+    r[11] = strLen(k.name);        // 7
+    k.pos = Vec2(1, 2);
+    var p = k.pos;
+    r[12] = ftoi(p.y);             // 2
+
+    // free(): drop() then the array fields and the instance.
+    free(k);
+    r[13] = drops;                 // 1
+
+    // Freed pointers are reused FIFO, so allocate many and free them all.
+    var i = 0;
+    while (i < 1000) {
+        var t = Counter();
+        t.n = i;
+        free(t);
+        i += 1;
+    }
+    r[14] = drops;                 // 1001
+
+    var m = Counter();
+    m.n = 10;
+    m.n -= 3;
+    m.n *= 2;
+    r[15] = m.n;                   // 14
+    r[16] = m.step;                // 3
+    r[0] = 16;
+}
+
+fn loop() {
+}

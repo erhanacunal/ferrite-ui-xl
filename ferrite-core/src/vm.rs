@@ -1748,6 +1748,12 @@ impl Vm {
         self.fault
     }
 
+    /// Variable slot `i` (globals first, in declaration order).
+    #[cfg(test)]
+    pub(crate) fn var(&self, i: usize) -> i32 {
+        self.vars[i]
+    }
+
     /// Address of the instruction that raised the most recent VM error.
     /// Unlike `pc()`, this stays correct after a failed callback restores
     /// the interrupted state.

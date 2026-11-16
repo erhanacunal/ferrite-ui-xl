@@ -25,6 +25,7 @@ Working branch: `main` (commit and push there).
 - Device perf: `python scripts/perf_baseline.py`
 - Firmware: `cd bsp/exynos4412 && cargo build --release` (or `./exynos4412.ps1` from the repo root)
 - After changing `lib/flex.fl`: `python ferrite-core/testdata/flex/gen.py`
+- After changing the compiler's class support: `python ferrite-core/testdata/classes/gen.py`
 - After changing `system/setup/main.fl` or ferrite-ui `lib/system.fl`: `python scripts/build_setup.py` (rebuilds the embedded `system/setup/setup.img`; `--check` compares), then the firmware
 - Board: `192.168.1.55` (HTTP API `/api/status`, `/api/screen`, `/api/perf`; protocol bridge `tcp://HOST:7000`; `ferrite_cli --host H savefw` / `bootflash`).
 

@@ -2774,6 +2774,40 @@ mod mem_detail_tests {
 }
 
 #[cfg(all(test, feature = "mock"))]
+mod class_tests {
+    //! `.fl` classes (instances are pool arrays): `testdata/classes/classes.fl`,
+    //! compiled by `testdata/classes/gen.py` with and without superops.
+    use super::*;
+    use crate::pool::{ObjPtr, T_ARRAY};
+
+    fn run(code: &[u8]) {
+        let mut rt = super::multi_tests::boot(&[(b"main", code.to_vec())]);
+        for _ in 0..3 {
+            rt.step();
+        }
+        assert_eq!(rt.error_code, 0);
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let r = rt.ctx.objs.arr(rt.tasks.main.var(0) as ObjPtr).expect("r[]").to_vec();
+        let expected = [16, 25, 45, 45, 18, 100, 5, 10, 5, 789, 4, 7, 2, 1, 1001, 14, 3];
+        assert_eq!(&r[..expected.len()], &expected);
+        // Live: r, the Vec2s a, b, c (scaled()'s result), m with its two
+        // array fields. free(k) took k, its array fields and k.pos (its
+        // drop()); the 1000 freed Counters left nothing.
+        assert_eq!(rt.ctx.objs.live_objects(T_ARRAY), 1 + 3 + 3, "live arrays");
+    }
+
+    #[test]
+    fn classes() {
+        run(include_bytes!("../testdata/classes/classes.prg"));
+    }
+
+    #[test]
+    fn classes_superops() {
+        run(include_bytes!("../testdata/classes/classes_super.prg"));
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
 mod flex_tests {
     //! Native `FLEX_LAYOUT` (`vm_flex.rs`) against lib/flex.fl's function:
     //! the same program (`testdata/flex/flex_test.fl`, compiled both ways by

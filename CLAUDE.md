@@ -16,7 +16,7 @@ Working branch: `main` (commit and push there).
 - `ferrite-core` = the whole device-agnostic framework, generic over `P: Platform`; each BSP owns backends + entry point.
 - Always compiled (not features): `layers`, `multi_program`, `perf`, `fast_vm`, `superops`, `render_cache`, `wide_obj`, `wide_code`, `pool_large`, `audio`. Remaining features: `host`, `mock`, `external_alloc`, `jpeg`.
 - Removed: `epaper`, `sdcard`, `sdboot`, the write-only AA underlay, the sim's `no-readback`/`tablet` features, buffered render mode (dirty rendering only, one `FLAG_DIRTY`).
-- Compiler, `.fl` library and Designer live in `../ferrite-ui` (single source). Examples include `../ferrite-ui/lib`; `sim.bat` uses `%FERRITE_UI%`. XL-only bytecode is gated by device caps (`caps.*` in ferrite-ui `tools/devices/exynos4412*.json`); XL examples use the `exynos4412-xl` profile.
+- Compiler, `.fl` library and Designer live in `../ferrite-ui` (single source). Examples include `../ferrite-ui/lib`; `sim.bat` uses `%FERRITE_UI%`. XL-only bytecode is gated by device caps (`caps.*` in ferrite-ui `tools/devices/exynos4412-xl.json`, the only tablet profile); XL examples use it.
 
 ## Commands
 

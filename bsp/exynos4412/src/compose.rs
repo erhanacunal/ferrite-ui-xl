@@ -175,7 +175,7 @@ struct Tex {
     addr: usize,
     w: usize,
     h: usize,
-    /// Bytes from a line to the next.
+    /// Bytes from a line to the next; `mali::TILED` (0) = block-interleaved.
     stride: usize,
     fmt: Fmt,
 }
@@ -276,6 +276,8 @@ struct State {
     cov_tris: Vec<tess::Vtx>,
     /// Images that aren't raw opaque RGB565, decoded into textures.
     images: Images,
+    /// Raw opaque RGB565 pictures in the PPs' block layout.
+    tiled: TiledPics,
     /// The GPU reads RGB565 rows of any stride (`Ui::any_565_stride`), for this render.
     any_565: bool,
     /// A GPU error was printed: only the first is.
@@ -315,6 +317,7 @@ static mut STATE: State = State {
     areas: Vec::new(),
     cov_tris: Vec::new(),
     images: Images { entries: Vec::new(), bytes: 0, render: 0 },
+    tiled: TiledPics { entries: Vec::new(), bytes: 0 },
     any_565: false,
     told: false,
     groups: Vec::new(),
@@ -448,6 +451,94 @@ impl Images {
         let e = &mut self.entries[at];
         e.used = self.render;
         Some(Tex { addr: e.px[e.start..].as_ptr() as usize, w: e.w, h: e.h, stride: e.stride * 4, fmt: Fmt::Argb })
+    }
+}
+
+/// Raw opaque RGB565 pictures copied into the PPs' block-interleaved layout
+/// (`mali::TILED`): sampled linear where they are in the flash shadow, a full-screen
+/// background cost the tablet home 1.7 of 5.0 ms of PP time per full repaint, 6.1 MB of bus
+/// reads (3x its size) and nearly all texture cache misses (`?pp_cnt`, `?probe`). Copied the
+/// first time a render shows one; a flash write (`flash::generation`) makes new copies.
+/// Least recently used ones go past [`TILED_BYTES`], never one this render uses.
+struct TiledPics {
+    entries: Vec<TiledPic>,
+    bytes: usize,
+}
+
+struct TiledPic {
+    /// The picture's texels in the flash shadow, its size, the flash generation copied at.
+    src: usize,
+    w: usize,
+    h: usize,
+    generation: u32,
+    /// Whole 16x16 blocks from `start` texels into `px` (64-byte aligned).
+    px: Vec<u16>,
+    start: usize,
+    used: u32,
+}
+
+const TILED_BYTES: usize = 16 << 20;
+const TILED_ENTRIES: usize = 16;
+
+/// Block-interleaved copies of pictures ([`TiledPics`]); HTTP `POST /api/compose?tiled=0|1`.
+pub static TILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Time copying pictures into blocks since boot, us, and how many.
+pub static TILED_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static TILED_COPIES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+impl TiledPics {
+    /// The picture of `w` x `h` RGB565 texels at `src` (2-byte aligned, CPU-readable) as a
+    /// block-interleaved texture, copied now if not held; None without the memory.
+    fn tex(&mut self, src: usize, w: usize, h: usize, render: u32) -> Option<Tex> {
+        if w == 0 || h == 0 || w > 4096 || h > 4096 {
+            return None;
+        }
+        let generation = crate::flash::generation();
+        let found = self.entries.iter().position(|e| (e.src, e.w, e.h, e.generation) == (src, w, h, generation));
+        let at = match found {
+            Some(at) => at,
+            None => {
+                let (tw, th) = (w.next_multiple_of(16), h.next_multiple_of(16));
+                let len = tw * th + 32;
+                // Copies from an older flash generation go first.
+                self.entries.retain(|e| e.generation == generation || e.used == render);
+                self.bytes = self.entries.iter().map(|e| e.px.len() * 2).sum();
+                while self.bytes + len * 2 > TILED_BYTES || self.entries.len() >= TILED_ENTRIES {
+                    let lru = (0..self.entries.len())
+                        .filter(|&i| self.entries[i].used != render)
+                        .max_by_key(|&i| render.wrapping_sub(self.entries[i].used))?;
+                    let old = self.entries.swap_remove(lru);
+                    self.bytes -= old.px.len() * 2;
+                }
+                let mut px: Vec<u16> = Vec::new();
+                px.try_reserve_exact(len).ok()?;
+                px.resize(len, 0);
+                let start = ((px.as_ptr() as usize).next_multiple_of(64) - px.as_ptr() as usize) / 2;
+                let t = now_us();
+                let index: [u8; 256] = core::array::from_fn(|i| exynos_4412_rs::drivers::mali::tiled_index(i as u32 % 16, i as u32 / 16) as u8);
+                let blocks_across = tw / 16;
+                // SAFETY: the picture's w * h texels in the flash shadow (`picture_addr`).
+                let texels = unsafe { core::slice::from_raw_parts(src as *const u16, w * h) };
+                let dst = &mut px[start..start + tw * th];
+                for y in 0..h {
+                    let row = &texels[y * w..(y + 1) * w];
+                    let band = (y / 16) * blocks_across * 256;
+                    let iy = (y % 16) * 16;
+                    for (x, &t) in row.iter().enumerate() {
+                        dst[band + (x / 16) * 256 + index[iy + x % 16] as usize] = t;
+                    }
+                }
+                exynos_4412_rs::mmu::clean_dcache_range(dst.as_ptr() as usize, tw * th * 2);
+                TILED_US.fetch_add((now_us() - t) as u32, core::sync::atomic::Ordering::Relaxed);
+                TILED_COPIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                self.bytes += px.len() * 2;
+                self.entries.push(TiledPic { src, w, h, generation, px, start, used: render });
+                self.entries.len() - 1
+            }
+        };
+        let e = &mut self.entries[at];
+        e.used = render;
+        Some(Tex { addr: e.px[e.start..].as_ptr() as usize, w: e.w, h: e.h, stride: exynos_4412_rs::drivers::mali::TILED as usize, fmt: Fmt::Rgb565 })
     }
 }
 
@@ -1075,6 +1166,12 @@ impl State {
         if img.is_raw_opaque()
             && let Some(addr) = renderer::picture_addr(img.data_addr(), (pw * ph * 2) as usize)
         {
+            if TILED.load(core::sync::atomic::Ordering::Relaxed)
+                && addr % 2 == 0
+                && let Some(tex) = self.tiled.tex(addr, pw as usize, ph as usize, self.images.render)
+            {
+                return Some((tex, 0, true));
+            }
             // From the 64-byte boundary before it: `shift` texels to the left.
             let shift = (addr % 64) / 2;
             let stride = pw as usize * 2;

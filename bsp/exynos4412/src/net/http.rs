@@ -300,6 +300,13 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", if on { "Pieces merged into fewer draws\n" } else { "A draw per run of pieces\n" }).await?;
                 return Ok(false);
             }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"tiled") {
+                let on = v == b"1";
+                crate::compose::TILED.store(on, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", if on { "Pictures in the PPs' block layout\n" } else { "Pictures sampled linear\n" }).await?;
+                return Ok(false);
+            }
             if let Some(v) = query_param(query, b"probe").and_then(|v| core::str::from_utf8(v).ok()).and_then(|v| v.parse::<u32>().ok()) {
                 crate::compose::PROBE.store(v, Ordering::Relaxed);
                 crate::compose::REPAINT.store(true, Ordering::Release);
@@ -998,8 +1005,11 @@ fn status_json() -> String {
     s.push('}');
     let _ = write!(
         s,
-        ",\"cull\":{},\"overdraw\":{{\"on\":{}",
+        ",\"cull\":{},\"tiled\":{},\"tiled_copies\":{},\"tiled_us\":{},\"overdraw\":{{\"on\":{}",
         crate::compose::CULL.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::TILED.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::TILED_COPIES.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::TILED_US.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::OVERDRAW_ON.load(core::sync::atomic::Ordering::Relaxed)
     );
     for (name, n) in crate::compose::OVERDRAW_NAMES.iter().zip(&crate::compose::OVERDRAW) {

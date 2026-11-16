@@ -1,0 +1,115 @@
+// Inheritance (runtime::class_tests): results go to `r`, the first global,
+// which the test reads back; r[0] counts the setup steps that ran.
+
+var r[24];
+var drops = 0;
+
+class Shape {
+    var x;
+    var tag = 1;
+    fn init(x0) {
+        self.x = x0;
+    }
+    fn area() -> int {
+        return 0;
+    }
+    fn kind() -> int {
+        return 1;
+    }
+    // Virtual calls on self from a base class method.
+    fn describe() -> int {
+        return self.kind() * 1000 + self.area();
+    }
+    fn me() -> Shape {
+        return self;
+    }
+    fn drop() {
+        drops += 1;
+    }
+}
+
+class Rect : Shape {
+    var w;
+    var h;
+    var cells[3];
+    fn init(x0, w0, h0) {
+        super.init(x0);
+        self.w = w0;
+        self.h = h0;
+    }
+    fn area() -> int {
+        return self.w * self.h;
+    }
+    fn kind() -> int {
+        return 2;
+    }
+}
+
+class Square : Rect {
+    fn init(x0, side) {
+        super.init(x0, side, side);
+    }
+    fn kind() -> int {
+        return 3;
+    }
+    fn drop() {
+        drops += 10;
+        super.drop();
+    }
+}
+
+// No init of its own: the constructor takes Shape.init's params.
+class Circle : Shape {
+    var rad = 2;
+    fn area() -> int {
+        return 3 * self.rad * self.rad;
+    }
+}
+
+// Not in a tree: no hidden class id word.
+class Plain {
+    var v;
+}
+
+fn total(s: Shape) -> int {
+    return s.area();
+}
+
+fn setup() {
+    var s = Shape(1);
+    var rc = Rect(2, 3, 4);
+    var sq = Square(3, 5);
+    var c = Circle(4);
+    r[1] = total(s);               // 0
+    r[2] = total(rc);              // 12
+    r[3] = total(sq);              // 25
+    r[4] = total(c);               // 12
+    r[5] = sq.describe();          // 3025
+    r[6] = c.describe();           // 1012
+    r[7] = sq.x + c.x * 10;        // 43: inherited fields
+    r[8] = c.tag + sq.tag;         // 2
+    var sh: Shape = sq;
+    r[9] = (sh is Rect) + (sh is Square) * 10 + (sh is Circle) * 100;   // 11
+    var rr = sh as Rect;
+    r[10] = rr.w;                  // 5
+    var cc = sh as Circle;
+    r[11] = cc == 0;               // 1
+    r[12] = c.me().area();         // 12: receiver is a call (temporary)
+    r[13] = rc.area() + sq.area(); // 37
+    rc.cells[1] = 9;
+    r[14] = rc.cells[1];           // 9
+    var p = Plain();
+    p.v = 7;
+    r[15] = p.v;                   // 7
+    free(sq);                      // Square.drop → Shape.drop
+    r[16] = drops;                 // 11
+    var g: Shape = Rect(0, 1, 1);
+    free(g);                       // a Rect behind a Shape: cells freed too
+    r[17] = drops;                 // 12
+    var none: Shape;
+    r[18] = none is Rect;          // 0: no instance
+    r[0] = 18;
+}
+
+fn loop() {
+}

@@ -2775,7 +2775,7 @@ mod mem_detail_tests {
 
 #[cfg(all(test, feature = "mock"))]
 mod class_tests {
-    //! `.fl` classes (instances are pool arrays): `testdata/classes/classes.fl`,
+    //! `.fl` classes (instances are pool arrays): `testdata/classes/*.fl`,
     //! compiled by `testdata/classes/gen.py` with and without superops.
     use super::*;
     use crate::pool::{ObjPtr, T_ARRAY};
@@ -2808,6 +2808,32 @@ mod class_tests {
     #[test]
     fn classes_superops() {
         run(include_bytes!("../testdata/classes/classes_super.prg"));
+    }
+
+    /// `inherit.fl`: virtual dispatch, super, is/as, inherited constructors
+    /// and fields, free() through a base class.
+    fn run_inherit(code: &[u8]) {
+        let mut rt = super::multi_tests::boot(&[(b"main", code.to_vec())]);
+        for _ in 0..3 {
+            rt.step();
+        }
+        assert_eq!(rt.error_code, 0);
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let r = rt.ctx.objs.arr(rt.tasks.main.var(0) as ObjPtr).expect("r[]").to_vec();
+        let expected = [18, 0, 12, 25, 12, 3025, 1012, 43, 2, 11, 5, 1, 12, 37, 9, 7, 11, 12, 0];
+        assert_eq!(&r[..expected.len()], &expected);
+        // Live: r, s, rc with its cells, c, p. sq and g went with their cells.
+        assert_eq!(rt.ctx.objs.live_objects(T_ARRAY), 1 + 1 + 2 + 1 + 1, "live arrays");
+    }
+
+    #[test]
+    fn inheritance() {
+        run_inherit(include_bytes!("../testdata/classes/inherit.prg"));
+    }
+
+    #[test]
+    fn inheritance_superops() {
+        run_inherit(include_bytes!("../testdata/classes/inherit_super.prg"));
     }
 }
 

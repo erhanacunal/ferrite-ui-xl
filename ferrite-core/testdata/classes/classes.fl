@@ -44,6 +44,18 @@ class Counter {
     }
 }
 
+class Node {
+    var val;
+    var f = 0.5;
+    var next: Node;
+    var items[4];
+    fn grow() -> Node {
+        self.next = Node();
+        self.next.val = self.val + 1;
+        return self.next;
+    }
+}
+
 // A class used by a function before its declaration.
 fn makeCounter(step) -> Counter {
     var c = Counter();
@@ -96,7 +108,30 @@ fn setup() {
     m.n *= 2;
     r[15] = m.n;                   // 14
     r[16] = m.step;                // 3
-    r[0] = 16;
+
+    // Chains: fields of fields, array fields, ++/--, calls in the middle.
+    var n = Node();
+    n.val = 1;
+    n.grow();                      // n.next.val = 2
+    n.next.val += 10;
+    r[17] = n.next.val;            // 12
+    n.next.grow().val = 40;
+    r[18] = n.next.next.val;       // 40
+    n.items[2] = 7;
+    n.items[2] *= 3;
+    n.items[1]++;
+    r[19] = n.items[2] + n.items[1] * 100;   // 121
+    var old = n.val++;             // 1, val = 2
+    var neu = ++n.val;             // 3
+    r[20] = old * 10 + neu;        // 13
+    n.next.f++;
+    r[21] = ftoi(n.next.f * 10.0); // 15
+    r[22] = ftoi(a.scaled(2.0).len2());     // a = (1, 4.5) → 4 + 81
+    var arr[3] = [5, 6, 7];
+    arr[1]++;
+    --arr[0];
+    r[23] = arr[0] * 100 + arr[1] * 10 + arr[2];   // 477
+    r[0] = 23;
 }
 
 fn loop() {

@@ -300,6 +300,19 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", if on { "Pieces merged into fewer draws\n" } else { "A draw per run of pieces\n" }).await?;
                 return Ok(false);
             }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"play_hist") {
+                let on = v == b"1";
+                if on {
+                    for row in &crate::compose::PLAY_HIST {
+                        for n in row {
+                            n.store(0, Ordering::Relaxed);
+                        }
+                    }
+                }
+                crate::compose::PLAY_HIST_ON.store(on, Ordering::Relaxed);
+                text(socket, "200 OK", "Play histogram set\n").await?;
+                return Ok(false);
+            }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"tiled") {
                 let on = v == b"1";
                 crate::compose::TILED.store(on, Ordering::Relaxed);
@@ -344,7 +357,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"overdraw") {
                 let on = v == b"1";
                 if on {
-                    for n in &crate::compose::OVERDRAW {
+                    for n in crate::compose::OVERDRAW.iter().chain(&crate::compose::OVERDRAW_KIND) {
                         n.store(0, Ordering::Relaxed);
                     }
                 }
@@ -1014,6 +1027,28 @@ fn status_json() -> String {
     );
     for (name, n) in crate::compose::OVERDRAW_NAMES.iter().zip(&crate::compose::OVERDRAW) {
         let _ = write!(s, ",\"{}\":{}", name, n.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    for (name, n) in crate::compose::OVERDRAW_KIND_NAMES.iter().zip(&crate::compose::OVERDRAW_KIND) {
+        let _ = write!(s, ",\"{}_px\":{}", name, n.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    s.push('}');
+    s.push_str(",\"play_hist\":{");
+    let mut first = true;
+    for (code, row) in crate::compose::PLAY_HIST.iter().enumerate() {
+        let calls = row[0].load(core::sync::atomic::Ordering::Relaxed);
+        if calls != 0 {
+            let name = ferrite_core::dl::OP_NAMES.get(code).copied().unwrap_or("?");
+            let _ = write!(
+                s,
+                "{}\"{}\":[{},{},{}]",
+                if first { "" } else { "," },
+                name,
+                calls,
+                row[1].load(core::sync::atomic::Ordering::Relaxed),
+                row[2].load(core::sync::atomic::Ordering::Relaxed)
+            );
+            first = false;
+        }
     }
     s.push('}');
     let _ = write!(s, ",\"pp_cnt\":{{");

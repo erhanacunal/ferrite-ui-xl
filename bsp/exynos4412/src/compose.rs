@@ -67,7 +67,7 @@ use crate::renderer::{self, Sprite};
 
 pub mod shaders;
 mod play;
-pub use play::{PLAY_COUNTS, PLAY_NAMES, PLAY_LAST_OP, play};
+pub use play::{PLAY_COUNTS, PLAY_HIST, PLAY_HIST_ON, PLAY_LAST_OP, PLAY_NAMES, play};
 
 const TILE: i32 = 16;
 /// Where a piece of a box away from its corners is against them: far inside.
@@ -714,6 +714,10 @@ pub static OVERDRAW_ON: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// pieces [`CULL`] leaves out (not in the others).
 pub const OVERDRAW_NAMES: [&str; 6] = ["frame_px", "shaded_px", "opaque_px", "hidden_px", "skipped_px", "culled_px"];
 pub static OVERDRAW: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+/// `shaded_px` by kind of piece, as [`PROBE`]'s bits: pictures, solids, glyphs, other ARGB
+/// textures, triangles, `ui_round`.
+pub const OVERDRAW_KIND_NAMES: [&str; 6] = ["pictures", "solids", "glyphs", "argb", "tris", "round"];
+pub static OVERDRAW_KIND: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::atomic::AtomicU64::new(0) }; 6];
 /// A piece wholly inside a later opaque piece (a solid at alpha 1 or a raw RGB565 picture, at
 /// least [`CULL_MIN_PX`] pixels in the frame) is left out of the frame: "over" at alpha 1
 /// leaves nothing of what is under it, so the pixels are the same. Board, tablet home: the
@@ -2047,10 +2051,12 @@ impl State {
                     let fill = (tri / area(&bbox).max(1) as f32).min(1.0);
                     shaded += (px as f32 * fill) as u64;
                     hidden += (under as f32 * fill) as u64;
+                    OVERDRAW_KIND[4].fetch_add((px as f32 * fill) as u64, Relaxed);
                 }
                 _ => {
                     shaded += px;
                     hidden += under;
+                    OVERDRAW_KIND[self.probe_kind(&p).trailing_zeros() as usize].fetch_add(px, Relaxed);
                     if self.is_opaque(&p) {
                         opaque += px;
                     }

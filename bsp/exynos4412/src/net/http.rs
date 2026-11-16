@@ -300,6 +300,31 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", if on { "Pieces merged into fewer draws\n" } else { "A draw per run of pieces\n" }).await?;
                 return Ok(false);
             }
+            if let Some(v) = query_param(query, b"probe").and_then(|v| core::str::from_utf8(v).ok()).and_then(|v| v.parse::<u32>().ok()) {
+                crate::compose::PROBE.store(v, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", "Probe mask set
+").await?;
+                return Ok(false);
+            }
+            if let Some(v) = query_param(query, b"pp_cnt") {
+                // "A,B" (Mali-4xx FP events; "-" = that counter off) or "off".
+                let mut src = [crate::compose::PP_CNT_OFF; 2];
+                if v != b"off" {
+                    for (i, part) in v.split(|&c| c == b',').take(2).enumerate() {
+                        if let Some(n) = core::str::from_utf8(part).ok().and_then(|t| t.parse::<u32>().ok()) {
+                            src[i] = n;
+                        }
+                    }
+                }
+                for (slot, (s, sum)) in crate::compose::PP_CNT_SRC.iter().zip(&crate::compose::PP_CNT).enumerate() {
+                    s.store(src[slot], Ordering::Relaxed);
+                    sum.store(0, Ordering::Relaxed);
+                }
+                text(socket, "200 OK", "PP counters set (sums zeroed)
+").await?;
+                return Ok(false);
+            }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"cull") {
                 let on = v == b"1";
                 crate::compose::CULL.store(on, Ordering::Relaxed);
@@ -979,6 +1004,13 @@ fn status_json() -> String {
     );
     for (name, n) in crate::compose::OVERDRAW_NAMES.iter().zip(&crate::compose::OVERDRAW) {
         let _ = write!(s, ",\"{}\":{}", name, n.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    s.push('}');
+    let _ = write!(s, ",\"pp_cnt\":{{");
+    for (i, (src, n)) in crate::compose::PP_CNT_SRC.iter().zip(&crate::compose::PP_CNT).enumerate() {
+        let src = src.load(core::sync::atomic::Ordering::Relaxed);
+        let src = if src == crate::compose::PP_CNT_OFF { -1 } else { src as i64 };
+        let _ = write!(s, "{}\"src{}\":{},\"n{}\":{}", if i == 0 { "" } else { "," }, i, src, i, n.load(core::sync::atomic::Ordering::Relaxed));
     }
     s.push('}');
     s.push('}');

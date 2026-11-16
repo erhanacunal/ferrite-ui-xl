@@ -632,6 +632,20 @@ pub static OVERDRAW: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::a
 pub static CULL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// Smaller opaque pieces are not checked as occluders (pieces × occluders a frame).
 const CULL_MIN_PX: i32 = 4096;
+/// The Mali-4xx FP events the PPs count during the compositor's frames (HTTP
+/// `POST /api/compose?pp_cnt=A,B`, `off`; [`PP_CNT_OFF`] = that counter off), and their
+/// values summed over the PPs and frames since they were set (`/api/status`
+/// `compositor.pp_cnt`). Events: 0 active cycles, 2 / 3 bus reads / writes, 9 tile writeback
+/// writes, 12 texture cache uncompressed reads, 29 fragments rasterized, 35 instructions
+/// completed, 51 / 52 texture cache hits / misses (ARM's list; the board checks them).
+pub static PP_CNT_SRC: [core::sync::atomic::AtomicU32; 2] = [const { core::sync::atomic::AtomicU32::new(PP_CNT_OFF) }; 2];
+pub static PP_CNT: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+pub const PP_CNT_OFF: u32 = u32::MAX;
+/// Measurement only (HTTP `?probe=MASK`, 0 at boot; the picture is wrong meanwhile): leaves
+/// kinds of `ui_flat` pieces out of the frames, to see what the PPs' time goes to. 1 = raw
+/// RGB565 pictures, 2 = solids (the white texel), 4 = glyphs (the atlas), 8 = other ARGB
+/// textures (sprites, layers, captures, decoded images), 16 = `Prim::Tris`.
+pub static PROBE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Cell side of the overdraw measurement, pixels.
 const OD_CELL: i32 = 4;
 /// [`ENABLED`] changed: the whole screen is repainted the new way ([`service`]).
@@ -1732,18 +1746,21 @@ impl State {
         if OVERDRAW_ON.load(core::sync::atomic::Ordering::Relaxed) {
             self.overdraw(from, c);
         }
+        let src = |i: usize| Some(PP_CNT_SRC[i].load(core::sync::atomic::Ordering::Relaxed)).filter(|&s| s != PP_CNT_OFF);
+        gpu.set_pp_counters([src(0), src(1)]);
         let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), 0xFF00_0000);
         add_time(T_BEGIN, now_us() - started);
         let scale = [2.0 / c.w() as f32, 2.0 / c.h() as f32];
         // The pieces into draws: a piece joins the latest draw of its batch unless a piece of
         // a draw after that one touches it (painter's order where they overlap).
+        let probe = PROBE.load(core::sync::atomic::Ordering::Relaxed);
         let back = if MERGE.load(core::sync::atomic::Ordering::Relaxed) { MERGE_BACK } else { 1 };
         let mut groups = core::mem::take(&mut self.groups);
         let mut used = 0usize;
         for at in from..self.prims.len() {
             let p = self.prims[at];
             let rect = p.rect().meet(c);
-            if rect.is_empty() || self.culled[at - from] {
+            if rect.is_empty() || self.culled[at - from] || (probe != 0 && probe & self.probe_kind(&p) != 0) {
                 continue;
             }
             let b = p.batch();
@@ -1809,10 +1826,25 @@ impl State {
             add_time(T_GP, t.gp_us);
             add_time(T_PP, t.pps_us);
             add_time(T_HW, t.total_us);
+            for (sum, n) in PP_CNT.iter().zip(t.pp_counts) {
+                sum.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         add_time(T_FRAME, now_us() - started);
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
         shown.map(|_| ())
+    }
+
+    /// [`PROBE`]'s bit for `p`.
+    fn probe_kind(&self, p: &Prim) -> u32 {
+        match *p {
+            Prim::Flat { tex, .. } if tex.fmt == Fmt::Rgb565 => 1,
+            Prim::Flat { tex, .. } if tex.addr == self.white => 2,
+            Prim::Flat { tex, .. } if tex.addr == self.atlas.tex().addr => 4,
+            Prim::Flat { .. } => 8,
+            Prim::Tris { .. } => 16,
+            Prim::Round { .. } => 32,
+        }
     }
 
     /// Whether `p` paints every pixel of its rect opaquely: a solid at alpha 1, or a raw RGB565

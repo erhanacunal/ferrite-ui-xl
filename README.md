@@ -51,7 +51,7 @@ Other examples in [`examples/exynos4412`](examples/exynos4412): `launcher` (prog
 
 - **Boot:** the boot partition holds the HAL's `uart_boot`. At power-on it waits 3 s for an image over the UART or Wi-Fi, then boots the saved firmware, `FERRITE/FERRITE.BIN` on CACHE. Hold **volume up** at power-on to stay in `uart_boot`.
 - **Drawing:** the VM's core records each frame as a display list; CPU2 plays it, through the GPU where it can and the CPU otherwise. Drawing goes into a shadow buffer whose changed area is copied to the scanned framebuffer at vsync, so there is no tearing and no half-drawn frame. Widget subtrees marked as layers (`set(layer, n)`) can live in the display's hardware windows, so moving or fading them costs no drawing.
-- **Filesystem:** the 64 MB flash image (programs, fonts, images, sounds) lives in RAM, loaded from `FERRITE/FLASH.BIN`. A `writefs` changes it until the next boot; `ferrite_cli bootflash` or an HTTP upload saves it.
+- **Filesystem:** the 64 MB flash image (programs, fonts, images, sounds) lives in RAM, loaded from `FERRITE/FLASH.BIN`. A `writefs` changes it without a restart and is saved back to `FLASH.BIN` once writes have been quiet for 1.5 s; `ferrite_cli bootflash` or an HTTP upload writes the file directly and restarts.
 - **Program storage:** programs can write files and directories (`lib/storage.fl`) under `FERRITE/USER`, their own root: the firmware's files are out of their reach. The EEPROM builtins use 4096 bytes kept in `FERRITE/EEPROM.BIN`.
 - **Touch:** every finger is tracked. Widgets take part in Flutter-style gesture recognizers (`onGesture`, `lib/gesture.fl`: tap, double tap, long press, pan and axis drags, scale/rotate, tap-and-drag) that compete in a gesture arena; `on_click` is a tap in that arena, and scroll containers scroll and fling when dragged.
 - **Recovery:** hold the top-left 80×80 px for 3 s at boot. Recovery also starts when CACHE has no filesystem yet.
@@ -93,7 +93,7 @@ Without `--save`, `uartboot.py` runs the image from RAM only, until the next res
 ```powershell
 python ..\ferrite-ui\tools\ferrite_build.py examples\exynos4412\launcher\project.json -o fs.bin
 python ..\ferrite-ui\tools\ferrite_cli.py --host 192.168.88.120 bootflash fs.bin --reset   # save as FLASH.BIN, restart
-python ..\ferrite-ui\tools\ferrite_cli.py -p COMx writefs fs.bin     # or: until the next boot, over UART
+python ..\ferrite-ui\tools\ferrite_cli.py -p COMx writefs fs.bin     # or: no restart (saved after 1.5 s idle), over UART
 python ..\ferrite-ui\tools\ferrite_cli.py -p tcp://192.168.88.120 writefs fs.bin   # the same over Wi-Fi
 python ..\ferrite-ui\tools\ferrite_cli.py -p COMx monitor            # watch the console
 ```

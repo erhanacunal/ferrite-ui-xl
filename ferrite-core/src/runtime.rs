@@ -2838,6 +2838,42 @@ mod class_tests {
 }
 
 #[cfg(all(test, feature = "mock"))]
+mod widget_ctor_tests {
+    //! Widget constructors (`Button(text: .., children: [..])`, lowered by the
+    //! compiler to alloc/parent/set): `testdata/widgets/ctor.fl`, compiled by
+    //! `testdata/widgets/gen.py` with and without superops.
+    use super::*;
+    use crate::pool::ObjPtr;
+
+    fn run(code: &[u8]) {
+        let mut rt = super::multi_tests::boot(&[(b"main", code.to_vec())]);
+        for _ in 0..3 {
+            rt.step();
+        }
+        assert_eq!(rt.error_code, 0);
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let r = |rt: &Runtime<_>| rt.ctx.objs.arr(rt.tasks.main.var(0) as ObjPtr).expect("r[]").to_vec();
+        let expected = [17, 5, 1, 1, 1, 1, 2, 1, 2, 31, 65535, 2016, 100, 1, 1, 3, 98, 400];
+        assert_eq!(&r(&rt)[..expected.len()], &expected);
+        // `on_click: @on_ok` on `ok` (global 3) reaches the click dispatcher.
+        let ok = WidgetId(rt.tasks.main.var(3) as ObjPtr);
+        rt.tasks.widget_click(&rt.ctx.objs, ok);
+        rt.step();
+        assert_eq!(r(&rt)[19], 1, "on_ok ran");
+    }
+
+    #[test]
+    fn widget_constructors() {
+        run(include_bytes!("../testdata/widgets/ctor.prg"));
+    }
+
+    #[test]
+    fn widget_constructors_superops() {
+        run(include_bytes!("../testdata/widgets/ctor_super.prg"));
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
 mod flex_tests {
     //! Native `FLEX_LAYOUT` (`vm_flex.rs`) against lib/flex.fl's function:
     //! the same program (`testdata/flex/flex_test.fl`, compiled both ways by

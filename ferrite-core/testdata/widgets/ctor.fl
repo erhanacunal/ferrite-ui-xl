@@ -1,0 +1,93 @@
+// Widget constructors (runtime::widget_ctor_tests): results go to `r`, the
+// first global, which the test reads back; r[0] counts the setup steps that ran.
+
+#include "core.fl"
+#include "flex.fl"
+
+var r[20];
+var root;
+var title;
+var ok;
+var extra;
+var list;
+
+// Defaults on top of Button's.
+widget Primary : Button(bg_color: 0x001F, text_color: 0xFFFF);
+
+fn on_ok(w) {
+    r[19] += 1;
+}
+
+// A component: returns the widget it built.
+fn card(t) -> widget {
+    return Box(size: [100, 50], children: [Label(text: t)]);
+}
+
+fn count(w: widget) -> int {
+    var n = 0;
+    target(w);
+    var c: widget = get(first_child);
+    while (c >= 0) {
+        n++;
+        target(c);
+        c = get(next_sibling);
+    }
+    return n;
+}
+
+fn setup() {
+    root = Column(parent: 0, flex: FLEX_COLUMN | ITEMS_STRETCH, size: [400, 300], children: [
+        title = Label(text: "Title", size: [0, 30]),
+        Row(flex: FLEX_ROW, flex_grow: 1, children: [
+            ok = Primary(text: "OK", on_click: @on_ok, size: [80, 40]),
+            Button(text: "Cancel", size: [80, 40], bg_color: 0x07E0),
+        ]),
+        card("x"),
+        extra = card("y"),
+    ]);
+    title.text = "Title 2";
+
+    // Unnamed widgets in a loop, attached with parent:.
+    list = Column(parent: root);
+    for (var i = 0; i < 3; i++) {
+        Label(parent: list, text: "item");
+    }
+
+    r[1] = count(root);                 // 5: title, row, two cards, list
+    target(root);
+    var c: widget = get(first_child);
+    r[2] = c == title;                  // 1
+    target(c);
+    r[3] = get(kind);                   // 1: KIND_LABEL
+    var row: widget = get(next_sibling);
+    target(row);
+    r[4] = get(flex);                   // 1: FLEX_ROW (overrides Row's default)
+    r[5] = get(flex_grow);              // 1
+    r[6] = count(row);                  // 2
+    target(row);
+    var b: widget = get(first_child);
+    r[7] = b == ok;                     // 1
+    target(b);
+    r[8] = get(kind);                   // 2: KIND_BUTTON (from Button)
+    r[9] = get(bg_color);               // 31: Primary's default
+    r[10] = get(text_color);            // 65535
+    b = get(next_sibling);
+    target(b);
+    r[11] = get(bg_color);              // 2016: the call's own value
+    target(row);
+    var cd: widget = get(next_sibling);
+    target(cd);
+    r[12] = get(size_w);                // 100: card()
+    r[13] = count(cd);                  // 1
+    target(cd);
+    r[14] = get(next_sibling) == extra; // 1
+    r[15] = count(list);                // 3
+    target(root);
+    r[16] = get(flex);                  // 98: FLEX_COLUMN | ITEMS_STRETCH
+    flexLayout(root);
+    r[17] = title.width;                // 400: stretched
+    r[0] = 17;
+}
+
+fn loop() {
+}

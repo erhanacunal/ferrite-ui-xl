@@ -207,7 +207,7 @@ static mut STATE: State = State {
     models: Vec::new(),
     buffers: Vec::new(),
     frames: 0,
-    times: gpu::Times { gp_us: 0, pps_us: 0, total_us: 0, pp_counts: [0; 2] },
+    times: gpu::Times { gp_us: 0, pps_us: 0, total_us: 0, pp_counts: [0; 2], clean_us: 0, clean_bytes: 0 },
     triangles: 0,
     error: 0,
 };

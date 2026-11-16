@@ -736,6 +736,14 @@ const CULL_MIN_PX: i32 = 4096;
 pub static PP_CNT_SRC: [core::sync::atomic::AtomicU32; 2] = [const { core::sync::atomic::AtomicU32::new(PP_CNT_OFF) }; 2];
 pub static PP_CNT: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 pub const PP_CNT_OFF: u32 = u32::MAX;
+/// The CPU writes the GPU frames' memory through the uncached alias of DRAM, so no cache
+/// clean precedes the hardware (HAL `Gpu::set_frame_uncached`). HTTP
+/// `POST /api/compose?frame_nc=0|1`.
+pub static FRAME_NC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// The frames' cache cleans before the hardware (`Times::clean_us`/`clean_bytes`), summed
+/// since boot (`/api/status` `compositor.clean_us`/`clean_bytes`).
+pub static CLEAN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CLEAN_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Measurement only (HTTP `?probe=MASK`, 0 at boot; the picture is wrong meanwhile): leaves
 /// kinds of `ui_flat` pieces out of the frames, to see what the PPs' time goes to. 1 = raw
 /// RGB565 pictures, 2 = solids (the white texel), 4 = glyphs (the atlas), 8 = other ARGB
@@ -1849,6 +1857,10 @@ impl State {
         }
         let src = |i: usize| Some(PP_CNT_SRC[i].load(core::sync::atomic::Ordering::Relaxed)).filter(|&s| s != PP_CNT_OFF);
         gpu.set_pp_counters([src(0), src(1)]);
+        let nc = FRAME_NC.load(core::sync::atomic::Ordering::Relaxed);
+        if gpu.frame_uncached() != nc {
+            gpu.set_frame_uncached(nc);
+        }
         let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), 0xFF00_0000);
         add_time(T_BEGIN, now_us() - started);
         let scale = [2.0 / c.w() as f32, 2.0 / c.h() as f32];
@@ -1927,6 +1939,8 @@ impl State {
             add_time(T_GP, t.gp_us);
             add_time(T_PP, t.pps_us);
             add_time(T_HW, t.total_us);
+            CLEAN_US.fetch_add(t.clean_us, core::sync::atomic::Ordering::Relaxed);
+            CLEAN_BYTES.fetch_add(t.clean_bytes, core::sync::atomic::Ordering::Relaxed);
             for (sum, n) in PP_CNT.iter().zip(t.pp_counts) {
                 sum.fetch_add(n, core::sync::atomic::Ordering::Relaxed);
             }

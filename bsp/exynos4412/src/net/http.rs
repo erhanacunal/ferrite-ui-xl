@@ -300,6 +300,15 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", if on { "Pieces merged into fewer draws\n" } else { "A draw per run of pieces\n" }).await?;
                 return Ok(false);
             }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"frame_nc") {
+                let on = v == b"1";
+                crate::compose::FRAME_NC.store(on, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", if on { "GPU frame memory written uncached
+" } else { "GPU frame memory written cached, cleaned
+" }).await?;
+                return Ok(false);
+            }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"play_hist") {
                 let on = v == b"1";
                 if on {
@@ -1018,7 +1027,10 @@ fn status_json() -> String {
     s.push('}');
     let _ = write!(
         s,
-        ",\"cull\":{},\"tiled\":{},\"tiled_copies\":{},\"tiled_us\":{},\"overdraw\":{{\"on\":{}",
+        ",\"frame_nc\":{},\"clean_us\":{},\"clean_bytes\":{},\"cull\":{},\"tiled\":{},\"tiled_copies\":{},\"tiled_us\":{},\"overdraw\":{{\"on\":{}",
+        crate::compose::FRAME_NC.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::CLEAN_US.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::CLEAN_BYTES.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::CULL.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::TILED.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::TILED_COPIES.load(core::sync::atomic::Ordering::Relaxed),

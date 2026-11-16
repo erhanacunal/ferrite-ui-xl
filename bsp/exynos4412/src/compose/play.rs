@@ -31,10 +31,10 @@ const FAILED: usize = 5;
 /// The opcode of the last call declined (`dl::OP_NAMES`).
 pub static PLAY_LAST_OP: AtomicU32 = AtomicU32::new(0);
 /// Measurement (HTTP `POST /api/compose?play_hist=1|0`, off at boot; on = zeroed): per
-/// opcode, the calls played, the pieces they made and those pieces' pixels (their rects,
-/// triangles' boxes), summed over the lists (`/api/status` `compositor.play_hist`).
+/// opcode, the calls played, the pieces they made, those pieces' pixels (their rects,
+/// triangles' boxes) and the µs turning them into pieces, summed over the lists (`/api/status` `compositor.play_hist`).
 pub static PLAY_HIST_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-pub static PLAY_HIST: [[AtomicU32; 3]; ferrite_core::dl::OPCODES] = [const { [const { AtomicU32::new(0) }; 3] }; ferrite_core::dl::OPCODES];
+pub static PLAY_HIST: [[AtomicU32; 4]; ferrite_core::dl::OPCODES] = [const { [const { AtomicU32::new(0) }; 4] }; ferrite_core::dl::OPCODES];
 
 fn verdict(slot: usize) -> bool {
     PLAY_COUNTS[slot].fetch_add(1, Relaxed);
@@ -127,6 +127,8 @@ impl State {
         let mut result = Ok(());
         for op in list.ops() {
             let (code, before) = (op.code() as usize, self.prims.len());
+            let hist = PLAY_HIST_ON.load(Relaxed);
+            let started = if hist { now_us() } else { 0 };
             let ok = match op {
                 Op::Area(r) => {
                     area = R::of(&r);
@@ -307,7 +309,8 @@ impl State {
                 },
                 _ => false,
             };
-            if PLAY_HIST_ON.load(Relaxed) && code < PLAY_HIST.len() {
+            if hist && code < PLAY_HIST.len() {
+                PLAY_HIST[code][3].fetch_add((now_us() - started) as u32, Relaxed);
                 let px: u32 = self.prims[before..].iter().map(|p| {
                     let r = p.rect();
                     if r.is_empty() { 0 } else { (r.w() * r.h()) as u32 }

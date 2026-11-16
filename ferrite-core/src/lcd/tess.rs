@@ -297,29 +297,7 @@ pub fn polyline_within(m: &mut Mesh<'_>, pts: &[(i32, i32)], within: f32) {
             q.push(c);
         }
     }
-    // Greedy simplification: from each kept point, the furthest point whose chord passes
-    // within SIMPLIFY of every point it skips, all of them ahead along it.
-    let mut p: Vec<(f32, f32)> = Vec::with_capacity(q.len());
-    let mut i = 0;
-    while i < q.len() {
-        p.push(q[i]);
-        let mut j = i + 1;
-        // At most SIMPLIFY_RUN points a chord: the test is quadratic in the run (a flat
-        // graph 532 points long took 1.5 ms).
-        while j + 1 < q.len() && j - i < SIMPLIFY_RUN {
-            let (a, c) = (q[i], q[j + 1]);
-            let (dx, dy) = (c.0 - a.0, c.1 - a.1);
-            let l = libm::sqrtf(dx * dx + dy * dy);
-            let fits = q[i + 1..=j].iter().all(|b| {
-                ((b.0 - a.0) * dy - (b.1 - a.1) * dx).abs() <= within * l && (b.0 - a.0) * dx + (b.1 - a.1) * dy >= 0.0
-            });
-            if !fits {
-                break;
-            }
-            j += 1;
-        }
-        i = j;
-    }
+    let p = simplify(&q, within);
     let Some(&first) = p.first() else { return };
     let mut s = m.begin();
     disk(m, first);
@@ -342,6 +320,88 @@ pub fn polyline_within(m: &mut Mesh<'_>, pts: &[(i32, i32)], within: f32) {
     }
     m.end(s);
 }
+
+/// Whether the chord `a` → `c` passes within `within` of `b`, with `b` ahead of `a` along it.
+fn chord_fits(a: (f32, f32), c: (f32, f32), b: (f32, f32), within: f32) -> bool {
+    let (dx, dy) = (c.0 - a.0, c.1 - a.1);
+    let l = libm::sqrtf(dx * dx + dy * dy);
+    ((b.0 - a.0) * dy - (b.1 - a.1) * dx).abs() <= within * l && (b.0 - a.0) * dx + (b.1 - a.1) * dy >= 0.0
+}
+
+/// Greedy simplification of `q`: from each kept point, the furthest point (at most
+/// [`SIMPLIFY_RUN`] ahead) whose chord passes within `within` of every point it skips, all of
+/// them ahead along it ([`chord_fits`]); the points kept.
+///
+/// Testing every skipped point for every chord is quadratic in the run: cheap for short runs
+/// (a spiky graph), dear for long ones (a flat graph 532 points long took 1.5 ms on the
+/// board). Past [`SECTOR_FROM`] skipped points the test is Williams' sector test instead,
+/// linear: a skipped point `b` at distance `d` from the start `a` allows the chord's
+/// direction within `asin(within / d)` of `b`'s (it then passes within `within` of `b`,
+/// ahead of `a`), so the chords that fit are those whose direction is in the intersection
+/// of the skipped points' cones, kept as an interval of angles from the first skipped
+/// point's. Within [`CONE_MARGIN`] of the interval's ends, and for a chord back to `a`
+/// itself, the exact test decides: the points kept are always those of [`chord_fits`].
+/// Host, 410 columns: flat 11.4 → 3.1 µs, spiky (a quarter of the points off the line)
+/// unchanged (the runs stay short).
+fn simplify(q: &[(f32, f32)], within: f32) -> Vec<(f32, f32)> {
+    let mut p: Vec<(f32, f32)> = Vec::with_capacity(q.len());
+    let mut i = 0;
+    while i < q.len() {
+        p.push(q[i]);
+        let a = q[i];
+        let mut j = i + 1;
+        // The cone over q[i + 1..upto] (angles from q[i + 1]'s direction), once built.
+        let (mut lo, mut hi, mut upto) = (-core::f32::consts::PI, core::f32::consts::PI, i + 1);
+        while j + 1 < q.len() && j - i < SIMPLIFY_RUN {
+            let c = q[j + 1];
+            let exact = |j: usize| q[i + 1..=j].iter().all(|&b| chord_fits(a, c, b, within));
+            let fits = if j - i < SECTOR_FROM {
+                exact(j)
+            } else {
+                let r = (q[i + 1].0 - a.0, q[i + 1].1 - a.1);
+                let angle = |b: (f32, f32)| {
+                    let v = (b.0 - a.0, b.1 - a.1);
+                    libm::atan2f(r.0 * v.1 - r.1 * v.0, r.0 * v.0 + r.1 * v.1)
+                };
+                // The skipped points not in the cone yet (one back at `a` itself fits any
+                // chord).
+                for &b in &q[upto..=j] {
+                    if b != a {
+                        let d = libm::sqrtf((b.0 - a.0) * (b.0 - a.0) + (b.1 - a.1) * (b.1 - a.1));
+                        let half = if d <= within { core::f32::consts::FRAC_PI_2 } else { libm::asinf(within / d) };
+                        let t = angle(b);
+                        lo = lo.max(t - half);
+                        hi = hi.min(t + half);
+                    }
+                }
+                upto = j + 1;
+                let tc = angle(c);
+                if c == a {
+                    exact(j)
+                } else if tc < lo - CONE_MARGIN || tc > hi + CONE_MARGIN {
+                    false
+                } else if tc > lo + CONE_MARGIN && tc < hi - CONE_MARGIN {
+                    true
+                } else {
+                    exact(j)
+                }
+            };
+            if !fits {
+                break;
+            }
+            j += 1;
+        }
+        i = j;
+    }
+    p
+}
+
+/// Skipped points from which [`simplify`] uses the sector test.
+const SECTOR_FROM: usize = 8;
+
+/// Radians either side of a cone's end where [`simplify`] runs the exact test (the angles'
+/// rounding is ~1e-6).
+const CONE_MARGIN: f32 = 1e-3;
 
 /// Points closer than this (px) to the chord that skips them are dropped: 0.1 changed no
 /// pixel in the tests, 0.2 put the peaks' mean error from 2 % to 8 %.
@@ -940,6 +1000,83 @@ pub(crate) mod raster {
 mod tests {
     use super::*;
 
+    /// The simplification as it was, quadratic: every skipped point tested for every chord.
+    fn simplify_exact(q: &[(f32, f32)], within: f32) -> Vec<(f32, f32)> {
+        let mut p = Vec::new();
+        let mut i = 0;
+        while i < q.len() {
+            p.push(q[i]);
+            let mut j = i + 1;
+            while j + 1 < q.len() && j - i < SIMPLIFY_RUN {
+                if !q[i + 1..=j].iter().all(|&b| chord_fits(q[i], q[j + 1], b, within)) {
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+        }
+        p
+    }
+
+    #[test]
+    fn the_sector_simplification_keeps_the_points_the_exact_one_keeps() {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = |n: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % n
+        };
+        let mut cases: Vec<Vec<(i32, i32)>> = Vec::new();
+        // Graph-like: one point a column, flat runs, ramps, spikes, noise.
+        for kind in 0..6 {
+            for _ in 0..40 {
+                let n = 50 + rnd(500) as i32;
+                let mut y = 100;
+                let pts = (0..n)
+                    .map(|x| {
+                        y = match kind {
+                            0 => 100,
+                            1 => 100 + x / 3,
+                            2 => if rnd(10) == 0 { 40 + rnd(60) as i32 } else { 100 },
+                            3 => (y + rnd(5) as i32 - 2).clamp(0, 200),
+                            4 => 100 + (x % 17) * 3,
+                            _ => 100 + ((x as f32 / 9.0).sin() * 40.0) as i32,
+                        };
+                        (x, y)
+                    })
+                    .collect();
+                cases.push(pts);
+            }
+        }
+        // Free-form: random walks in any direction, back-tracking included.
+        for _ in 0..200 {
+            let (mut x, mut y) = (300, 300);
+            let pts = (0..(10 + rnd(200)))
+                .map(|_| {
+                    x += rnd(7) as i32 - 3;
+                    y += rnd(7) as i32 - 3;
+                    (x, y)
+                })
+                .collect();
+            cases.push(pts);
+        }
+        let mut kept = 0;
+        for pts in &cases {
+            let mut q: Vec<(f32, f32)> = Vec::new();
+            for &(x, y) in pts {
+                let c = (x as f32 + 0.5, y as f32 + 0.5);
+                if q.last() != Some(&c) {
+                    q.push(c);
+                }
+            }
+            for within in [0.1, 0.25, 0.5, 1.0, 2.0] {
+                let fast = simplify(&q, within);
+                assert_eq!(fast, simplify_exact(&q, within), "within {} points {:?}", within, pts);
+                kept += fast.len();
+            }
+        }
+        assert!(kept > 0);
+    }
+
     fn mesh_of(f: impl FnOnce(&mut Mesh<'_>)) -> (Vec<Vtx>, Vec<Chunk>) {
         let (mut verts, mut chunks) = (Vec::new(), Vec::new());
         f(&mut Mesh { verts: &mut verts, chunks: &mut chunks });
@@ -1055,3 +1192,4 @@ mod tests {
         assert_eq!(chunks, [Chunk { start: 0, len: 6, x0: 3, y0: 4, x1: 13, y1: 10 }]);
     }
 }
+

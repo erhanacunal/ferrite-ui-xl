@@ -1044,6 +1044,11 @@ fn status_json() -> String {
         let _ = write!(s, ",\"{}_px\":{}", name, n.load(core::sync::atomic::Ordering::Relaxed));
     }
     s.push('}');
+    s.push_str(",\"build\":{");
+    for (i, (name, n)) in crate::compose::BUILD_NAMES.iter().zip(&crate::compose::BUILD).enumerate() {
+        let _ = write!(s, "{}\"{}\":{}", if i == 0 { "" } else { "," }, name, n.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    s.push('}');
     s.push_str(",\"play_hist\":{");
     let mut first = true;
     for (code, row) in crate::compose::PLAY_HIST.iter().enumerate() {
@@ -1052,12 +1057,13 @@ fn status_json() -> String {
             let name = ferrite_core::dl::OP_NAMES.get(code).copied().unwrap_or("?");
             let _ = write!(
                 s,
-                "{}\"{}\":[{},{},{}]",
+                "{}\"{}\":[{},{},{},{}]",
                 if first { "" } else { "," },
                 name,
                 calls,
                 row[1].load(core::sync::atomic::Ordering::Relaxed),
-                row[2].load(core::sync::atomic::Ordering::Relaxed)
+                row[2].load(core::sync::atomic::Ordering::Relaxed),
+                row[3].load(core::sync::atomic::Ordering::Relaxed)
             );
             first = false;
         }

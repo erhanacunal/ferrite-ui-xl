@@ -740,6 +740,20 @@ pub const PP_CNT_OFF: u32 = u32::MAX;
 /// clean precedes the hardware (HAL `Gpu::set_frame_uncached`). HTTP
 /// `POST /api/compose?frame_nc=0|1`.
 pub static FRAME_NC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Where building the frames' draws goes (`frame`), µs summed since boot (`/api/status`
+/// `compositor.build`): [`CULL`]'s check, putting the pieces into draws, their vertices
+/// (`push`), the meshes and draws (`flush`: attribute copies into the frame's memory).
+pub const BUILD_NAMES: [&str; 4] = ["cull_us", "group_us", "push_us", "flush_us"];
+pub static BUILD: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+const B_CULL: usize = 0;
+const B_GROUP: usize = 1;
+const B_PUSH: usize = 2;
+const B_FLUSH: usize = 3;
+
+fn add_build(slot: usize, us: u64) {
+    BUILD[slot].fetch_add(us, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// The frames' cache cleans before the hardware (`Times::clean_us`/`clean_bytes`), summed
 /// since boot (`/api/status` `compositor.clean_us`/`clean_bytes`).
 pub static CLEAN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1851,7 +1865,9 @@ impl State {
         let started = now_us();
         let first = self.items.iter().rposition(|it| it.opaque.is_some_and(|o| o.contains(c))).unwrap_or(0);
         let from = self.items.get(first).map_or(self.prims.len(), |it| it.start);
+        let culling = now_us();
         self.cull(from, c);
+        add_build(B_CULL, now_us() - culling);
         if OVERDRAW_ON.load(core::sync::atomic::Ordering::Relaxed) {
             self.overdraw(from, c);
         }
@@ -1867,6 +1883,7 @@ impl State {
         // The pieces into draws: a piece joins the latest draw of its batch unless a piece of
         // a draw after that one touches it (painter's order where they overlap).
         let probe = PROBE.load(core::sync::atomic::Ordering::Relaxed);
+        let grouping = now_us();
         let back = if MERGE.load(core::sync::atomic::Ordering::Relaxed) { MERGE_BACK } else { 1 };
         let mut groups = core::mem::take(&mut self.groups);
         let mut used = 0usize;
@@ -1910,17 +1927,27 @@ impl State {
             group.items.push((at as u32, rect));
             add_time(T_PIECES, 1);
         }
+        let pushing = now_us();
+        add_build(B_GROUP, pushing - grouping);
+        let (mut push_us, mut flush_us) = (0, 0);
         let mut built = Ok(());
         for group in &groups[..used] {
+            let t = now_us();
             for &(at, rect) in &group.items {
                 let p = self.prims[at as usize];
                 self.push(&p, &rect, c);
             }
+            let t2 = now_us();
             built = self.flush(ui, &mut frame, group.batch, scale);
+            let t3 = now_us();
+            push_us += t2 - t;
+            flush_us += t3 - t2;
             if built.is_err() {
                 break;
             }
         }
+        add_build(B_PUSH, push_us);
+        add_build(B_FLUSH, flush_us);
         self.groups = groups;
         built?;
         let drew = used != 0;

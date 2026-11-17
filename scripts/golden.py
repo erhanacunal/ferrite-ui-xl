@@ -105,16 +105,11 @@ def main():
                     help="answer reads of render-owned values (animated props, scroll offsets) from the last "
                          "render's snapshot, as the render core will (FERRITE_SIM_STALE_READS=1); frames that "
                          "differ show programs depending on reading them live")
-    ap.add_argument("--plain", action="store_true",
-                    help="plain CPU drawing only: no layers, no pixel moves (FERRITE_SIM_PLAIN=1); frames of "
-                         "examples with layers differ from the golden ones (compare with --hashes)")
-    ap.add_argument("--play", action="store_true",
-                    help="the render side only plays each frame's display list, recorded by the VM's side "
-                         "(FERRITE_SIM_PLAY=1); must match --plain")
     ap.add_argument("--areas", action="store_true",
-                    help="as --play, recorded in compositor order: changed areas repainted whole, back to front "
+                    help="the board's mode: the render side only plays each frame's display list, recorded by "
+                         "the VM's side in compositor order: changed areas repainted whole, back to front "
                          "with retained layers (FERRITE_SIM_AREAS=1); matches the golden frames except paint "
-                         "(on_paint) and layers (a composed layer, within 1/255)")
+                         "(on_paint: whole areas)")
     ap.add_argument("--hashes", help="check against / write (--update) this hash file instead of golden/hashes.json")
     a = ap.parse_args()
     global HASHES
@@ -147,10 +142,6 @@ def main():
             env.update(FERRITE_SIM_STALE_READS="1")
         if a.areas:
             env.update(FERRITE_SIM_AREAS="1")
-        elif a.play:
-            env.update(FERRITE_SIM_PLAY="1")
-        elif a.plain:
-            env.update(FERRITE_SIM_PLAIN="1")
         frames = run(name, sc, img, env)
         if a.update:
             golden[name] = frames

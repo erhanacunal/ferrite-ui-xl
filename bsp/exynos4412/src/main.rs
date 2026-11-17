@@ -78,7 +78,6 @@ mod gpu;
 mod hotplug;
 mod jpeg;
 mod lcd;
-mod model3d;
 #[cfg(feature = "wifi")]
 mod net;
 // FIMD window 1 board test, driven over HTTP (`POST /api/overlay`).

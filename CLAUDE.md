@@ -21,7 +21,7 @@ Working branch: `main` (commit and push there).
 ## Commands
 
 - Tests: `cargo test -p ferrite-core --features host,mock`
-- Pixel regression: `python scripts/golden.py` (`--dl`, `--areas`, `--play`, `--plain`, `--stale`; `--update` only after an intended visual change)
+- Pixel regression: `python scripts/golden.py` (`--dl`, `--areas`, `--stale`; `--update` only after an intended visual change)
 - Device perf: `python scripts/perf_baseline.py`
 - Firmware: `cd bsp/exynos4412 && cargo build --release` (or `./exynos4412.ps1` from the repo root)
 - After changing `lib/flex.fl`: `python ferrite-core/testdata/flex/gen.py`
@@ -55,4 +55,4 @@ Working branch: `main` (commit and push there).
 
 ## Debug switches (sim env vars)
 
-`FERRITE_SIM_DL=1`, `FERRITE_SIM_DL_VERIFY=1`, `FERRITE_SIM_AREAS=1`, `FERRITE_SIM_PLAY=1`, `FERRITE_SIM_PLAIN=1`, `FERRITE_SIM_SCENE_VERIFY=1`, `FERRITE_SIM_SCENE_FULL=1`, `FERRITE_SIM_ONE_CTX=1`, `FERRITE_SIM_STALE_READS=1`, `FERRITE_SIM_NO_MOVE=1`, `FERRITE_SIM_CLOCK=HH:MM`, `FERRITE_SIM_BATTERY=P,C`. Sim flags: `--dl-dump`, `--storage DIR`, `--eeprom FILE`, `--pinch …`, `--swipe …`, `--tap`, `--prof SECS`. exynos equivalents are under `/api/rcore`, `/api/dl`, `/api/compose`, `/api/snapshot` (see the notes).
+`FERRITE_SIM_DL=1`, `FERRITE_SIM_DL_VERIFY=1`, `FERRITE_SIM_AREAS=1` (the board's render mode), `FERRITE_SIM_SCENE_VERIFY=1`, `FERRITE_SIM_SCENE_FULL=1`, `FERRITE_SIM_ONE_CTX=1`, `FERRITE_SIM_STALE_READS=1`, `FERRITE_SIM_NO_MOVE=1`, `FERRITE_SIM_CLOCK=HH:MM`, `FERRITE_SIM_BATTERY=P,C`. Sim flags: `--dl-dump`, `--storage DIR`, `--eeprom FILE`, `--pinch …`, `--swipe …`, `--tap`, `--prof SECS`. exynos equivalents are under `/api/rcore`, `/api/dl`, `/api/compose`, `/api/snapshot` (see the notes).

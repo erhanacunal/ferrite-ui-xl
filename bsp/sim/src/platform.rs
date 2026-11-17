@@ -210,7 +210,7 @@ impl PlatformRuntime for SimPlatform {
             // Battery (lib/battery.fl): none on the host (-1 = unknown, charger 2 = powered),
             // unless `FERRITE_SIM_BATTERY=PERCENT,CHARGER` fakes one.
             0x05 | 0x08 | 0x09 => Some(sim_battery(id)),
-            // 3D model syscalls (lib/model3d.fl, exynos4412 model3d.rs): the sim has no GPU,
+            // 3D model syscalls (lib/model3d.fl): no 3D drawing (as on the board, since 2026-11-17),
             // so a model widget shows its background; setters succeed, stats are 0.
             0x60..=0x63 | 0x65 => Some(1),
             0x64 => Some(0),

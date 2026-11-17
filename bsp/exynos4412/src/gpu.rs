@@ -1,9 +1,8 @@
-//! The Mali-400, shared by the 3D model widgets (`model3d.rs`) and the GPU compositor
-//! (`compose.rs`).
+//! The Mali-400, for the GPU player (`compose.rs`, `compose/play.rs`).
 //!
 //! Started on first use (`Gpu::start_offscreen`, no screen of its own): its MMUs map the pool,
-//! the LCD shadow (the compositor's target) and the whole heap (model buffers, sprites, the
-//! flash shadow's pictures), so frames can draw into any of them and sample textures where they
+//! the LCD shadow (the compositor's target) and the whole heap (sprites, the flash shadow's
+//! pictures), so frames can draw into any of them and sample textures where they
 //! are. Each user points the GPU at its own target before a frame (`Gpu::set_target`).
 //!
 //! **UI programs.** The compositor's shader pairs (`shaders/ui_flat`, `shaders/ui_round`, `shaders/ui_cov`, `shaders/ui_band`,

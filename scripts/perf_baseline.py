@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FERRITE_UI = Path(os.environ.get("FERRITE_UI", ROOT.parent / "ferrite-ui"))
 CLI = FERRITE_UI / "tools" / "ferrite_cli.py"
 BUILD = FERRITE_UI / "tools" / "ferrite_build.py"
-EXAMPLES = ["bench", "tablet", "scroll", "paint", "layers", "multitask", "launcher", "model3d"]
+EXAMPLES = ["bench", "tablet", "scroll", "paint", "layers", "multitask", "launcher"]
 
 
 def get(host, path):

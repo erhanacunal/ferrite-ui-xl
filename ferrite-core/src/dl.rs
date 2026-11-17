@@ -66,7 +66,7 @@ pub static DIRECT: AtomicU32 = AtomicU32::new(0);
 pub static STORES: AtomicU32 = AtomicU32::new(0);
 pub static EVICTS: AtomicU32 = AtomicU32::new(0);
 pub static BYTES: AtomicU32 = AtomicU32::new(0);
-/// Count the calls of the frames played (`render::submit` in `MODE_PLAY`)
+/// Count the calls of the frames played (`render::submit` in `MODE_AREAS`)
 /// by opcode (`OP_CALLS` / `OP_WORDS`; sim `FERRITE_SIM_OP_STATS=1`, exynos
 /// `POST /api/rcore?ops=1`): what a GPU player of the lists must cover.
 pub static OP_STATS: AtomicBool = AtomicBool::new(false);

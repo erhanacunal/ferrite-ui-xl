@@ -43,16 +43,11 @@ static JOB: AtomicU8 = AtomicU8::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 /// Jobs go to CPU2 (`POST /api/rcore?on=`); off = CPU0 runs them.
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
-/// The render mode asked for (`POST /api/rcore?mode=0|1|2|3`:
-/// `render::MODE_NORMAL` / `MODE_PLAIN` / `MODE_PLAY` / `MODE_AREAS`), applied
-/// by CPU0 between passes ([`service`]). Areas (the GPU player) at boot.
-pub static MODE: AtomicU8 = AtomicU8::new(ferrite_core::render::MODE_AREAS);
-
-/// CPU0, `frame_end`: a render mode asked for over HTTP.
+/// CPU0, `frame_end`: the board renders in `render::MODE_AREAS` only (the GPU player;
+/// the VM pool's mode survives program loads, this sets it once).
 pub fn service(ctx: &mut Ctx<P>) {
-    let mode = MODE.load(Ordering::Relaxed);
-    if ctx.objs.render_mode() != mode {
-        ctx.objs.set_render_mode(mode);
+    if ctx.objs.render_mode() != ferrite_core::render::MODE_AREAS {
+        ctx.objs.set_render_mode(ferrite_core::render::MODE_AREAS);
     }
 }
 

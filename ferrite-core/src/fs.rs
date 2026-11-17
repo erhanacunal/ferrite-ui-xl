@@ -66,8 +66,8 @@ pub const RES_SOUND: u8 = 6;
 /// Triangle mesh for 3D model widgets (`ferrite_build.convert_mesh` from an
 /// OBJ file): header magic "MS", version 1, flags, triangle count u32 LE, then
 /// three vertices per triangle, each position x/y/z and normal x/y/z as i16 LE
-/// (/ 32767; the model centred and scaled to radius 1). Read by board renderers
-/// (exynos4412 `model3d.rs`).
+/// (/ 32767; the model centred and scaled to radius 1). For board renderers (none
+/// draws models now: exynos4412's `model3d.rs` went with its render mode 0, 2026-11-17).
 pub const RES_MESH: u8 = 7;
 /// `Fs::find_kind` wildcard.
 pub const RES_ANY: u8 = 0xFF;

@@ -180,13 +180,11 @@ pub(crate) struct RenderState {
     /// VM pool: how the render side draws (`render::MODE_*`,
     /// `ObjPool::set_render_mode`).
     pub(crate) mode: u8,
-    /// Render pool: draw with the core's own CPU drawing only (no board
-    /// renderer, layers or pixel moves): `MODE_PLAIN`, `MODE_PLAY`.
-    pub(crate) plain: bool,
     /// Render pool, `MODE_AREAS`: dirty renders repaint whole areas, back to
-    /// front (`render::paint_areas`), not through the passes.
+    /// front (`render::paint_areas`), not through the passes, with the core's
+    /// own drawing only (no board renderer or pixel moves).
     pub(crate) areas: bool,
-    /// Render pool, `MODE_PLAY`: the frame being recorded (everything the
+    /// Render pool, `MODE_AREAS`: the frame being recorded (everything the
     /// render draws goes here while it is busy, `render::screen!`), then the
     /// list the render side plays.
     pub(crate) frame: crate::dl::Recorder,
@@ -222,7 +220,6 @@ impl RenderState {
             recs: Vec::new(),
             msgs: Vec::new(),
             mode: 0,
-            plain: false,
             areas: false,
             frame: crate::dl::Recorder::new(),
             commit: None,

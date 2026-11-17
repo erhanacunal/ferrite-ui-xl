@@ -15,7 +15,7 @@ use crate::widget::{
 };
 
 /// The canvas the render draws on: the screen, or the frame being recorded
-/// (`MODE_PLAY`, `RenderState::frame`).
+/// (`MODE_AREAS`, `RenderState::frame`).
 macro_rules! screen {
     ($ctx:expr, |$c:ident| $body:expr) => {
         if $ctx.objs.render.frame.busy() {
@@ -28,32 +28,29 @@ macro_rules! screen {
     };
 }
 
-/// Render modes (`ObjPool::set_render_mode`; experiments, with a render
-/// context). Normal: the render side holds the widgets (`view.rs`) and
-/// renders them, with the board's renderer, layers and pixel moves.
+/// Render modes (`ObjPool::set_render_mode`, with a render context). Normal:
+/// the render side holds the widgets (`view.rs`) and renders them, with the
+/// board's renderer, layers and pixel moves (the sim's default, the golden
+/// frames' reference).
 pub const MODE_NORMAL: u8 = 0;
-/// As normal, but only the core's own CPU drawing: what `MODE_PLAY` draws,
-/// rendered the normal way (its baseline).
-pub const MODE_PLAIN: u8 = 1;
-/// The render side only plays commands: the VM's core runs the whole render
-/// (sync, tree walk, clipping, restores) with every drawing call recorded
-/// into one display list a frame (`RenderState::frame`), and hands that to
-/// the render side (`RenderJob::Play`), which needs nothing of the widgets.
-pub const MODE_PLAY: u8 = 2;
-/// As play, but recorded in compositor order: each changed area
+/// The render side only plays commands (exynos: always): the VM's core runs
+/// the render with every drawing call recorded into one display list a frame
+/// (`RenderState::frame`) in compositor order: each changed area
 /// (`compose_dirty`'s) repainted whole, every widget touching it back to
-/// front, after an area marker (`Canvas::area`); no clip regions, restores
-/// or occluders. The board may play it its own way (`WidgetRenderer::play`,
-/// a GPU), else it is replayed on the CPU like play.
+/// front, after an area marker (`Canvas::area`); no clip regions, restores,
+/// occluders or board renderer (the core's own drawing). The render side
+/// (`RenderJob::Play`) needs nothing of the widgets: the board plays it its
+/// own way (`WidgetRenderer::play`, a GPU), else it is replayed on the CPU.
+/// (The value is the old mode number: 1 and 2 were experiments, removed.)
 pub const MODE_AREAS: u8 = 3;
 
-/// Frames recorded for the render side to play (`MODE_PLAY`), their
-/// commands and their bytes, since boot.
 /// `MODE_AREAS` keeps composed layers (a root over which something is drawn records
 /// `Canvas::compose_layer`, the GPU player samples the surface); off = such a layer goes
 /// back to the tree, as before (exynos `POST /api/compose?layer_compose=0|1`).
 pub static AREAS_COMPOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
+/// Frames recorded for the render side to play (`MODE_AREAS`), their
+/// commands and their bytes, since boot.
 pub static PLAYS: [core::sync::atomic::AtomicU32; 3] = [const { core::sync::atomic::AtomicU32::new(0) }; 3];
 
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
@@ -265,7 +262,7 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
 /// A render the render side runs (`Platform::render_start`, `run_job`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderJob {
-    /// Play the frame recorded on the VM's core (`MODE_PLAY`): no render.
+    /// Play the frame recorded on the VM's core (`MODE_AREAS`): no render.
     Play,
     /// `render_dirty`.
     Dirty,
@@ -352,7 +349,7 @@ pub fn records<P: Platform>(ctx: &Ctx<P>) -> bool {
 /// `capture_paint` for a recorded `on_paint` list: replayed into the board
 /// renderer's capture with the scissor on the widget's box, if it takes it.
 fn capture_list<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: &crate::dl::List) -> bool {
-    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || r.objs.render.plain || !r.objs.is_tree_visible(id) {
+    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || r.objs.render.areas || !r.objs.is_tree_visible(id) {
         return false;
     }
     let abs = r.objs.absolute_rect(id);
@@ -418,9 +415,8 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
     };
     let t0 = crate::perf::now();
     let mode = ctx.objs.render.mode;
-    r.objs.render.plain = mode != MODE_NORMAL;
     r.objs.render.areas = mode == MODE_AREAS;
-    let job = if mode == MODE_PLAY || mode == MODE_AREAS {
+    let job = if mode == MODE_AREAS {
         // The whole render here, into a list: the render side plays it.
         sync_render_ctx(ctx, &mut r, false);
         r.objs.render.frame.begin(&r.lcd);
@@ -654,7 +650,7 @@ fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
     let active = layers_sync(ctx);
 
     // A board that repaints whole areas (a GPU) takes the render over.
-    let composes = <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.plain;
+    let composes = <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.areas;
     if active == 0 && (composes || ctx.objs.render.areas) && compose_dirty(ctx, false) {
         ctx.objs.geo_end();
         return;
@@ -982,11 +978,11 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
             a.union(&b)
         }
     };
-    // Plain drawing: no layers (dropped ones go back to the tree below). Areas
-    // (`MODE_AREAS`) record the layers' areas for the player too (`layer_areas`),
-    // composed ones too: a composed root records `Canvas::compose_layer`.
+    // Areas (`MODE_AREAS`) record the layers' areas for the player too
+    // (`layer_areas`), composed ones too: a composed root records
+    // `Canvas::compose_layer`.
     let areas = ctx.objs.render.areas;
-    let count = if ctx.objs.render.plain && !areas { 0 } else { ctx.lcd.layer_count() };
+    let count = ctx.lcd.layer_count();
     let can_compose = ctx.lcd.can_compose() && (!areas || AREAS_COMPOSE.load(core::sync::atomic::Ordering::Relaxed));
     let mut active = 0;
     let mut composed = 0u8;
@@ -1415,7 +1411,7 @@ const SHIFT_MAX: usize = crate::clip::MAX_CLIP_RECTS;
 #[inline(never)]
 fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Restores) {
     ctx.objs.render.shifted.clear();
-    if !settled || ctx.lcd.is_portrait() || ctx.objs.render.plain {
+    if !settled || ctx.lcd.is_portrait() || ctx.objs.render.areas {
         return;
     }
     let screen = screen_rect(&ctx.lcd);
@@ -1875,7 +1871,7 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
         crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
         return;
     }
-    if ctx.objs.render.plain || !P::Renderer::draw(ctx, id, abs, clip) {
+    if ctx.objs.render.areas || !P::Renderer::draw(ctx, id, abs, clip) {
         draw_body(ctx, id, abs, clip);
     }
     crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));

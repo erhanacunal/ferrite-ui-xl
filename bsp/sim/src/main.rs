@@ -172,17 +172,12 @@ fn main() {
         tasks: ferrite_core::task::TaskTable::new(),
     });
 
-    // `FERRITE_SIM_PLAY=1`: the render side only plays the display list of each frame, which
-    // the VM's side records (`render::MODE_PLAY`); `FERRITE_SIM_PLAIN=1`: its baseline, the
-    // same plain drawing rendered the normal way (`MODE_PLAIN`).
-    // `FERRITE_SIM_AREAS=1`: as play, recorded in compositor order (`render::MODE_AREAS`).
+    // `FERRITE_SIM_AREAS=1`: the board's mode: the render side only plays the display list of
+    // each frame, which the VM's side records in compositor order (`render::MODE_AREAS`;
+    // replayed on the CPU here).
     let mut ctx = ctx;
     if std::env::var_os("FERRITE_SIM_AREAS").is_some() {
         ctx.objs.set_render_mode(ferrite_core::render::MODE_AREAS);
-    } else if std::env::var_os("FERRITE_SIM_PLAY").is_some() {
-        ctx.objs.set_render_mode(ferrite_core::render::MODE_PLAY);
-    } else if std::env::var_os("FERRITE_SIM_PLAIN").is_some() {
-        ctx.objs.set_render_mode(ferrite_core::render::MODE_PLAIN);
     }
     // `FERRITE_SIM_OP_STATS=1`: count the played frames' calls by opcode (printed at exit).
     if std::env::var_os("FERRITE_SIM_OP_STATS").is_some() {

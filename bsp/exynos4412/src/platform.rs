@@ -186,7 +186,11 @@ impl PlatformRuntime for Exynos4412Platform {
             crate::battery::SYS_BATTERY_MV | crate::battery::SYS_BATTERY_PERCENT | crate::battery::SYS_CHARGER => {
                 crate::battery::syscall(id)
             }
-            crate::model3d::SYS_SHAPE..=crate::model3d::SYS_MESH => crate::model3d::syscall(id, args, objs),
+            // 3D model syscalls (lib/model3d.fl): no 3D drawing since the board renders in
+            // `MODE_AREAS` only, so a model widget shows its background (as on the sim);
+            // setters succeed, stats are 0.
+            0x60..=0x63 | 0x65 => Some(1),
+            0x64 => Some(0),
             ferrite_core::setup::SYS_WIFI_STATE..=ferrite_core::setup::SYS_WIFI_SCANS => {
                 crate::setup::syscall(id, args, objs)
             }

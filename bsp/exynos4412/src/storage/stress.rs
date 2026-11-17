@@ -1,7 +1,7 @@
 //! Power-loss testing on USERDATA: a write load to cut the power under, and a check for after.
 //!
-//! [`set`] starts or stops the load (never across a restart); [`step`] does one operation per
-//! main-loop pass, on CPU0, in `/stress/` (outside `FERRITE/` and programs' reach):
+//! [`set`] starts or stops the load (never across a restart); [`step`] runs operations for
+//! 40 ms of each main-loop pass, on CPU0, in `/stress/` (outside `FERRITE/` and programs' reach):
 //! - rewrites `f0.bin`…`f7.bin` the safe way (`ext4::save_in`: `NAME.new`, rename, commit),
 //!   4 KiB to 260 KiB each, every one self-checking (header: magic, sequence, length, CRC-32);
 //! - appends 32-byte records to `log.bin`, committing every fourth (as a program's writes);
@@ -103,11 +103,19 @@ pub fn set(on: bool) -> Result<String, String> {
     Ok(format!("stress {} (sequence {})\n", if on { "on" } else { "off" }, unsafe { SEQ }))
 }
 
-/// One operation of the load, when it is on. CPU0, once per pass.
+/// The load's share of each pass: steps run back to back for this long, so the card is busy
+/// nearly all the time and a power cut likely lands inside a write or a commit.
+const PASS_MS: u32 = 40;
+
+/// Operations of the load for [`PASS_MS`], when it is on. CPU0, once per pass.
 pub fn step() {
-    if unsafe { !ON } {
-        return;
+    let start = crate::systick::millis();
+    while unsafe { ON } && crate::systick::millis().wrapping_sub(start) < PASS_MS {
+        one();
     }
+}
+
+fn one() {
     let seq = unsafe {
         SEQ += 1;
         SEQ

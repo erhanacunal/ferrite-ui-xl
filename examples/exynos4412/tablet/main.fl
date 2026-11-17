@@ -11,6 +11,7 @@
 // State shared with the apps travels in the runProgram argument (ui.fl).
 
 #include "ui.fl"
+#include "gesture.fl"
 
 #hint_widgets 140 140
 
@@ -41,6 +42,8 @@ var drawer_handle;
 var notif;
 
 var pager;
+var pager_drag = 0;      // a finger is dragging the pager
+var pager_drag_end = 0;  // millis() when the last drag ended
 var page_dot0; var page_dot1;
 var glance_time; var glance_date;
 var perf_big; var perf_sub; var perf_graph;
@@ -409,9 +412,55 @@ fn go_page(p) {
     if (p == ui_page) {
         return 0;
     }
+    settle_page(p, 360);
+}
+
+// Slides the pager to page p from wherever it is.
+fn settle_page(p, ms) {
     ui_page = p;
-    animate(pager, PROP_LOC_X, -SCREEN_W * p, 360, EASE_OUT);
+    animate(pager, PROP_LOC_X, -SCREEN_W * p, ms, EASE_OUT);
     show_page();
+}
+
+// The pager follows a horizontal drag; on release it settles on the page a
+// fling points to, else on the one showing most.
+fn pager_gesture(w, e) {
+    if (e == GE_DRAG_START) {
+        if (launching || shade_open || drawer_open) {
+            return 0;
+        }
+        pager_drag = 1;
+        stopAnimProp(pager, PROP_LOC_X);
+    } else if (e == GE_DRAG_UPDATE) {
+        if (!pager_drag) {
+            return 0;
+        }
+        target(pager);
+        var x = get(loc_x) + gestureInfo(GI_DX);
+        // Past either end it moves at a third of the finger's speed.
+        if (x > 0 || x < -SCREEN_W) {
+            x = get(loc_x) + gestureInfo(GI_DX) / 3;
+        }
+        if (x > SCREEN_W / 4) { x = SCREEN_W / 4; }
+        if (x < -SCREEN_W - SCREEN_W / 4) { x = -SCREEN_W - SCREEN_W / 4; }
+        set(loc_x, x);
+    } else if (e == GE_DRAG_END) {
+        if (!pager_drag) {
+            return 0;
+        }
+        pager_drag = 0;
+        pager_drag_end = millis();
+        target(pager);
+        var at = get(loc_x);
+        var vx = gestureInfo(GI_VX);
+        var p = at < -SCREEN_W / 2 ? 1 : 0;
+        if (vx < -300) { p = 1; }
+        if (vx > 300) { p = 0; }
+        // Time for the rest of the way: shorter the less is left.
+        var left = at + SCREEN_W * p;
+        if (left < 0) { left = -left; }
+        settle_page(p, 120 + left * 240 / SCREEN_W);
+    }
 }
 
 fn open_drawer(open) {
@@ -459,8 +508,10 @@ fn on_swipe(dir, w, delta) {
         if (dir == SWIPE_DOWN) { open_drawer(0); }
         return 0;
     }
-    if (dir == SWIPE_LEFT) { go_page(1); }
-    if (dir == SWIPE_RIGHT) { go_page(0); }
+    // A swipe on the pager is its drag (pager_gesture); one elsewhere pages too.
+    var dragged = pager_drag || millis() - pager_drag_end < 300;
+    if (dir == SWIPE_LEFT && !dragged) { go_page(1); }
+    if (dir == SWIPE_RIGHT && !dragged) { go_page(0); }
     if (dir == SWIPE_DOWN) { open_shade(1); }
     if (dir == SWIPE_UP) { open_drawer(1); }
 }
@@ -633,6 +684,7 @@ fn setup() {
     // Layer 1 (a FIMD window on the board): a page slide moves the window,
     // nothing is redrawn for it.
     set(layer, 1);
+    onGesture(pager, GESTURE_HDRAG, @pager_gesture);
     var pg0 = alloc();
     style_group(0, 0, SCREEN_W, 560);
     parent(pager);

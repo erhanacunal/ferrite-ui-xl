@@ -16,6 +16,8 @@
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/storage` | where the files are (`medium=USERDATA fs=ext4 size_mib=… free_mib=…`, or `medium=CACHE fs=fat32`) |
 //! | `POST /api/storage/migrate` | formats USERDATA (ext4), copies `FERRITE/` and `SYSTEM/` from CACHE, verifies and switches to it (`storage::migrate`); 409 with the report if it refused or failed. Blocks the UI for its seconds |
+//! | `POST /api/storage/stress?on=0\|1` | power-loss test load on USERDATA (`storage::stress`), off again after a restart |
+//! | `GET /api/storage/check` | `Ext4::check` of USERDATA plus the stress files' contents; 409 when something is wrong |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
 //! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; `?scene=0\|1` syncs update the render pool's scene / capture it whole (`/api/status` `scene`); counters and the jobs' time breakdown in `/api/status` `rcore` |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
@@ -272,6 +274,29 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
 ").await?,
         },
         (b"POST", b"/api/storage/migrate") => match super::storage_request(super::STORAGE_MIGRATE, 600).await {
+            Some((true, t)) => text(socket, "200 OK", &t).await?,
+            Some((false, t)) => text(socket, "409 Conflict", &t).await?,
+            None => text(socket, "503 Service Unavailable", "No answer from the UI core
+").await?,
+        },
+        (b"POST", b"/api/storage/stress") => {
+            let what = match query_param(query, b"on") {
+                Some(b"1") => Some(super::STORAGE_STRESS_ON),
+                Some(b"0") => Some(super::STORAGE_STRESS_OFF),
+                _ => None,
+            };
+            match what {
+                None => text(socket, "400 Bad Request", "on=0|1
+").await?,
+                Some(what) => match super::storage_request(what, 10).await {
+                    Some((true, t)) => text(socket, "200 OK", &t).await?,
+                    Some((false, t)) => text(socket, "409 Conflict", &t).await?,
+                    None => text(socket, "503 Service Unavailable", "No answer from the UI core
+").await?,
+                },
+            }
+        }
+        (b"GET", b"/api/storage/check") => match super::storage_request(super::STORAGE_CHECK, 120).await {
             Some((true, t)) => text(socket, "200 OK", &t).await?,
             Some((false, t)) => text(socket, "409 Conflict", &t).await?,
             None => text(socket, "503 Service Unavailable", "No answer from the UI core

@@ -1047,6 +1047,9 @@ static STORAGE_WANTED: AtomicU8 = AtomicU8::new(STORAGE_NONE);
 const STORAGE_NONE: u8 = 0;
 pub const STORAGE_STATUS: u8 = 1;
 pub const STORAGE_MIGRATE: u8 = 2;
+pub const STORAGE_STRESS_ON: u8 = 3;
+pub const STORAGE_STRESS_OFF: u8 = 4;
+pub const STORAGE_CHECK: u8 = 5;
 static STORAGE_TEXT: CriticalSectionMutex<RefCell<Option<(bool, String)>>> = CriticalSectionMutex::new(RefCell::new(None));
 
 /// CPU3: asks CPU0 for `what` (`STORAGE_STATUS` or `STORAGE_MIGRATE`); None when it does not
@@ -1076,6 +1079,14 @@ fn storage_service() {
         STORAGE_MIGRATE => match crate::storage::migrate() {
             Ok(report) => (true, report),
             Err(report) => (false, report),
+        },
+        STORAGE_STRESS_ON | STORAGE_STRESS_OFF => match crate::storage::stress::set(what == STORAGE_STRESS_ON) {
+            Ok(t) => (true, t),
+            Err(t) => (false, t),
+        },
+        STORAGE_CHECK => match crate::storage::stress::check() {
+            Ok(t) => (true, t),
+            Err(t) => (false, t),
         },
         _ => return,
     };

@@ -24,6 +24,7 @@
 
 mod ext4;
 mod fat;
+pub mod stress;
 
 use alloc::format;
 use alloc::string::String;
@@ -154,6 +155,9 @@ pub fn save_in(dir: &str, name: &str, data: &[u8]) -> bool {
 /// EEPROM file. Before a restart or power-off (`force`), and from
 /// `frame_end` (`force` false: once writes have settled).
 pub fn sync(force: bool) {
+    if !force && medium() == Medium::UserData {
+        stress::step();
+    }
     BoardStorage.flush(force);
     crate::eeprom::save_if_dirty(force);
 }
@@ -164,6 +168,9 @@ pub fn status_text() -> String {
     match medium() {
         Medium::UserData => {
             let _ = write!(s, "medium=USERDATA fs=ext4");
+            if let Some((unclean, replayed)) = ext4::mount_state() {
+                let _ = write!(s, " mount_unclean={} replayed={}", unclean as u8, replayed as u8);
+            }
             if let Some(st) = ext4::stats() {
                 let _ = write!(
                     s,

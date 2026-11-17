@@ -298,6 +298,69 @@ pub fn save_in(dir: &str, name: &str, data: &[u8]) -> bool {
     }
 }
 
+/// Appends `data` to `dir`/`name` (made if missing); commits if `commit`.
+pub fn append(dir: &str, name: &str, data: &[u8], commit: bool) -> Result<(), E> {
+    let fs = fs().ok_or(E::Io)?;
+    let at = path(dir, name);
+    let ino = match fs.lookup(&at)? {
+        Some(ino) => ino,
+        None => fs.create(&at)?,
+    };
+    let size = fs.metadata(ino)?.size;
+    if fs.write_at(ino, size, data)? != data.len() {
+        return Err(E::NoSpace);
+    }
+    if commit { fs.sync() } else { Ok(()) }
+}
+
+/// Writes `dir`/`name` (replacing it) without committing.
+pub fn write_new(dir: &str, name: &str, data: &[u8]) -> Result<(), E> {
+    let fs = fs().ok_or(E::Io)?;
+    let at = path(dir, name);
+    let ino = match fs.lookup(&at)? {
+        Some(ino) => {
+            fs.set_len(ino, 0)?;
+            ino
+        }
+        None => fs.create(&at)?,
+    };
+    if fs.write_at(ino, 0, data)? != data.len() {
+        return Err(E::NoSpace);
+    }
+    Ok(())
+}
+
+/// Removes `dir`/`name` if it is there, without committing.
+pub fn remove(dir: &str, name: &str) -> Result<(), E> {
+    match fs().ok_or(E::Io)?.remove(&path(dir, name)) {
+        Ok(()) | Err(E::NotFound) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The names in `dir` (`/`-separated from the root), as on disk: (name, is a directory).
+pub fn list_dir(dir: &str) -> Option<Vec<(String, bool)>> {
+    let fs = fs()?;
+    let ino = fs.lookup(&lower(&format!("/{}", dir))).ok()??;
+    let mut out = Vec::new();
+    fs.read_dir(ino, |e| {
+        out.push((String::from_utf8_lossy(e.name).into_owned(), e.kind == FsKind::Dir));
+        true
+    })
+    .ok()?;
+    Some(out)
+}
+
+/// What mount found: (not cleanly unmounted, a transaction replayed).
+pub fn mount_state() -> Option<(bool, bool)> {
+    fs().map(|fs| fs.mount_state())
+}
+
+/// `Ext4::check` of the whole file system.
+pub fn check() -> Result<ext4_rs::CheckReport, E> {
+    fs().ok_or(E::Io)?.check()
+}
+
 /// Makes directory `dir` (`/`-separated from the root) unless it is there.
 pub fn make_dirs(dir: &str) -> bool {
     let Some(fs) = fs() else { return false };

@@ -80,6 +80,10 @@ use crate::systick;
 #[path = "lcd_layers.rs"]
 mod layers;
 
+#[path = "lcd_region.rs"]
+pub mod region;
+use region::{EMPTY, Rect, Region, is_empty, union};
+
 /// Layer shadows drawn through the uncached alias (`layers::UNCACHED`).
 pub use layers::UNCACHED as LAYER_UNCACHED;
 
@@ -112,22 +116,10 @@ const SCAN_B: usize = 1;
 const SHADOW: usize = 2;
 /// Inside `begin_frame` .. `end_frame` (buffered mode): `back_buf` is 1 then.
 static mut IN_FRAME: bool = false;
-/// Dirty box since the last hand-over: x0, y0, x1, y1 (exclusive); x0 > x1 =
-/// empty. CPU0 only.
-static mut DIRTY: Rect = EMPTY;
+/// What was drawn since the last hand-over (a few boxes, `region`). CPU0 only.
+static mut DIRTY: Region = Region::EMPTY;
 
 static mut CURSOR: fb::StreamCursor = fb::StreamCursor::new();
-
-type Rect = [usize; 4];
-const EMPTY: Rect = [usize::MAX, usize::MAX, 0, 0];
-
-fn union(a: Rect, b: Rect) -> Rect {
-    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
-}
-
-fn is_empty(r: &Rect) -> bool {
-    r[0] >= r[2]
-}
 
 fn buf_ptr(index: usize) -> *mut u32 {
     // SAFETY: in bounds of the static array.
@@ -278,8 +270,7 @@ pub fn end_sprite(px: *const u32, words: usize) {
 
 fn mark(x: usize, y: usize, w: usize, h: usize) {
     unsafe {
-        let d = &mut *(&raw mut DIRTY);
-        *d = union(*d, [x, y, x + w, y + h]);
+        (*(&raw mut DIRTY)).add([x, y, x + w, y + h], region::limit());
     }
 }
 
@@ -359,9 +350,12 @@ static FLIP_AT: AtomicU32 = AtomicU32::new(0);
 /// The G2D present in flight: CPU0 only, used by the task and by the G2D
 /// interrupt, so every user but the interrupt masks IRQs around it.
 struct G2dJob {
-    /// The box being copied (`prev ∪ req`).
-    r: Rect,
-    /// End of the band the G2D copies now (rows `COPY_LO..band_end`).
+    /// The boxes being copied (`prev ∪ req`), from the top down.
+    r: Region,
+    /// The box being copied now, and the first row of its band in flight.
+    k: usize,
+    y: usize,
+    /// End of the band the G2D copies now (rows `y..band_end` of box `k`).
     band_end: usize,
     /// The back scan buffer: physical address (G2D) and non-cacheable alias
     /// (CPU fallback).
@@ -375,7 +369,9 @@ struct JobCell(UnsafeCell<G2dJob>);
 unsafe impl Sync for JobCell {}
 
 static JOB: JobCell = JobCell(UnsafeCell::new(G2dJob {
-    r: EMPTY,
+    r: Region::EMPTY,
+    k: 0,
+    y: 0,
     band_end: 0,
     back: 0,
     nc: 0,
@@ -393,10 +389,10 @@ static PRESENTER: AtomicBool = AtomicBool::new(false);
 /// The presenter's own state: touched by one core at a time (CPU0 before
 /// CPU2 starts, CPU2 after), handed over through `STATE`/`smp::start_cpu`.
 struct Present {
-    /// The box CPU0 handed over (written before `STATE` = COPY).
-    req: Rect,
-    /// The box of the previous present: the back buffer still lacks it.
-    prev: Rect,
+    /// The boxes CPU0 handed over (written before `STATE` = COPY).
+    req: Region,
+    /// The boxes of the previous present: the back buffer still lacks them.
+    prev: Region,
     /// Scan buffer the FIMD shows now.
     front: usize,
     /// Per scan buffer: its framebuffer (for `Fimd::show`), and where the
@@ -414,8 +410,8 @@ struct PresentCell(UnsafeCell<Present>);
 unsafe impl Sync for PresentCell {}
 
 static PRESENT: PresentCell = PresentCell(UnsafeCell::new(Present {
-    req: EMPTY,
-    prev: EMPTY,
+    req: Region::EMPTY,
+    prev: Region::EMPTY,
     front: SCAN_A,
     fb: [None, None],
     nc: [0, 0],
@@ -482,14 +478,14 @@ pub static DIRECT: AtomicBool = AtomicBool::new(true);
 pub static DIRECT_COUNTS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 /// The box the shadow lacks (x0, y0, x1, y1), and that it is not empty. One core
 /// at a time (the render job's, or CPU0 between jobs), as the shadow.
-static mut STALE: Rect = EMPTY;
+static mut STALE: Region = Region::EMPTY;
 static STALE_ANY: AtomicBool = AtomicBool::new(false);
 /// The scan buffer holding the newest picture while `STALE_ANY`.
 static LATEST: AtomicUsize = AtomicUsize::new(SCAN_A);
 /// A direct frame is drawn in the back buffer and waits for [`flush`] to show
 /// it; `DIRECT_BOX` = what it drew there (its present's box).
 static DIRECT_PENDING: AtomicBool = AtomicBool::new(false);
-static mut DIRECT_BOX: Rect = EMPTY;
+static mut DIRECT_BOX: Region = Region::EMPTY;
 
 /// The scan buffer the direct frame draws.
 static DIRECT_TARGET: AtomicUsize = AtomicUsize::new(SCAN_B);
@@ -505,7 +501,7 @@ pub fn direct_begin(areas: &[UiRect]) -> Option<(usize, usize, usize, usize)> {
     if !DIRECT.load(Ordering::Relaxed) || PRESENTER.load(Ordering::Acquire) || !G2D_ON.load(Ordering::Relaxed) {
         return None;
     }
-    let waiting = unsafe { !is_empty(&*(&raw const DIRTY)) };
+    let waiting = unsafe { !(*(&raw const DIRTY)).is_empty() };
     let state = STATE.load(Ordering::Acquire);
     if state == COPY || waiting || DIRECT_PENDING.load(Ordering::Acquire) {
         DIRECT_COUNTS[1].fetch_add(1, Ordering::Relaxed);
@@ -523,12 +519,15 @@ pub fn direct_begin(areas: &[UiRect]) -> Option<(usize, usize, usize, usize)> {
         }
     }
     DIRECT_TARGET.store(back, Ordering::Relaxed);
-    let covered = areas.iter().any(|a| {
-        let (x, y) = (a.x.max(0) as usize, a.y.max(0) as usize);
-        x <= prev[0] && y <= prev[1] && prev[2] <= x + a.w as usize && prev[3] <= y + a.h as usize
-    });
-    if !is_empty(&prev) && !covered {
-        let (x, y, w, h) = (prev[0], prev[1], prev[2] - prev[0], prev[3] - prev[1]);
+    for b in prev.boxes() {
+        let covered = areas.iter().any(|a| {
+            let (x, y) = (a.x.max(0) as usize, a.y.max(0) as usize);
+            x <= b[0] && y <= b[1] && b[2] <= x + a.w as usize && b[3] <= y + a.h as usize
+        });
+        if covered {
+            continue;
+        }
+        let (x, y, w, h) = (b[0], b[1], b[2] - b[0], b[3] - b[1]);
         if !g2d_copy_argb(src, dst, W, H, x, y, w, h) {
             let (s, d) = (p.nc[front] as *const u32, p.nc[back] as *mut u32);
             if s.is_null() || d.is_null() {
@@ -541,16 +540,13 @@ pub fn direct_begin(areas: &[UiRect]) -> Option<(usize, usize, usize, usize)> {
         }
         COPY_BYTES.fetch_add((w * h * 4) as u32, Ordering::Relaxed);
     }
-    unsafe { *(&raw mut DIRECT_BOX) = EMPTY };
+    unsafe { *(&raw mut DIRECT_BOX) = Region::EMPTY };
     Some((dst, W * 4, W, H))
 }
 
 /// The GPU drew rect (`x`, `y`, `w`, `h`) of the direct frame.
 pub fn direct_drew(x: usize, y: usize, w: usize, h: usize) {
-    unsafe {
-        let b = &mut *(&raw mut DIRECT_BOX);
-        *b = union(*b, [x, y, x + w, y + h]);
-    }
+    unsafe { (*(&raw mut DIRECT_BOX)).add([x, y, x + w, y + h], region::limit()) };
 }
 
 /// The direct frame is complete (`ok`): it waits for [`flush`]; the shadow lacks
@@ -560,10 +556,10 @@ pub fn direct_end(ok: bool) {
     // SAFETY: a barrier only: the GPU's writes before the FIMD's reads.
     unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
     let b = unsafe { *(&raw const DIRECT_BOX) };
-    if !ok || is_empty(&b) {
+    if !ok || b.is_empty() {
         return;
     }
-    unsafe { *(&raw mut STALE) = union(*(&raw const STALE), b) };
+    unsafe { (*(&raw mut STALE)).add_region(&b, region::limit()) };
     LATEST.store(DIRECT_TARGET.load(Ordering::Relaxed), Ordering::Relaxed);
     STALE_ANY.store(true, Ordering::Release);
     DIRECT_COUNTS[0].fetch_add(1, Ordering::Relaxed);
@@ -575,24 +571,26 @@ pub fn direct_end(ok: bool) {
 #[cold]
 #[inline(never)]
 fn sync_shadow() {
-    let b = unsafe { core::mem::replace(&mut *(&raw mut STALE), EMPTY) };
+    let stale = unsafe { core::mem::replace(&mut *(&raw mut STALE), Region::EMPTY) };
     STALE_ANY.store(false, Ordering::Release);
-    if is_empty(&b) {
+    if stale.is_empty() {
         return;
     }
     let i = LATEST.load(Ordering::Relaxed);
-    let (x, y, w, h) = (b[0], b[1], b[2] - b[0], b[3] - b[1]);
     DIRECT_COUNTS[2].fetch_add(1, Ordering::Relaxed);
-    DIRECT_COUNTS[3].fetch_add((w * h * 4) as u32, Ordering::Relaxed);
-    if g2d_copy_argb(buf_ptr(i) as usize, buf_ptr(SHADOW) as usize, W, H, x, y, w, h) {
-        return;
-    }
-    let s = present_state().nc[i] as *const u32;
-    let s = if s.is_null() { buf_ptr(i) as *const u32 } else { s };
-    let d = back();
-    for row in y..y + h {
-        // SAFETY: the box is on the screen; the scan buffer and the shadow are distinct.
-        unsafe { copy_row(s.add(row * W + x), d.add(row * W + x), w) };
+    DIRECT_COUNTS[3].fetch_add((stale.pixels() * 4) as u32, Ordering::Relaxed);
+    for b in stale.boxes() {
+        let (x, y, w, h) = (b[0], b[1], b[2] - b[0], b[3] - b[1]);
+        if g2d_copy_argb(buf_ptr(i) as usize, buf_ptr(SHADOW) as usize, W, H, x, y, w, h) {
+            continue;
+        }
+        let s = present_state().nc[i] as *const u32;
+        let s = if s.is_null() { buf_ptr(i) as *const u32 } else { s };
+        let d = back();
+        for row in y..y + h {
+            // SAFETY: the box is on the screen; the scan buffer and the shadow are distinct.
+            unsafe { copy_row(s.add(row * W + x), d.add(row * W + x), w) };
+        }
     }
 }
 
@@ -647,7 +645,7 @@ pub fn g2d_state() -> (bool, bool, bool) {
 /// copied and waiting for the scan-out switch). `flush` hands it over once
 /// that present is done; drawing more meanwhile is wasted.
 pub fn render_due() -> bool {
-    let nothing_waits = unsafe { is_empty(&*(&raw const DIRTY)) };
+    let nothing_waits = unsafe { (*(&raw const DIRTY)).is_empty() };
     let nothing_waits = nothing_waits && !layers::pending() && !DIRECT_PENDING.load(Ordering::Acquire);
     nothing_waits || STATE.load(Ordering::Acquire) == IDLE
 }
@@ -687,13 +685,13 @@ pub fn flush() {
             STATE.store(FLIP, Ordering::Release);
             return;
         }
-        if is_empty(d) {
+        if d.is_empty() {
             layers::commit_now(&commit);
             return;
         }
         present_state().layers = commit;
     }
-    if is_empty(d) {
+    if d.is_empty() {
         return;
     }
     if !PRESENTER.load(Ordering::Acquire) {
@@ -702,7 +700,7 @@ pub fn flush() {
             IDLE => {
                 let p = present_state();
                 p.req = *d;
-                *d = EMPTY;
+                *d = Region::EMPTY;
                 present(p, |_, _| {}, || {});
             }
             _ => {}
@@ -713,7 +711,7 @@ pub fn flush() {
         return;
     }
     present_state().req = *d;
-    *d = EMPTY;
+    *d = Region::EMPTY;
     // Every row is busy until CPU2 says which ones it copies.
     COPY_LO.store(0, Ordering::Relaxed);
     COPY_HI.store(H, Ordering::Relaxed);
@@ -744,7 +742,7 @@ pub fn service_present() {
 /// error screens that must be visible before what follows).
 pub fn flush_wait() {
     flush();
-    while unsafe { !is_empty(&*(&raw const DIRTY)) }
+    while unsafe { !(*(&raw const DIRTY)).is_empty() }
         || STATE.load(Ordering::Acquire) != IDLE
         || layers_pending()
         || DIRECT_PENDING.load(Ordering::Acquire)
@@ -763,7 +761,7 @@ pub fn flush_wait() {
 /// Nothing drawn waits to be presented and no present or layer change is in
 /// flight: `flush` has nothing to drive (CPU0 may sleep longer than a pass).
 pub fn settled() -> bool {
-    let nothing_drawn = unsafe { is_empty(&*(&raw const DIRTY)) } && !DIRECT_PENDING.load(Ordering::Acquire);
+    let nothing_drawn = unsafe { (*(&raw const DIRTY)).is_empty() } && !DIRECT_PENDING.load(Ordering::Acquire);
     nothing_drawn && STATE.load(Ordering::Acquire) == IDLE && !layers_pending()
 }
 
@@ -793,8 +791,8 @@ fn show(p: &mut Present, i: usize) -> Result<(), display::Error> {
     r
 }
 
-/// CPU0, IDLE, G2D on: starts the G2D present of `d` (+ the previous box).
-fn g2d_start(d: &mut Rect) {
+/// CPU0, IDLE, G2D on: starts the G2D present of `d` (+ the previous boxes).
+fn g2d_start(d: &mut Region) {
     let p = present_state();
     let back_i = 1 - p.front;
     let Some(back) = p.fb[back_i].as_ref().map(|fb| fb.address()) else {
@@ -802,8 +800,8 @@ fn g2d_start(d: &mut Rect) {
         return;
     };
     p.req = *d;
-    *d = EMPTY;
-    let r = union(p.prev, p.req);
+    *d = Region::EMPTY;
+    let r = copy_region(p);
     let nc = p.nc[back_i];
     let t0 = crate::perf::cycles();
     // The G2D reads DRAM: what this core drew is still in its L1 and in the
@@ -818,14 +816,17 @@ fn g2d_start(d: &mut Rect) {
         mmu::clean_l1_all();
         L2c::new().clean_all();
     }
-    COPY_LO.store(r[1], Ordering::Relaxed);
-    COPY_HI.store(r[3], Ordering::Relaxed);
+    let bounds = r.bounds();
+    COPY_LO.store(bounds[1], Ordering::Relaxed);
+    COPY_HI.store(bounds[3], Ordering::Relaxed);
     G2D_PRESENT_AT.store(systick::millis(), Ordering::Relaxed);
     STATE.store(COPY, Ordering::Release);
     let masked = cpu::mask_irq();
     let j = job();
     j.r = r;
-    j.band_end = r[1];
+    j.k = 0;
+    j.y = bounds[1];
+    j.band_end = bounds[1];
     j.back = back;
     j.nc = nc;
     {
@@ -870,14 +871,36 @@ fn g2d_step(by: usize) {
     }
 }
 
-/// IRQs masked: rows below `band_end` are copied; starts the next band, or
-/// switches the FIMD. A G2D that refuses → CPU copy of the rest.
+/// The first shadow row a copy at row `y` of box `k` may still read (boxes from
+/// the top down): it only grows as the copy goes on.
+fn copy_lo(r: &Region, k: usize, y: usize) -> usize {
+    r.boxes().get(k + 1).map_or(y, |b| y.min(b[1]))
+}
+
+/// What a present copies: the previous present's boxes and this one's, from the top down.
+fn copy_region(p: &Present) -> Region {
+    let mut r = p.prev;
+    r.add_region(&p.req, region::MAX);
+    r.sort_by_top();
+    r
+}
+
+/// IRQs masked: box `k`'s rows below `band_end` (and the boxes before) are
+/// copied; starts the next band, or switches the FIMD. A G2D that refuses →
+/// CPU copy of the rest.
 fn g2d_next(j: &mut G2dJob) {
+    while j.k < j.r.boxes().len() && j.band_end >= j.r.boxes()[j.k][3] {
+        j.k += 1;
+        if let Some(b) = j.r.boxes().get(j.k) {
+            j.band_end = b[1];
+        }
+    }
     let y = j.band_end;
-    COPY_LO.store(y, Ordering::Release);
-    if y < j.r[3] {
-        let y1 = (y + BAND).min(j.r[3]);
-        if g2d_rows(j.back, j.r[0], y, y1, j.r[2] - j.r[0]) {
+    COPY_LO.store(copy_lo(&j.r, j.k, y), Ordering::Release);
+    if let Some(&b) = j.r.boxes().get(j.k) {
+        let y1 = (y + BAND).min(b[3]);
+        if g2d_rows(j.back, b[0], y, y1, b[2] - b[0]) {
+            j.y = y;
             j.band_end = y1;
             return;
         }
@@ -914,22 +937,25 @@ fn g2d_abort() {
         let j = job();
         // From the band in flight on (the G2D may still write it: the same
         // pixels).
-        cpu_copy(j, COPY_LO.load(Ordering::Relaxed));
+        cpu_copy(j, j.y);
         g2d_finish(j);
     }
     cpu::restore_irq(masked);
 }
 
-/// Copies rows `y..` of the job's box with the CPU.
+/// Copies rows `y..` of the job's box `k`, then the boxes after it, with the CPU.
 fn cpu_copy(j: &G2dJob, y: usize) {
     let (src, dst) = (back(), j.nc as *mut u32);
-    let (x, w) = (j.r[0], j.r[2] - j.r[0]);
-    for row in y..j.r[3] {
-        let at = row * W + x;
-        // SAFETY: the box is clipped to the screen; `nc` is the back
-        // buffer's alias (G2D mode needs one).
-        unsafe { copy_row(src.add(at), dst.add(at), w) };
-        COPY_LO.store(row + 1, Ordering::Release);
+    for (k, b) in j.r.boxes().iter().enumerate().skip(j.k) {
+        let (x, w) = (b[0], b[2] - b[0]);
+        let from = if k == j.k { y.max(b[1]) } else { b[1] };
+        for row in from..b[3] {
+            let at = row * W + x;
+            // SAFETY: the box is clipped to the screen; `nc` is the back
+            // buffer's alias (G2D mode needs one).
+            unsafe { copy_row(src.add(at), dst.add(at), w) };
+            COPY_LO.store(copy_lo(&j.r, k, row + 1), Ordering::Release);
+        }
     }
 }
 
@@ -942,7 +968,7 @@ fn g2d_finish(j: &G2dJob) {
     {
         COPY_CYCLES.fetch_add(crate::perf::cycles().wrapping_sub(j.t0), Ordering::Relaxed);
         COPY_COUNT.fetch_add(1, Ordering::Relaxed);
-        COPY_BYTES.fetch_add(((j.r[3] - j.r[1]) * (j.r[2] - j.r[0]) * 4) as u32, Ordering::Relaxed);
+        COPY_BYTES.fetch_add((j.r.pixels() * 4) as u32, Ordering::Relaxed);
     }
     FRAMES.fetch_add(1, Ordering::Relaxed);
     let p = present_state();
@@ -967,29 +993,32 @@ fn g2d_flipped() {
 }
 
 /// One present: copy `prev ∪ req` from the shadow into the back buffer
-/// (`rows(lo, hi)` first, then `rows(y + 1, hi)` after each row: the shadow
-/// rows it may still read), run `copied` (the shadow is free again), switch
-/// the FIMD to the back buffer and wait until it scans it.
+/// (`rows(lo, hi)` first, then again after each row: the shadow rows it may
+/// still read), run `copied` (the shadow is free again), switch the FIMD to
+/// the back buffer and wait until it scans it.
 fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) {
     let back_i = 1 - p.front;
-    let r = union(p.prev, p.req);
+    let r = copy_region(p);
     // The alias with an uncached shadow: a cached read could hit lines from
     // before CPU0's uncached writes.
     let src = back();
-    let (x, w) = (r[0], r[2] - r[0]);
     let nc = p.nc[back_i];
     let dst = if nc != 0 { nc as *mut u32 } else { buf_ptr(back_i) };
-    rows(r[1], r[3]);
+    let bounds = r.bounds();
+    rows(bounds[1], bounds[3]);
     let t0 = crate::perf::cycles();
-    for y in r[1]..r[3] {
-        let at = y * W + x;
-        // SAFETY: both boxes are clipped to the screen (`mark` callers);
-        // the shadow and the scan buffers are distinct.
-        unsafe { copy_row(src.add(at), dst.add(at), w) };
-        if nc == 0 {
-            mmu::clean_dcache_range(dst as usize + at * 4, w * 4);
+    for (k, b) in r.boxes().iter().enumerate() {
+        let (x, w) = (b[0], b[2] - b[0]);
+        for y in b[1]..b[3] {
+            let at = y * W + x;
+            // SAFETY: the boxes are clipped to the screen (`mark` callers);
+            // the shadow and the scan buffers are distinct.
+            unsafe { copy_row(src.add(at), dst.add(at), w) };
+            if nc == 0 {
+                mmu::clean_dcache_range(dst as usize + at * 4, w * 4);
+            }
+            rows(copy_lo(&r, k, y + 1), bounds[3]);
         }
-        rows(y + 1, r[3]);
     }
     // The copy has reached DRAM before the FIMD may scan it.
     // SAFETY: a barrier only.
@@ -997,7 +1026,7 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     {
         COPY_CYCLES.fetch_add(crate::perf::cycles().wrapping_sub(t0), Ordering::Relaxed);
         COPY_COUNT.fetch_add(1, Ordering::Relaxed);
-        COPY_BYTES.fetch_add(((r[3] - r[1]) * w * 4) as u32, Ordering::Relaxed);
+        COPY_BYTES.fetch_add((r.pixels() * 4) as u32, Ordering::Relaxed);
     }
     FRAMES.fetch_add(1, Ordering::Relaxed);
     copied();

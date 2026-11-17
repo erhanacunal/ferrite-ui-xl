@@ -368,6 +368,11 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", "Play histogram set\n").await?;
                 return Ok(false);
             }
+            if let Some(v @ (b"1" | b"2" | b"3" | b"4")) = query_param(query, b"boxes") {
+                crate::lcd::region::BOXES.store((v[0] - b'0') as usize, Ordering::Relaxed);
+                text(socket, "200 OK", "Damage boxes set\n").await?;
+                return Ok(false);
+            }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"direct") {
                 let on = v == b"1";
                 crate::lcd::DIRECT.store(on, Ordering::Relaxed);
@@ -1317,8 +1322,9 @@ fn status_json() -> String {
         let d = &crate::lcd::DIRECT_COUNTS;
         let _ = write!(
             s,
-            ",\"direct\":{{\"on\":{},\"frames\":{},\"declined\":{},\"syncs\":{},\"sync_bytes\":{}}}",
+            ",\"direct\":{{\"on\":{},\"boxes\":{},\"frames\":{},\"declined\":{},\"syncs\":{},\"sync_bytes\":{}}}",
             crate::lcd::DIRECT.load(Relaxed),
+            crate::lcd::region::limit(),
             d[0].load(Relaxed),
             d[1].load(Relaxed),
             d[2].load(Relaxed),

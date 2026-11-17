@@ -1891,6 +1891,20 @@ pub fn gpu_target() -> Option<(usize, usize, usize, usize)> {
     g2d_draw_ready().then(|| (buf_ptr(SHADOW) as usize, W * 4, W, H))
 }
 
+/// Layer `n`'s shadow as a GPU target (`layers::gpu_surface`): physical address, stride in
+/// bytes, width, height; the CPU draws it uncached from then on. None if it can't be one.
+pub fn layer_gpu_target(n: usize) -> Option<(usize, usize, usize, usize)> {
+    layers::gpu_surface(n)
+}
+
+/// The GPU wrote `w` × `h` pixels of layer `n`'s shadow at (`x`, `y`): the next `flush`
+/// copies them to its scan buffer.
+pub fn layer_gpu_drew(n: usize, x: usize, y: usize, w: usize, h: usize) {
+    // SAFETY: a barrier only: the GPU's writes before the copy's reads.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    layers::mark(n, x, y, w, h);
+}
+
 /// A copy of the shadow (XRGB8888, `PANEL` size, rows top to bottom), for
 /// screenshots (HTTP `GET /api/screen`). CPU0, between passes. None if the
 /// heap has no room.

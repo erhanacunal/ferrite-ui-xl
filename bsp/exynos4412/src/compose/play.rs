@@ -11,6 +11,10 @@
 //! polygons, the other ellipse calls), drawing outside an area, or a text glyph the atlas
 //! can't take: declined, nothing drawn; the CPU replays the list (`render::run_job`).
 //!
+//! Retained layers (`Op::Layer` markers, core `render::layer_areas`): a layer's areas are in
+//! its coordinates and drawn into its surface (`lcd::layer_gpu_target`), cleared transparent
+//! first; each target's areas are drawn on their own (the screen's, then each layer's).
+//!
 //! The pixels are the compositor's, not the CPU's (anti-aliasing within a few 1/255).
 
 use super::*;
@@ -37,6 +41,9 @@ pub static PLAY_LAST_OP: AtomicU32 = AtomicU32::new(0);
 pub static PLAY_HIST_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub static PLAY_HIST: [[AtomicU32; 5]; ferrite_core::dl::OPCODES] = [const { [const { AtomicU32::new(0) }; 5] }; ferrite_core::dl::OPCODES];
 
+/// A layer as recorded (`Op::Layer`): index, width, height.
+type Layer = (usize, u16, u16);
+
 fn verdict(slot: usize) -> bool {
     PLAY_COUNTS[slot].fetch_add(1, Relaxed);
     slot == PLAYED
@@ -52,14 +59,22 @@ pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
     if !ENABLED.load(Relaxed) || ctx.lcd.is_portrait() {
         return verdict(OTHER);
     }
-    // The areas, and nothing drawn outside them.
-    let mut areas: Vec<Rect> = Vec::new();
+    // The areas by target (None = the screen), and nothing drawn outside them.
+    let mut groups: Vec<(Option<Layer>, Vec<Rect>)> = Vec::new();
+    let mut on: Option<Layer> = None;
     let mut open = false;
     for op in list.ops() {
         match op {
+            Op::Layer(t) => {
+                on = t;
+                open = false;
+            }
             Op::Area(r) if r.is_empty() => open = false,
             Op::Area(r) => {
-                areas.push(r);
+                match groups.iter_mut().find(|g| g.0 == on) {
+                    Some(g) => g.1.push(r),
+                    None => groups.push((on, alloc::vec![r])),
+                }
                 open = true;
             }
             Op::SetScissor(_) => {}
@@ -67,19 +82,35 @@ pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
             _ => {}
         }
     }
-    if areas.is_empty() {
+    if groups.is_empty() {
         return verdict(OUTSIDE);
     }
-    let rs: Vec<R> = areas.iter().map(R::of).collect();
-    let frames: i32 = rs.iter().map(frames_of).sum();
-    let kpx: i32 = rs.iter().map(|a| a.w() * a.h() / 1000).sum();
+    let all = || groups.iter().flat_map(|g| g.1.iter().map(R::of));
+    let frames: i32 = all().map(|a| frames_of(&a)).sum();
+    let kpx: i32 = all().map(|a| a.w() * a.h() / 1000).sum();
     if frames > FREE_FRAMES.load(Relaxed) as i32 && kpx < MIN_FRAME_KPX.load(Relaxed) as i32 * frames {
         return verdict(SMALL_AREAS);
     }
     if let Some(o) = ctx.objs.overlay
-        && areas.iter().any(|a| a.intersects(&o))
+        && groups.iter().any(|g| g.0.is_none() && g.1.iter().any(|a| a.intersects(&o)))
     {
         return verdict(OTHER);
+    }
+    // Each layer's surface as a target: allocated, the size recorded, whole tiles.
+    let mut targets: Vec<Option<(usize, Target)>> = Vec::with_capacity(groups.len());
+    for g in &groups {
+        targets.push(match g.0 {
+            None => None,
+            Some((n, w, h)) => match lcd::layer_gpu_target(n) {
+                Some((address, stride, width, height))
+                    if (width, height) == (w as usize, (h as usize).next_multiple_of(TILE as usize))
+                        && width % TILE as usize == 0 =>
+                {
+                    Some((n, Target { address, stride, width, height }))
+                }
+                _ => return verdict(OTHER),
+            },
+        });
     }
     let Some(shared) = crate::gpu::get() else { return verdict(OTHER) };
     let Some(ui) = shared.ui else { return verdict(OTHER) };
@@ -92,33 +123,44 @@ pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
             None => return verdict(OTHER),
         }
     }
-    s.prims.clear();
-    s.items.clear();
     s.scratch.clear();
-    s.tverts.clear();
     s.glyphs = GLYPHS.load(Relaxed) && s.atlas.begin();
     s.images.render = s.images.render.wrapping_add(1);
     s.any_565 = ui.any_565_stride;
-    s.areas.clear();
-    s.areas.extend_from_slice(&rs);
-    let built = s.calls(ctx, list);
-    add_time(T_COLLECT, now_us() - t0);
-    let result = match built {
-        Err(op) => {
-            PLAY_LAST_OP.store(op as u32, Relaxed);
-            UNSUPPORTED
+    let mut result = PLAYED;
+    for (g, target) in groups.iter().zip(&targets) {
+        let t1 = now_us();
+        s.prims.clear();
+        s.items.clear();
+        s.tverts.clear();
+        s.areas.clear();
+        s.areas.extend(g.1.iter().map(R::of));
+        let built = s.calls(ctx, list, g.0);
+        add_time(T_COLLECT, now_us() - t1);
+        match built {
+            Err(op) => {
+                PLAY_LAST_OP.store(op as u32, Relaxed);
+                result = UNSUPPORTED;
+            }
+            Ok(()) if s.draw(&ui, gpu, &g.1, *target) => {}
+            Ok(()) => result = FAILED,
         }
-        Ok(()) if s.draw(&ui, gpu, &areas) => PLAYED,
-        Ok(()) => FAILED,
-    };
+        if result != PLAYED {
+            // The CPU replays the whole list: it repaints these areas too.
+            break;
+        }
+    }
+    s.on_layer = false;
     s.scratch.clear();
     add_time(T_COMPOSE, now_us() - t0);
     verdict(result)
 }
 
 impl State {
-    /// The list's calls as pieces. Err(the opcode) for a call it can't draw.
-    fn calls(&mut self, ctx: &Ctx<P>, list: &List) -> Result<(), u8> {
+    /// The list's calls drawn on `want` (None = the screen) as pieces. Err(the opcode) for a
+    /// call it can't draw.
+    fn calls(&mut self, ctx: &Ctx<P>, list: &List, want: Option<Layer>) -> Result<(), u8> {
+        let mut on: Option<Layer> = None;
         let mut area = R { x0: 0, y0: 0, x1: 0, y1: 0 };
         let mut clip = area;
         // The pen being drawn (colour, thickness) and its points.
@@ -127,6 +169,13 @@ impl State {
         pts.clear();
         let mut result = Ok(());
         for op in list.ops() {
+            if let Op::Layer(t) = op {
+                on = t;
+                continue;
+            }
+            if on != want {
+                continue;
+            }
             let (code, before) = (op.code() as usize, self.prims.len());
             let hist = PLAY_HIST_ON.load(Relaxed);
             let started = if hist { now_us() } else { 0 };
@@ -137,6 +186,8 @@ impl State {
                     self.items.push(Item { start: self.prims.len(), opaque: None });
                     true
                 }
+                // The frame starts the area transparent (`State::draw` on a layer).
+                Op::LayerClear(_) => true,
                 Op::SetScissor(r) => {
                     clip = match r {
                         Some(r) => R::of(&r).meet(&area),

@@ -290,6 +290,8 @@ struct State {
     any_565: bool,
     /// A GPU error was printed: only the first is.
     told: bool,
+    /// Drawing into a layer's surface ([`State::draw`]): cleared transparent, not black.
+    on_layer: bool,
     /// The frame's draws while it is gathered (`frame`), kept for their room.
     groups: Vec<Group>,
     /// One opaque white texel (heap, 64-byte aligned, cleaned): solid pieces are `ui_flat`
@@ -330,6 +332,7 @@ static mut STATE: State = State {
     tiled: TiledPics { entries: Vec::new(), bytes: 0 },
     any_565: false,
     told: false,
+    on_layer: false,
     groups: Vec::new(),
     white: 0,
     od_cells: Vec::new(),
@@ -981,7 +984,7 @@ pub fn compose(ctx: &Ctx<P>, areas: &[Rect]) -> bool {
     add_time(T_COLLECT, now_us() - t0);
     let result = match collected {
         Err(slot) => slot,
-        Ok(()) if s.draw(&ui, gpu, areas) => TAKEN,
+        Ok(()) if s.draw(&ui, gpu, areas, None) => TAKEN,
         Ok(()) => GPU_ERROR,
     };
     // The sprites drawn for this render only go (the frames are over).
@@ -1837,25 +1840,40 @@ impl State {
     }
 
     /// Runs the frames of every area into the shadow. False if the GPU failed.
-    fn draw(&mut self, ui: &Ui, gpu: &mut Gpu, areas: &[Rect]) -> bool {
-        let Some((address, stride, width, height)) = lcd::gpu_target() else { return false };
-        if !lcd::gpu_begin() {
+    fn draw(&mut self, ui: &Ui, gpu: &mut Gpu, areas: &[Rect], layer: Option<(usize, Target)>) -> bool {
+        let target = match layer {
+            Some((_, t)) => t,
+            None => {
+                let Some((address, stride, width, height)) = lcd::gpu_target() else { return false };
+                if !lcd::gpu_begin() {
+                    return false;
+                }
+                Target { address, stride, width, height }
+            }
+        };
+        // SAFETY: the shadow (mapped at the GPU's start; between `gpu_begin` and `gpu_drew`
+        // only the GPU writes it), or a layer's (`lcd::layer_gpu_target`: on the heap the GPU
+        // maps, nothing else draws it during a render job).
+        if unsafe { gpu.set_target(target) }.is_err() {
             return false;
         }
-        // SAFETY: the shadow, mapped at the GPU's start; between `gpu_begin` and `gpu_drew` only
-        // the GPU writes it.
-        if unsafe { gpu.set_target(Target { address, stride, width, height }) }.is_err() {
-            return false;
-        }
+        self.on_layer = layer.is_some();
         for a in areas {
-            let a = R::of(a);
+            let mut a = R::of(a);
+            if layer.is_some() {
+                // A layer's last rows: its target's rows go on to whole tiles.
+                a.x1 = ((a.x1 + TILE - 1) / TILE * TILE).min(target.width as i32);
+                a.y1 = ((a.y1 + TILE - 1) / TILE * TILE).min(target.height as i32);
+            }
             // Full-width strips of at most MAX_TILES tiles.
             let across = (a.w() + TILE - 1) / TILE;
             let lines = ((FRAME_TILES.load(core::sync::atomic::Ordering::Relaxed) as i32 / across.max(1)).max(1) * TILE).min(a.h().max(TILE));
             let mut y = a.y0;
             while y < a.y1 {
                 let c = R { x0: a.x0, y0: y, x1: a.x1, y1: (y + lines).min(a.y1) };
-                lcd::gpu_fence(c.y0 as usize, c.y1 as usize);
+                if layer.is_none() {
+                    lcd::gpu_fence(c.y0 as usize, c.y1 as usize);
+                }
                 if let Err(e) = self.frame(ui, gpu, &c) {
                     if !self.told {
                         self.told = true;
@@ -1863,7 +1881,10 @@ impl State {
                     }
                     return false;
                 }
-                lcd::gpu_drew(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize);
+                match layer {
+                    None => lcd::gpu_drew(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize),
+                    Some((n, _)) => lcd::layer_gpu_drew(n, c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize),
+                }
                 y = c.y1;
             }
         }
@@ -1888,7 +1909,7 @@ impl State {
         if gpu.frame_uncached() != nc {
             gpu.set_frame_uncached(nc);
         }
-        let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), 0xFF00_0000);
+        let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), if self.on_layer { 0 } else { 0xFF00_0000 });
         add_time(T_BEGIN, now_us() - started);
         let scale = [2.0 / c.w() as f32, 2.0 / c.h() as f32];
         // The pieces into draws: a piece joins the latest draw of its batch unless a piece of
@@ -1963,8 +1984,10 @@ impl State {
         built?;
         let drew = used != 0;
         if !drew {
-            // Nothing there: black, as an empty frame would leave the area as it was.
-            let black = solid_prim(*c, Lin::flat([0.0, 0.0, 0.0, 1.0]), self.white);
+            // Nothing there: black (on a layer transparent), as an empty frame would leave the
+            // area as it was.
+            let a = if self.on_layer { 0.0 } else { 1.0 };
+            let black = solid_prim(*c, Lin::flat([0.0, 0.0, 0.0, a]), self.white);
             self.push(&black, c, c);
             self.flush(ui, &mut frame, black.batch(), scale)?;
         }

@@ -113,7 +113,8 @@ def main():
                          "(FERRITE_SIM_PLAY=1); must match --plain")
     ap.add_argument("--areas", action="store_true",
                     help="as --play, recorded in compositor order: changed areas repainted whole, back to front "
-                         "(FERRITE_SIM_AREAS=1); compare with --plain")
+                         "with retained layers (FERRITE_SIM_AREAS=1); matches the golden frames except paint "
+                         "(on_paint) and layers (a composed layer, within 1/255)")
     ap.add_argument("--hashes", help="check against / write (--update) this hash file instead of golden/hashes.json")
     a = ap.parse_args()
     global HASHES

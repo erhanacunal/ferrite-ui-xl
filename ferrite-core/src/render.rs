@@ -677,7 +677,7 @@ fn render_dirty_view<P: Platform>(ctx: &mut Ctx<P>) {
     // With layers: the screen's part (their subtrees left out; a composed
     // layer's root is its surface). The windowed layers' surfaces are drawn
     // by the passes after.
-    if active != 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && !ctx.objs.render.plain {
+    if active != 0 && (composes || ctx.objs.render.areas) {
         ctx.objs.layers.scope = base_scope(&ctx.objs);
         let taken = compose_dirty(ctx, true);
         ctx.objs.layers.scope = crate::layer::Scope::All;
@@ -977,9 +977,12 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
             a.union(&b)
         }
     };
-    // Plain drawing: no layers (dropped ones go back to the tree below).
-    let count = if ctx.objs.render.plain { 0 } else { ctx.lcd.layer_count() };
-    let can_compose = ctx.lcd.can_compose();
+    // Plain drawing: no layers (dropped ones go back to the tree below). Areas
+    // (`MODE_AREAS`) record the layers' areas for the player too (`layer_areas`),
+    // but not composed layers (`LcdImpl::layer_compose` draws past the recording).
+    let areas = ctx.objs.render.areas;
+    let count = if ctx.objs.render.plain && !areas { 0 } else { ctx.lcd.layer_count() };
+    let can_compose = ctx.lcd.can_compose() && !areas;
     let mut active = 0;
     let mut composed = 0u8;
     for s in 0..MAX_LAYERS {
@@ -1107,14 +1110,18 @@ fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) -> bool {
     ctx.objs.layers.scope = crate::layer::Scope::Layer(ri as u32, end as u32);
     ctx.objs.layers.origin = at;
     ctx.lcd.layer_target(Some((s, slot.w, slot.h)));
-    if full {
-        ctx.lcd.layer_clear(&Rect::new(0, 0, slot.w, slot.h));
-        ctx.objs.layer_redraw_all(ri, end);
-    }
-    if all {
-        render_all_iterative(ctx, ri, end);
+    if ctx.objs.render.areas {
+        layer_areas(ctx, s, full, at);
     } else {
-        dirty_passes(ctx, false, false);
+        if full {
+            ctx.lcd.layer_clear(&Rect::new(0, 0, slot.w, slot.h));
+            ctx.objs.layer_redraw_all(ri, end);
+        }
+        if all {
+            render_all_iterative(ctx, ri, end);
+        } else {
+            dirty_passes(ctx, false, false);
+        }
     }
     ctx.lcd.layer_target(None);
     ctx.objs.layers.origin = Offset { x: 0, y: 0 };
@@ -1123,6 +1130,51 @@ fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) -> bool {
     slot.at = at;
     slot.full = false;
     true
+}
+
+/// `MODE_AREAS`, inside [`layer_pass`] (scope and target are layer `s`'s): its changed
+/// areas (`full`: the whole surface), in its coordinates, repainted whole after a clear,
+/// between the recording's layer markers ([`Canvas::target_layer`]), for the player to draw
+/// into the surface; the bookkeeping as [`compose_dirty`]'s. Prev rects are screen
+/// coordinates from when the root was at `at` (a move since makes [`layer_pass`] go `full`).
+fn layer_areas<P: Platform>(ctx: &mut Ctx<P>, s: usize, full: bool, at: Offset) {
+    let slot = ctx.objs.layers.slots[s];
+    let surface = Rect::new(0, 0, slot.w, slot.h);
+    let mut areas = Areas::new();
+    if full {
+        areas.add(surface, &surface);
+    } else {
+        for di in 0..ctx.objs.dfs_len() {
+            let id = ctx.objs.dfs_at(di);
+            if !ctx.objs.get(id).is_dirty() || !ctx.objs.in_scope(di) {
+                continue;
+            }
+            if ctx.objs.vis_at(di) || ctx.objs.rendered(id) {
+                areas.add(ctx.objs.abs_at(di), &surface);
+            }
+            let p = ctx.objs.prev_rect(id);
+            if !p.is_empty() {
+                areas.add(Rect::new(p.x.wrapping_sub(at.x), p.y.wrapping_sub(at.y), p.w, p.h), &surface);
+            }
+        }
+    }
+    if areas.n > 0 {
+        screen!(ctx, |c| c.target_layer(Some((s, slot.w, slot.h))));
+        let ri = ctx.objs.dfs_index(slot.root).unwrap_or(0);
+        let end = ctx.objs.sub_end_at(ri);
+        paint_areas_on(ctx, &areas.list[..areas.n], ri, end, true);
+        screen!(ctx, |c| c.target_layer(None));
+    }
+    for di in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(di);
+        if !ctx.objs.in_scope(di) || !(full || ctx.objs.get(id).is_dirty()) {
+            continue;
+        }
+        ctx.objs.set_prev_rect(id, Rect::new(0, 0, 0, 0));
+        let vis = ctx.objs.vis_at(di);
+        ctx.objs.set_rendered(id, vis);
+    }
+    ctx.objs.render.draw_epoch = ctx.objs.render.draw_epoch.wrapping_add(1);
 }
 
 /// Shows every active layer where its root is (scope `All`, origin 0).
@@ -1243,7 +1295,7 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
         }
     }
     if areas.n > 0 {
-        if ctx.objs.render.areas && !layered {
+        if ctx.objs.render.areas {
             let areas = <P::Renderer as WidgetRenderer<P>>::play_areas(&areas.list[..areas.n]);
             paint_areas(ctx, &areas);
         } else if !<P::Renderer as WidgetRenderer<P>>::compose(ctx, &areas.list[..areas.n]) {
@@ -1283,13 +1335,22 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
 /// compositor does with the tree (`WidgetRenderer::compose`), on the canvas.
 fn paint_areas<P: Platform>(ctx: &mut Ctx<P>, areas: &[Rect]) {
     let n = ctx.objs.dfs_len();
+    paint_areas_on(ctx, areas, 0, n, false);
+}
+
+/// [`paint_areas`] over DFS entries `lo..hi`; `clear`: on a layer's surface (scope and
+/// target its, `lo..hi` its subtree), each area made transparent first.
+fn paint_areas_on<P: Platform>(ctx: &mut Ctx<P>, areas: &[Rect], lo: usize, n: usize, clear: bool) {
     for a in areas {
         let clip = ClipRegion::from_rect(*a);
         screen!(ctx, |c| {
             c.area(*a);
+            if clear {
+                c.clear_layer(*a);
+            }
             c.set_scissor(Some(*a));
         });
-        let mut i = 0;
+        let mut i = lo;
         while i < n {
             if !ctx.objs.vis_at(i) {
                 i = ctx.objs.sub_end_at(i);
@@ -1307,7 +1368,7 @@ fn paint_areas<P: Platform>(ctx: &mut Ctx<P>, areas: &[Rect]) {
             i += 1;
         }
         screen!(ctx, |c| c.set_scissor(Some(*a)));
-        for i in 0..n {
+        for i in lo..n {
             let id = ctx.objs.dfs_at(i);
             if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.objs.vis_at(i) {
                 let abs = ctx.objs.abs_at(i);

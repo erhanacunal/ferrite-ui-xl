@@ -126,6 +126,14 @@ pub trait Canvas {
     /// nothing to draw; a recording canvas notes it for a player that
     /// repaints areas (a GPU compositor).
     fn area(&self, _area: Rect) {}
+
+    /// What follows draws into layer `n`'s `w`×`h` surface, in its coordinates
+    /// (`Some((n, w, h))`), or on the screen again (`render::MODE_AREAS`'s layers:
+    /// `LcdImpl::layer_target`); a recording canvas notes it.
+    fn target_layer(&self, _t: Option<(usize, u16, u16)>) {}
+
+    /// Makes `r` of the targeted layer's surface transparent (`LcdImpl::layer_clear`).
+    fn clear_layer(&self, _r: Rect) {}
 }
 
 /// The immediate canvas: everything goes straight to the backend.
@@ -158,6 +166,12 @@ impl<B: LcdBackend> Canvas for LcdImpl<B> {
     #[inline]
     fn scissor(&self) -> Option<Rect> {
         LcdImpl::scissor(self)
+    }
+    fn target_layer(&self, t: Option<(usize, u16, u16)>) {
+        LcdImpl::layer_target(self, t)
+    }
+    fn clear_layer(&self, r: Rect) {
+        LcdImpl::layer_clear(self, &r)
     }
 
     #[inline]

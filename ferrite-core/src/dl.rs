@@ -71,7 +71,7 @@ pub static BYTES: AtomicU32 = AtomicU32::new(0);
 /// `POST /api/rcore?ops=1`): what a GPU player of the lists must cover.
 pub static OP_STATS: AtomicBool = AtomicBool::new(false);
 /// Opcodes 0..`OPCODES`: calls and words (header included) since boot.
-pub const OPCODES: usize = 37;
+pub const OPCODES: usize = 39;
 pub static OP_CALLS: [AtomicU32; OPCODES] = [const { AtomicU32::new(0) }; OPCODES];
 pub static OP_WORDS: [AtomicU32; OPCODES] = [const { AtomicU32::new(0) }; OPCODES];
 
@@ -81,7 +81,7 @@ pub const OP_NAMES: [&str; OPCODES] = [
     "pixels", "run", "blend_span", "blend_row", "line", "line_thick", "polyline", "wedge", "pen_begin",
     "pen_to", "pen_finish", "pen_end", "fill_polygon", "circle", "fill_circle", "ellipse", "fill_ellipse",
     "stroke_ellipse", "oval", "arc", "thin_arc", "rounded_rect", "fill_rounded_rect", "fill_rounded_rect_at",
-    "gradient_rounded_rect_at", "stroke_rounded_rect", "image", "text", "area",
+    "gradient_rounded_rect_at", "stroke_rounded_rect", "image", "text", "area", "layer", "layer_clear",
 ];
 
 /// Image / text calls replayed whose image or font the replaying side
@@ -196,6 +196,11 @@ pub enum Op<'a> {
     Text { font_id: u8, bitmaps: u32, x: i16, y: i16, fg: u16, bg: Option<u16>, text: &'a [u8] },
     /// `Canvas::area`: what follows repaints this area whole.
     Area(Rect),
+    /// `Canvas::target_layer`: what follows draws into layer `n`'s `w`×`h` surface, in its
+    /// coordinates (`Some((n, w, h))`), or on the screen again.
+    Layer(Option<(usize, u16, u16)>),
+    /// `Canvas::clear_layer`: this rect of the targeted layer's surface made transparent.
+    LayerClear(Rect),
 }
 
 impl Op<'_> {
@@ -238,6 +243,8 @@ impl Op<'_> {
             Op::Image { .. } => code::IMAGE,
             Op::Text { .. } => code::TEXT,
             Op::Area(..) => code::AREA,
+            Op::Layer(..) => code::LAYER,
+            Op::LayerClear(..) => code::LAYER_CLEAR,
         }
     }
 }
@@ -311,6 +318,10 @@ mod code {
     pub const TEXT: u8 = 35;
     /// `x|y` `w|h` (`Canvas::area`).
     pub const AREA: u8 = 36;
+    /// `[0 = the screen, else n + 1]`, then `w|h` if a layer (`Canvas::target_layer`).
+    pub const LAYER: u8 = 37;
+    /// `x|y` `w|h` (`Canvas::clear_layer`).
+    pub const LAYER_CLEAR: u8 = 38;
 
     /// TEXT: bit 16 of the `bg` word.
     pub const HAS_BG: u32 = 1 << 16;
@@ -750,6 +761,8 @@ impl List {
                     refs.draw_text(c, font_id, bitmaps, text, x, y, fg, bg)
                 }
                 Op::Area(r) => c.area(r),
+                Op::Layer(t) => c.target_layer(t),
+                Op::LayerClear(r) => c.clear_layer(r),
             }
         }
     }
@@ -1006,6 +1019,15 @@ impl<'a> Iterator for Ops<'a> {
                 let [p, sz] = self.args();
                 Op::Area(Rect::new(lo(p) as i16, hi(p) as i16, lo(sz), hi(sz)))
             }
+            code::LAYER if a == 0 => Op::Layer(None),
+            code::LAYER => {
+                let [sz] = self.args();
+                Op::Layer(Some((a as usize - 1, lo(sz), hi(sz))))
+            }
+            code::LAYER_CLEAR => {
+                let [p, sz] = self.args();
+                Op::LayerClear(Rect::new(lo(p) as i16, hi(p) as i16, lo(sz), hi(sz)))
+            }
             op => panic!("dl: bad opcode {op} at word {}", self.i - 1),
         })
     }
@@ -1073,6 +1095,8 @@ pub struct Recorder {
     scissor: Cell<Option<Rect>>,
     /// Between `begin` and `end` (a nested drawing draws directly).
     busy: Cell<bool>,
+    /// The screen's size while a layer is targeted (`target_layer`).
+    screen: Cell<Option<(u16, u16)>>,
 }
 
 impl Default for Recorder {
@@ -1088,6 +1112,7 @@ impl Recorder {
             info: Cell::new(Info { width: 0, height: 0, has_alpha: false, smooth: false }),
             scissor: Cell::new(None),
             busy: Cell::new(false),
+            screen: Cell::new(None),
         }
     }
 
@@ -1098,6 +1123,7 @@ impl Recorder {
             return false;
         }
         self.busy.set(true);
+        self.screen.set(None);
         self.list.borrow_mut().clear();
         self.info.set(Info {
             width: target.width(),
@@ -1192,6 +1218,29 @@ impl Canvas for Recorder {
     }
     fn area(&self, r: Rect) {
         self.l().call(&[header(code::AREA, 0, 0), pki(r.x, r.y), pk(r.w, r.h)]);
+    }
+    fn target_layer(&self, t: Option<(usize, u16, u16)>) {
+        // The canvas is the surface's size meanwhile, as `LcdImpl::layer_target` makes it.
+        let mut info = self.info.get();
+        match t {
+            Some((n, w, h)) => {
+                if self.screen.get().is_none() {
+                    self.screen.set(Some((info.width, info.height)));
+                }
+                (info.width, info.height) = (w, h);
+                self.l().call(&[header(code::LAYER, n as u8 + 1, 0), pk(w, h)]);
+            }
+            None => {
+                if let Some((w, h)) = self.screen.take() {
+                    (info.width, info.height) = (w, h);
+                }
+                self.l().call(&[header(code::LAYER, 0, 0)]);
+            }
+        }
+        self.info.set(info);
+    }
+    fn clear_layer(&self, r: Rect) {
+        self.l().call(&[header(code::LAYER_CLEAR, 0, 0), pki(r.x, r.y), pk(r.w, r.h)]);
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
@@ -1561,6 +1610,9 @@ mod tests {
         r.fill_gradient_rounded_rect_at(-1, -2, 3, 4, 5, 6, 7, 1);
         r.stroke_rounded_rect(-1, -2, 3, 4, 5, 6, 7);
         r.area(Rect::new(-16, 32, 1280, 800));
+        r.target_layer(Some((2, 2560, 560)));
+        r.clear_layer(Rect::new(-16, 32, 64, 48));
+        r.target_layer(None);
         r.set_scissor(None);
 
         let want = [
@@ -1602,6 +1654,9 @@ mod tests {
             Op::GradientRoundedRectAt { x: -1, y: -2, w: 3, h: 4, r: 5, c1: 6, c2: 7, dir: 1 },
             Op::StrokeRoundedRect { x: -1, y: -2, w: 3, h: 4, r: 5, t: 6, color: 7 },
             Op::Area(Rect::new(-16, 32, 1280, 800)),
+            Op::Layer(Some((2, 2560, 560))),
+            Op::LayerClear(Rect::new(-16, 32, 64, 48)),
+            Op::Layer(None),
             Op::SetScissor(None),
         ];
         let l = r.list();

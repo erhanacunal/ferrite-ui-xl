@@ -124,6 +124,8 @@ struct Layer {
     px: usize,
     /// `px` is the uncached alias: no line of the shadow is cached.
     uncached: bool,
+    /// The GPU draws the shadow ([`gpu_surface`]): the CPU keeps to the uncached alias.
+    gpu: bool,
     w: usize,
     h: usize,
     /// Drawn in the shadow since the last copy.
@@ -153,8 +155,14 @@ impl Layer {
         surface_words(self.w, self.h)
     }
 
+    /// Words of the shadow: [`Self::surface_words`] with its rows rounded up to whole GPU
+    /// tiles ([`shadow_words`]).
+    fn shadow_words(&self) -> usize {
+        shadow_words(self.w, self.h)
+    }
+
     fn scan(&self, i: usize) -> usize {
-        self.base + (1 + i) * self.surface_words() * 4
+        self.base + (self.shadow_words() + i * self.surface_words()) * 4
     }
 
     /// Switches the CPU's view of the shadow to what [`UNCACHED`] asks (when
@@ -164,9 +172,9 @@ impl Layer {
     /// meanwhile, so it holds no dirty line; stale clean ones are dropped.
     /// Between passes only (nothing holds the old `px`).
     fn apply_mode(&mut self) {
-        let bytes = self.surface_words() * 4;
+        let bytes = self.shadow_words() * 4;
         let alias = mmu::uncached(self.base).filter(|_| mmu::uncached(self.base + bytes - 1).is_some());
-        let want = UNCACHED.load(Ordering::Relaxed) && alias.is_some();
+        let want = (UNCACHED.load(Ordering::Relaxed) || self.gpu) && alias.is_some();
         if want == self.uncached {
             return;
         }
@@ -270,6 +278,15 @@ fn surface_words(w: usize, h: usize) -> usize {
     (w * h).next_multiple_of(16)
 }
 
+/// The GPU's tile (rows of a shadow the GPU draws are whole tiles: [`gpu_surface`]).
+const TILE: usize = 16;
+
+/// The shadow's words: its rows rounded up to whole tiles, the ones past `h` unused (a GPU
+/// frame over the last rows clears them too).
+fn shadow_words(w: usize, h: usize) -> usize {
+    surface_words(w, h.next_multiple_of(TILE))
+}
+
 /// See `LcdBackend::layer_alloc`.
 pub fn alloc(n: usize, w: usize, h: usize) -> bool {
     if n >= COUNT || w == 0 || h == 0 {
@@ -278,7 +295,7 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
     free(n);
     const ALIGN: usize = 64;
     let sw = surface_words(w, h);
-    let words = 3 * sw + ALIGN / 4;
+    let words = shadow_words(w, h) + 2 * sw + ALIGN / 4;
     let mut mem = Vec::new();
     if mem.try_reserve_exact(words).is_err() {
         return false;
@@ -289,7 +306,7 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
     // The FIMD reads the scan buffers from DRAM, and the G2D writes them
     // there ([`copy_to_back`]): no cached line of them may stay, or be
     // written back over the G2D's writes later.
-    let scans = base + sw * 4;
+    let scans = base + shadow_words(w, h) * 4;
     mmu::clean_dcache_range(scans, 2 * sw * 4);
     mmu::invalidate_dcache_range(scans, 2 * sw * 4);
     exynos_4412_rs::println!("ferrite: layer {} {}x{} allocated", n, w, h);
@@ -299,6 +316,7 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
         base,
         px: base,
         uncached: false,
+        gpu: false,
         w,
         h,
         dirty: Boxes::NONE,
@@ -361,6 +379,18 @@ pub fn clear(x: u16, y: u16, w: u16, h: u16) {
         fb::fill_u32(unsafe { t.row(x, r, w) }, 0);
     }
     t.mark(x, y, w, h);
+}
+
+/// Layer `n`'s shadow as a GPU target (the GPU player, `compose::play`): physical address,
+/// stride in bytes, width, height (rounded up to whole tiles: [`shadow_words`]). From now on the CPU reaches it uncached, so no cached line
+/// of it is written back over the GPU's pixels: the switch puts this core's lines out to DRAM
+/// and drops them (the other core cleaned its L1 when it handed the job over). None if not
+/// allocated, or the alias doesn't cover it.
+pub fn gpu_surface(n: usize) -> Option<(usize, usize, usize, usize)> {
+    let l = state().layers.get_mut(n)?.as_mut()?;
+    l.gpu = true;
+    l.apply_mode();
+    l.uncached.then_some((l.base, l.w * 4, l.w, l.h.next_multiple_of(TILE)))
 }
 
 /// See `LcdBackend::layer_place`.

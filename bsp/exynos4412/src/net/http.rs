@@ -14,6 +14,8 @@
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?merge=0\|1` pieces merged into fewer draws / a draw per run of pieces; `?round_px=N` largest `ui_round` box drawn as four quarters (0 = always nine pieces); `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
+//! | `GET /api/storage` | where the files are (`medium=USERDATA fs=ext4 size_mib=… free_mib=…`, or `medium=CACHE fs=fat32`) |
+//! | `POST /api/storage/migrate` | formats USERDATA (ext4), copies `FERRITE/` and `SYSTEM/` from CACHE, verifies and switches to it (`storage::migrate`); 409 with the report if it refused or failed. Blocks the UI for its seconds |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
 //! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; `?scene=0\|1` syncs update the render pool's scene / capture it whole (`/api/status` `scene`); counters and the jobs' time breakdown in `/api/status` `rcore` |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
@@ -264,6 +266,17 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let early = &request[head_end..filled];
             upload(socket, super::Upload::System(name, len as u8), length, want, expect, early).await?;
         }
+        (b"GET", b"/api/storage") => match super::storage_request(super::STORAGE_STATUS, 3).await {
+            Some((_, t)) => text(socket, "200 OK", &t).await?,
+            None => text(socket, "503 Service Unavailable", "No answer from the UI core
+").await?,
+        },
+        (b"POST", b"/api/storage/migrate") => match super::storage_request(super::STORAGE_MIGRATE, 600).await {
+            Some((true, t)) => text(socket, "200 OK", &t).await?,
+            Some((false, t)) => text(socket, "409 Conflict", &t).await?,
+            None => text(socket, "503 Service Unavailable", "No answer from the UI core
+").await?,
+        },
         (b"GET", b"/api/dl") => {
             let id = match query_param(query, b"id") {
                 None => Some(super::DL_ALL),

@@ -1040,6 +1040,48 @@ pub async fn screenshot() -> Option<Vec<u32>> {
     SCREEN.lock(|s| s.borrow_mut().take())
 }
 
+/// Storage mailbox (HTTP `GET /api/storage`, `POST /api/storage/migrate`): CPU3 puts the
+/// request in [`STORAGE_WANTED`], CPU0 answers in [`STORAGE_TEXT`] between passes
+/// ([`storage_service`]): whether it worked, and the text.
+static STORAGE_WANTED: AtomicU8 = AtomicU8::new(STORAGE_NONE);
+const STORAGE_NONE: u8 = 0;
+pub const STORAGE_STATUS: u8 = 1;
+pub const STORAGE_MIGRATE: u8 = 2;
+static STORAGE_TEXT: CriticalSectionMutex<RefCell<Option<(bool, String)>>> = CriticalSectionMutex::new(RefCell::new(None));
+
+/// CPU3: asks CPU0 for `what` (`STORAGE_STATUS` or `STORAGE_MIGRATE`); None when it does not
+/// answer within `secs`.
+pub async fn storage_request(what: u8, secs: u64) -> Option<(bool, String)> {
+    STORAGE_TEXT.lock(|t| *t.borrow_mut() = None);
+    STORAGE_WANTED.store(what, Ordering::Release);
+    let start = Instant::now();
+    loop {
+        if let Some(answer) = STORAGE_TEXT.lock(|t| t.borrow_mut().take()) {
+            return Some(answer);
+        }
+        if start.elapsed() > Duration::from_secs(secs) {
+            // Too late to take it back if CPU0 has started; it still finishes.
+            let _ = STORAGE_WANTED.compare_exchange(what, STORAGE_NONE, Ordering::AcqRel, Ordering::Acquire);
+            return None;
+        }
+        Timer::after(Duration::from_millis(5)).await;
+    }
+}
+
+/// CPU0, once per pass: answers a storage request. A migration blocks the UI while it runs.
+fn storage_service() {
+    let what = STORAGE_WANTED.swap(STORAGE_NONE, Ordering::AcqRel);
+    let answer = match what {
+        STORAGE_STATUS => (true, crate::storage::status_text()),
+        STORAGE_MIGRATE => match crate::storage::migrate() {
+            Ok(report) => (true, report),
+            Err(report) => (false, report),
+        },
+        _ => return,
+    };
+    STORAGE_TEXT.lock(|t| *t.borrow_mut() = Some(answer));
+}
+
 /// Display-list dump mailbox (HTTP `GET /api/dl[?id=N]`): CPU3 puts the
 /// widget id (`DL_ALL` = the summary) in [`DL_WANTED`], CPU0 writes
 /// `render::dl_dump` into [`DL_TEXT`] between passes ([`dl_service`]).
@@ -1083,6 +1125,7 @@ pub fn dl_service(ctx: &mut ferrite_core::ctx::Ctx<crate::platform::Exynos4412Pl
 /// asked for something. `screen_ok`: nothing draws on the shadow now (no
 /// render job on CPU2), so a screen grab may read it.
 pub fn service(screen_ok: bool) {
+    storage_service();
     if screen_ok && SCREEN_WANTED.swap(false, Ordering::AcqRel) {
         let shot = crate::lcd::grab();
         SCREEN.lock(|s| *s.borrow_mut() = shot);

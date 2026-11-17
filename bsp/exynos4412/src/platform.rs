@@ -50,7 +50,7 @@ impl Platform for Exynos4412Platform {
     // FERRITE/EEPROM.BIN on CACHE (eeprom.rs).
     type EepromB = crate::eeprom::FileEeprom;
     // Programs' files in FERRITE/USER on CACHE (storage.rs).
-    type StorageB = crate::storage::CacheStorage;
+    type StorageB = crate::storage::BoardStorage;
     type AudioB = crate::audio::I2sAudio;
     type JpegB = crate::jpeg::SoftJpeg;
     type Renderer = crate::renderer::ExynosRenderer;

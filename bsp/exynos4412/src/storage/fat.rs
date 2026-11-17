@@ -1,30 +1,13 @@
-//! Persistent storage — the FAT32 file system on the eMMC CACHE partition
-//! (p8), through `exynos_4412_rs::fat` (as its `fat_test`). Everything here
-//! runs on CPU0.
+//! CACHE (p8, FAT32) through `exynos_4412_rs::fat` (as its `fat_test`): where the files were
+//! before USERDATA ([`super::ext4`]), and where they stay until `storage::migrate` moves them.
+//! The same tree and API as `ext4.rs`; `storage/mod.rs` picks one at boot.
 //!
-//! The firmware's own files live in [`DIR`] (`FERRITE/`):
-//! - `FLASH.BIN`, the ferrite "flash" (`flash.rs`, a RAM region): [`init`]
-//!   mounts CACHE and [`load`] reads it at boot; [`save`] writes the used
-//!   part back (`flash::save_if_dirty`: before a restart, and once writes
-//!   have been quiet for [`IDLE_SAVE_MS`]);
-//! - `FERRITE.BIN` (the firmware uart_boot starts, `net::install_firmware`),
-//!   the WiFi files (`net`), `EEPROM.BIN` (`eeprom.rs`).
-//!
-//! Programs get their own tree, [`USER_DIR`] (`FERRITE/USER/`), through
-//! [`CacheStorage`] (ferrite-core `storage`: `diskOpen`, `fileWrite`,
-//! `diskMkdir`…). The core checks every path (8.3 components, no `..`), so a
-//! program cannot reach [`DIR`]'s files or anything else on CACHE.
-//!
-//! CACHE is never formatted here: without a FAT32 on it persistence is off
-//! (logged at boot), the board runs from RAM only and programs get
-//! `NO_STORAGE`.
-//!
+//! CACHE is never formatted here: without a FAT32 on it persistence is off.
 //! `FLASH.BIN` is rewritten in place: power lost during a save leaves a torn
 //! image, which the boot-time CRC check (`VERIFY_FS_ON_BOOT`) turns into
 //! Code 9 + recovery, so a new `writefs` fixes it.
 
 use alloc::boxed::Box;
-#[cfg(feature = "wifi")]
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::ControlFlow;
@@ -39,23 +22,11 @@ use exynos_4412_rs::println;
 use exynos_4412_rs::time::DateTime;
 use ferrite_core::storage::{self as core_storage, Kind, MAX_OPEN, Path, StorageBackend, err};
 
+use super::{DIR, USER_DIR, USER_FLUSH_MS};
 use crate::systick;
 
 /// CACHE.
 const PARTITION: u32 = 8;
-pub const DIR: &str = "FERRITE";
-pub const FILE: &str = "FLASH.BIN";
-/// Programs' files: `DIR/USER_DIR`.
-pub const USER_DIR: &str = "USER";
-/// The board's own settings, shared with uart_boot (`uart_boot/src/settings.rs`, keep in
-/// sync): `WIFI.TXT`, the WiFi chip's firmware and NVRAM (`net`). Out of programs' reach.
-pub const SYSTEM_DIR: &str = "SYSTEM";
-/// Save this long after the last write (a writefs in progress keeps writing
-/// every chunk, so it is not saved half done unless the host stalls).
-pub const IDLE_SAVE_MS: u32 = 1500;
-/// Programs' written files reach the card this long after their last write
-/// (or when closed, or before a restart).
-const USER_FLUSH_MS: u32 = 1000;
 /// Device buffer as `fat_test`: read-ahead + single blocks + a 256 KiB write run.
 const DEVICE_BYTES: usize = fat::MIN_BUFFER - 512 + 256 * 1024;
 /// Addresses U-Boot may have given the card (it does not report it).
@@ -96,11 +67,13 @@ pub fn available() -> bool {
 }
 
 /// Opens the eMMC and checks CACHE holds a FAT32. Call once, after `heap::init`.
-pub fn init() {
-    match open() {
-        Ok(m) => unsafe { *(&raw mut MOUNTED) = Some(m) },
-        Err(why) => println!("ferrite: storage off ({}), resources live in RAM only", why),
+pub fn init() -> Result<(), &'static str> {
+    if available() {
+        return Ok(());
     }
+    let m = open()?;
+    unsafe { *(&raw mut MOUNTED) = Some(m) };
+    Ok(())
 }
 
 fn open() -> Result<Box<Mounted>, &'static str> {
@@ -173,28 +146,23 @@ impl Mounted {
     }
 }
 
-/// Reads the image file into `region`; returns its length (0 = no file yet).
-pub fn load(region: &mut [u8]) -> usize {
-    let Some(m) = mounted() else { return 0 };
-    match read_file(m, DIR, FILE, region) {
-        Ok(n) => {
-            println!("ferrite: loaded {}/{}, {} bytes", DIR, FILE, n);
-            n
-        }
-        Err(FsError::NotFound) => {
-            println!("ferrite: no {}/{} yet", DIR, FILE);
-            0
-        }
+/// Reads `dir`/`name` into `region`, at most its length: the bytes read, None when there is
+/// no such file.
+pub fn read_into(dir: &str, name: &str, region: &mut [u8]) -> Result<Option<usize>, ()> {
+    let m = mounted().ok_or(())?;
+    match read_file(m, dir, name, region) {
+        Ok(n) => Ok(Some(n)),
+        Err(FsError::NotFound) => Ok(None),
         Err(e) => {
-            println!("ferrite: load {}/{} ERROR {:?}", DIR, FILE, e);
-            0
+            println!("ferrite: read {}/{} ERROR {:?}", dir, name, e);
+            Err(())
         }
     }
 }
 
-/// Reads [`DIR`]/`name` into `region`, at most its length; the bytes read.
+/// Reads `dir`/`name` into `region`, at most its length; the bytes read.
 fn read_file(m: &Mounted, dir: &str, name: &str, region: &mut [u8]) -> Result<usize, FsError> {
-    m.in_dir([dir], |v, dir| {
+    m.in_dir(dir.split('/').filter(|c| !c.is_empty()), |v, dir| {
         let file = v.open_file_in_dir(dir, name, Mode::ReadOnly)?;
         let len = (v.file_length(file)? as usize).min(region.len());
         let mut done = 0;
@@ -213,9 +181,9 @@ fn read_file(m: &Mounted, dir: &str, name: &str, region: &mut [u8]) -> Result<us
     })
 }
 
-/// The length of [`DIR`]/`name`.
+/// The length of `dir`/`name`.
 fn file_len(m: &Mounted, dir: &str, name: &str) -> Result<usize, FsError> {
-    m.in_dir([dir], |v, dir| {
+    m.in_dir(dir.split('/').filter(|c| !c.is_empty()), |v, dir| {
         let file = v.open_file_in_dir(dir, name, Mode::ReadOnly)?;
         let len = v.file_length(file);
         v.close_file(file)?;
@@ -225,7 +193,6 @@ fn file_len(m: &Mounted, dir: &str, name: &str) -> Result<usize, FsError> {
 
 /// Reads `dir`/`name` (8.3 names) whole, if it exists and is at most `max`
 /// bytes.
-#[cfg(feature = "wifi")]
 pub fn read_in(dir: &str, name: &str, max: usize) -> Option<Vec<u8>> {
     let m = mounted()?;
     let len = file_len(m, dir, name).ok()?;
@@ -237,23 +204,6 @@ pub fn read_in(dir: &str, name: &str, max: usize) -> Option<Vec<u8>> {
     let n = read_file(m, dir, name, &mut buf).ok()?;
     buf.truncate(n);
     Some(buf)
-}
-
-/// Reads [`DIR`]/`name` into `buf` if it exists and is exactly its size.
-pub fn read_exact(name: &str, buf: &mut [u8]) -> bool {
-    let Some(m) = mounted() else { return false };
-    file_len(m, DIR, name).is_ok_and(|len| len == buf.len()) && read_file(m, DIR, name, buf).is_ok_and(|n| n == buf.len())
-}
-
-/// Writes `data` as the image file (made or truncated), then flushes the
-/// device so it is on the card when this returns.
-pub fn save(data: &[u8]) -> bool {
-    save_named(FILE, data)
-}
-
-/// Writes [`DIR`]/`name` (an 8.3 name, made or truncated) and flushes.
-pub fn save_named(name: &str, data: &[u8]) -> bool {
-    save_in(DIR, name, data)
 }
 
 /// Writes `dir`/`name` (8.3 names; `dir` made if needed, the file made or
@@ -271,7 +221,7 @@ pub fn save_in(dir: &str, name: &str, data: &[u8]) -> bool {
 
 fn write_file(m: &Mounted, dir: &str, name: &str, data: &[u8]) -> Result<(), FsError> {
     m.ensure_dir(&[], dir)?;
-    m.in_dir([dir], |v, dir| {
+    m.in_dir(dir.split('/').filter(|c| !c.is_empty()), |v, dir| {
         let file = v.open_file_in_dir(dir, name, Mode::ReadWriteCreateOrTruncate)?;
         let r = v.write(file, data);
         v.close_file(file)?;
@@ -279,12 +229,39 @@ fn write_file(m: &Mounted, dir: &str, name: &str, data: &[u8]) -> Result<(), FsE
     })
 }
 
-/// Everything written reaches the card: programs' open files and the
-/// EEPROM file. Before a restart or power-off (`force`), and from
-/// `frame_end` (`force` false: once writes have settled).
-pub fn sync(force: bool) {
-    CacheStorage.flush(force);
-    crate::eeprom::save_if_dirty(force);
+/// The names in directory `dir` (a path from the root, `/`-separated): (name, is a directory).
+/// `.`, `..`, long-name and volume entries left out.
+pub fn list(dir: &str) -> Result<Vec<(alloc::string::String, bool)>, ()> {
+    let m = mounted().ok_or(())?;
+    let mut out = Vec::new();
+    m.in_dir(dir.split('/').filter(|c| !c.is_empty()), |v, d| {
+        v.iterate_dir(d, |e| {
+            let a = e.attributes;
+            let (base, ext) = (e.name.base_name(), e.name.extension());
+            if a.is_lfn() || a.is_volume() || base.first() == Some(&b'.') {
+                return ControlFlow::Continue(());
+            }
+            let mut name = alloc::string::String::from_utf8_lossy(base).into_owned();
+            if !ext.is_empty() {
+                name.push('.');
+                name.push_str(&alloc::string::String::from_utf8_lossy(ext));
+            }
+            out.push((name, a.is_directory()));
+            ControlFlow::Continue(())
+        })
+    })
+    .map_err(|e| println!("ferrite: list {} ERROR {:?}", dir, e))?;
+    Ok(out)
+}
+
+/// The length of the file at `path` (`/`-separated from the root).
+pub fn len_of(dir: &str, name: &str) -> Option<usize> {
+    file_len(mounted()?, dir, name).ok()
+}
+
+/// Whether any program file has unflushed writes or is open.
+pub fn files_open() -> bool {
+    files().iter().any(Option::is_some)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,16 +336,16 @@ fn kind_of(path: &Path) -> Result<Option<Kind>, i32> {
     }
 }
 
-/// The board's `Platform::StorageB`: zero-sized, over the statics above.
-pub struct CacheStorage;
+/// Programs' files on CACHE: zero-sized, over the statics above.
+pub struct FatStorage;
 
-impl CacheStorage {
+impl FatStorage {
     fn file(slot: usize) -> Result<UserFile, i32> {
         files()[slot].ok_or(err::IO)
     }
 }
 
-impl StorageBackend for CacheStorage {
+impl StorageBackend for FatStorage {
     fn open(&self, slot: usize, path: &Path, mode: core_storage::Mode) -> Result<(), i32> {
         use core_storage::Mode as M;
         let fat_mode = match mode {

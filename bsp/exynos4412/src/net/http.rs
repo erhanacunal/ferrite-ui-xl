@@ -16,6 +16,7 @@
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/storage` | where the files are (`medium=USERDATA fs=ext4 size_mib=… free_mib=…`, or `medium=CACHE fs=fat32`) |
 //! | `POST /api/storage/migrate` | formats USERDATA (ext4), copies `FERRITE/` and `SYSTEM/` from CACHE, verifies and switches to it (`storage::migrate`); 409 with the report if it refused or failed. Blocks the UI for its seconds |
+//! | `POST /api/touch?swipe=X0,Y0,X1,Y1,MS` | a scripted one-finger swipe through the touch backend (`touch::swipe`: a press, a move every 8 ms, a lift), screen pixels; for measuring slides |
 //! | `POST /api/storage/stress?on=0\|1` | power-loss test load on USERDATA (`storage::stress`), off again after a restart; `?cut=1`: in 1 s `cut.bin` is committed to the journal only and the board resets, so the next mount must replay it |
 //! | `GET /api/storage/check` | `Ext4::check` of USERDATA plus the stress files' contents; 409 when something is wrong |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
@@ -510,6 +511,21 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
 " } else { "on=0|1 (now off)
 " }).await?;
                 }
+            }
+        }
+        (b"POST", b"/api/touch") => {
+            // A scripted swipe through the touch backend (`touch::swipe`), for measuring.
+            let nums: Option<alloc::vec::Vec<u32>> = query_param(query, b"swipe")
+                .and_then(|v| core::str::from_utf8(v).ok())
+                .map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect());
+            match nums.as_deref() {
+                Some(&[x0, y0, x1, y1, ms]) if x0.max(x1) < 4096 && y0.max(y1) < 4096 && ms <= 10_000 => {
+                    crate::touch::swipe(x0 as u16, y0 as u16, x1 as u16, y1 as u16, ms);
+                    text(socket, "200 OK", "swipe started
+").await?;
+                }
+                _ => text(socket, "400 Bad Request", "swipe=X0,Y0,X1,Y1,MS
+").await?,
             }
         }
         (b"POST", b"/api/backlight") => {

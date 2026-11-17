@@ -300,16 +300,100 @@ fn drain(s: &State) {
     }
 }
 
+// --- A scripted swipe (HTTP `POST /api/touch?swipe=X0,Y0,X1,Y1,MS`), for measuring ---
+
+/// One finger (id [`SYNTH_ID`]) pressed at (x0, y0), moved in a straight line to (x1, y1) over
+/// `dur` ms, a sample every [`SYNTH_STEP_MS`], then lifted; in screen pixels, past the
+/// controller (positions don't go through `to_screen`).
+#[derive(Clone, Copy)]
+struct Synth {
+    from: (i32, i32),
+    to: (i32, i32),
+    start: u32,
+    dur: u32,
+    /// The time of the last sample given (`None`: the press not given yet).
+    last: Option<u32>,
+}
+
+const SYNTH_ID: u8 = 15;
+const SYNTH_STEP_MS: u32 = 8;
+static SYNTH: Mutex<RefCell<Option<Synth>>> = Mutex::new(RefCell::new(None));
+
+/// Starts a scripted swipe (ignored while one runs).
+pub fn swipe(x0: u16, y0: u16, x1: u16, y1: u16, ms: u32) {
+    let start = crate::systick::millis();
+    critical_section::with(|cs| {
+        let mut s = SYNTH.borrow_ref_mut(cs);
+        if s.is_none() {
+            *s = Some(Synth { from: (x0.into(), y0.into()), to: (x1.into(), y1.into()), start, dur: ms.max(1), last: None });
+        }
+    });
+}
+
+impl Synth {
+    fn at(&self, ms: u32) -> (u16, u16) {
+        let t = ms.saturating_sub(self.start).min(self.dur) as i32;
+        let d = self.dur as i32;
+        let lerp = |a: i32, b: i32| (a + (b - a) * t / d) as u16;
+        (lerp(self.from.0, self.to.0), lerp(self.from.1, self.to.1))
+    }
+}
+
+fn synth() -> Option<Synth> {
+    critical_section::with(|cs| *SYNTH.borrow_ref(cs))
+}
+
+/// The scripted swipe's samples due by now into `out`.
+fn synth_samples(out: &mut [TouchSample]) -> usize {
+    fn put(out: &mut [TouchSample], n: &mut usize, kind: SampleKind, ms: u32, s: &Synth) {
+        if *n < out.len() {
+            let (x, y) = s.at(ms);
+            out[*n] = TouchSample { kind, id: SYNTH_ID, x, y, ms };
+            *n += 1;
+        }
+    }
+    let now = crate::systick::millis();
+    critical_section::with(|cs| {
+        let mut slot = SYNTH.borrow_ref_mut(cs);
+        let Some(s) = slot.as_mut() else { return 0 };
+        let end = s.start + s.dur;
+        let mut n = 0;
+        if s.last.is_none() {
+            put(out, &mut n, SampleKind::Down, s.start, s);
+            s.last = Some(s.start);
+        }
+        while let Some(last) = s.last {
+            let next = (last + SYNTH_STEP_MS).min(end);
+            if next > now || next == last || n + 2 > out.len() {
+                break;
+            }
+            put(out, &mut n, SampleKind::Move, next, s);
+            s.last = Some(next);
+        }
+        if s.last == Some(end) && n < out.len() {
+            put(out, &mut n, SampleKind::Up, end, s);
+            *slot = None;
+        }
+        n
+    })
+}
+
 pub struct MxtTouch;
 
 impl TouchBackend for MxtTouch {
     fn is_active(&self) -> bool {
+        if synth().is_some() {
+            return true;
+        }
         let Some(s) = state() else { return false };
         drain(s);
         DOWN.load(Ordering::Acquire) != 0 || (QUEUED.load(Ordering::Acquire) && !queue_empty())
     }
 
     fn read_screen(&self, cal: &CalParams) -> Option<(u16, u16)> {
+        if let Some(syn) = synth() {
+            return Some(syn.at(crate::systick::millis()));
+        }
         let s = state()?;
         drain(s);
         let p = POINTER.load(Ordering::Acquire);
@@ -317,6 +401,14 @@ impl TouchBackend for MxtTouch {
     }
 
     fn read_points(&self, cal: &CalParams, out: &mut [TouchPoint]) -> usize {
+        if let Some(syn) = synth() {
+            if out.is_empty() {
+                return 0;
+            }
+            let (x, y) = syn.at(crate::systick::millis());
+            out[0] = TouchPoint { id: SYNTH_ID, x, y };
+            return 1;
+        }
         let Some(s) = state() else { return 0 };
         drain(s);
         let down = DOWN.load(Ordering::Acquire);
@@ -337,6 +429,9 @@ impl TouchBackend for MxtTouch {
     }
 
     fn read_samples(&self, cal: &CalParams, out: &mut [TouchSample]) -> Option<usize> {
+        if synth().is_some() {
+            return Some(synth_samples(out));
+        }
         if !QUEUED.load(Ordering::Acquire) {
             return None;
         }

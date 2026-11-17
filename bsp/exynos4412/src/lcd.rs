@@ -474,8 +474,13 @@ fn fence(y0: usize, y1: usize) {
 /// box back from the newest scan buffer.
 pub static DIRECT: AtomicBool = AtomicBool::new(true);
 /// Direct frames played, declined (a present in flight or the shadow's drawing
-/// waiting: drawn into the shadow as before), shadow syncs and their bytes.
-pub static DIRECT_COUNTS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// waiting: drawn into the shadow as before), shadow syncs and their bytes, and
+/// the times a frame waited for the last switch on the render core and the µs.
+pub static DIRECT_COUNTS: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+/// The last present was a direct frame: until it is on screen the next one has
+/// no buffer to draw (the FIMD scans the other until the switch), so
+/// [`render_due`] holds the render back instead of a job waiting for it.
+static LAST_DIRECT: AtomicBool = AtomicBool::new(false);
 /// The box the shadow lacks (x0, y0, x1, y1), and that it is not empty. One core
 /// at a time (the render job's, or CPU0 between jobs), as the shadow.
 static mut STALE: Region = Region::EMPTY;
@@ -513,10 +518,16 @@ pub fn direct_begin(areas: &[UiRect]) -> Option<(usize, usize, usize, usize)> {
     let (front, back, prev) = if state == FLIP { (1 - p.front, p.front, p.req) } else { (p.front, 1 - p.front, p.prev) };
     let (src, dst) = (addr(front)?, addr(back)?);
     if state == FLIP {
+        // Rare since `render_due` holds the render back meanwhile (a job started before
+        // the switch, e.g. on a present CPU0 made without a job).
         let fimd = Fimd::new();
+        let t0 = crate::perf::cycles();
         while fimd.scan_address() != src as u32 && systick::millis().wrapping_sub(FLIP_AT.load(Ordering::Relaxed)) < FLIP_MS {
             core::hint::spin_loop();
         }
+        let us = crate::perf::cycles().wrapping_sub(t0) as u64 * 1_000_000 / crate::perf::hz().max(1) as u64;
+        DIRECT_COUNTS[4].fetch_add(1, Ordering::Relaxed);
+        DIRECT_COUNTS[5].fetch_add(us as u32, Ordering::Relaxed);
     }
     DIRECT_TARGET.store(back, Ordering::Relaxed);
     for b in prev.boxes() {
@@ -643,8 +654,14 @@ pub fn g2d_state() -> (bool, bool, bool) {
 /// (`PlatformRuntime::render_due`): false while something drawn since the
 /// last present is waiting for a present still in flight (copying, or
 /// copied and waiting for the scan-out switch). `flush` hands it over once
-/// that present is done; drawing more meanwhile is wasted.
+/// that present is done; drawing more meanwhile is wasted. Also false while a
+/// direct frame's switch is not on screen yet: the next direct frame would
+/// wait for it on the render core; recorded after it, it shows what is current
+/// then, and the render core sleeps meanwhile.
 pub fn render_due() -> bool {
+    if STATE.load(Ordering::Acquire) == FLIP && LAST_DIRECT.load(Ordering::Relaxed) && DIRECT.load(Ordering::Relaxed) {
+        return false;
+    }
     let nothing_waits = unsafe { (*(&raw const DIRTY)).is_empty() };
     let nothing_waits = nothing_waits && !layers::pending() && !DIRECT_PENDING.load(Ordering::Acquire);
     nothing_waits || STATE.load(Ordering::Acquire) == IDLE
@@ -679,6 +696,7 @@ pub fn flush() {
             p.layers = commit;
             p.req = unsafe { *(&raw const DIRECT_BOX) };
             DIRECT_PENDING.store(false, Ordering::Release);
+            LAST_DIRECT.store(true, Ordering::Relaxed);
             FRAMES.fetch_add(1, Ordering::Relaxed);
             let _ = show(p, 1 - p.front);
             FLIP_AT.store(systick::millis(), Ordering::Relaxed);
@@ -793,6 +811,7 @@ fn show(p: &mut Present, i: usize) -> Result<(), display::Error> {
 
 /// CPU0, IDLE, G2D on: starts the G2D present of `d` (+ the previous boxes).
 fn g2d_start(d: &mut Region) {
+    LAST_DIRECT.store(false, Ordering::Relaxed);
     let p = present_state();
     let back_i = 1 - p.front;
     let Some(back) = p.fb[back_i].as_ref().map(|fb| fb.address()) else {
@@ -997,6 +1016,7 @@ fn g2d_flipped() {
 /// still read), run `copied` (the shadow is free again), switch the FIMD to
 /// the back buffer and wait until it scans it.
 fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) {
+    LAST_DIRECT.store(false, Ordering::Relaxed);
     let back_i = 1 - p.front;
     let r = copy_region(p);
     // The alias with an uncached shadow: a cached read could hit lines from

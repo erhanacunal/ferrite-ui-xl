@@ -1328,13 +1328,15 @@ fn status_json() -> String {
         let d = &crate::lcd::DIRECT_COUNTS;
         let _ = write!(
             s,
-            ",\"direct\":{{\"on\":{},\"boxes\":{},\"frames\":{},\"declined\":{},\"syncs\":{},\"sync_bytes\":{}}}",
+            ",\"direct\":{{\"on\":{},\"boxes\":{},\"frames\":{},\"declined\":{},\"syncs\":{},\"sync_bytes\":{},\"flip_waits\":{},\"flip_wait_us\":{}}}",
             crate::lcd::DIRECT.load(Relaxed),
             crate::lcd::region::limit(),
             d[0].load(Relaxed),
             d[1].load(Relaxed),
             d[2].load(Relaxed),
-            d[3].load(Relaxed)
+            d[3].load(Relaxed),
+            d[4].load(Relaxed),
+            d[5].load(Relaxed)
         );
     }
     {

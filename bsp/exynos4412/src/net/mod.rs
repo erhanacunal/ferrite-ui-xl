@@ -1050,6 +1050,7 @@ pub const STORAGE_MIGRATE: u8 = 2;
 pub const STORAGE_STRESS_ON: u8 = 3;
 pub const STORAGE_STRESS_OFF: u8 = 4;
 pub const STORAGE_CHECK: u8 = 5;
+pub const STORAGE_CUT: u8 = 6;
 static STORAGE_TEXT: CriticalSectionMutex<RefCell<Option<(bool, String)>>> = CriticalSectionMutex::new(RefCell::new(None));
 
 /// CPU3: asks CPU0 for `what` (`STORAGE_STATUS` or `STORAGE_MIGRATE`); None when it does not
@@ -1081,6 +1082,10 @@ fn storage_service() {
             Err(report) => (false, report),
         },
         STORAGE_STRESS_ON | STORAGE_STRESS_OFF => match crate::storage::stress::set(what == STORAGE_STRESS_ON) {
+            Ok(t) => (true, t),
+            Err(t) => (false, t),
+        },
+        STORAGE_CUT => match crate::storage::stress::cut() {
             Ok(t) => (true, t),
             Err(t) => (false, t),
         },

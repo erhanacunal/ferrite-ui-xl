@@ -16,7 +16,7 @@
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/storage` | where the files are (`medium=USERDATA fs=ext4 size_mib=… free_mib=…`, or `medium=CACHE fs=fat32`) |
 //! | `POST /api/storage/migrate` | formats USERDATA (ext4), copies `FERRITE/` and `SYSTEM/` from CACHE, verifies and switches to it (`storage::migrate`); 409 with the report if it refused or failed. Blocks the UI for its seconds |
-//! | `POST /api/storage/stress?on=0\|1` | power-loss test load on USERDATA (`storage::stress`), off again after a restart |
+//! | `POST /api/storage/stress?on=0\|1` | power-loss test load on USERDATA (`storage::stress`), off again after a restart; `?cut=1`: in 1 s `cut.bin` is committed to the journal only and the board resets, so the next mount must replay it |
 //! | `GET /api/storage/check` | `Ext4::check` of USERDATA plus the stress files' contents; 409 when something is wrong |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
 //! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; `?scene=0\|1` syncs update the render pool's scene / capture it whole (`/api/status` `scene`); counters and the jobs' time breakdown in `/api/status` `rcore` |
@@ -281,6 +281,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
         },
         (b"POST", b"/api/storage/stress") => {
             let what = match query_param(query, b"on") {
+                _ if query_param(query, b"cut") == Some(b"1") => Some(super::STORAGE_CUT),
                 Some(b"1") => Some(super::STORAGE_STRESS_ON),
                 Some(b"0") => Some(super::STORAGE_STRESS_OFF),
                 _ => None,

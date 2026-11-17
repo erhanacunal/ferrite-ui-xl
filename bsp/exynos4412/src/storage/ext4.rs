@@ -351,6 +351,12 @@ pub fn list_dir(dir: &str) -> Option<Vec<(String, bool)>> {
     Some(out)
 }
 
+/// Commits the running transaction to the journal only (`Ext4::commit_to_log_only`): the file
+/// system is read-only after it, and the next mount must replay it.
+pub fn commit_to_log_only() -> Result<(), E> {
+    fs().ok_or(E::Io)?.commit_to_log_only()
+}
+
 /// What mount found: (not cleanly unmounted, a transaction replayed).
 pub fn mount_state() -> Option<(bool, bool)> {
     fs().map(|fs| fs.mount_state())

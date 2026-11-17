@@ -30,6 +30,10 @@ const FILES: u32 = 8;
 const BIG: usize = 4 << 20;
 
 static mut ON: bool = false;
+/// `systick::millis` when [`cut`] fires; 0 = none asked for.
+static mut CUT_AT: u32 = 0;
+/// The sequence [`cut`] writes `CUT.BIN` with.
+static mut CUT_SEQ: u32 = 0;
 static mut SEQ: u32 = 0;
 static mut APPENDED: u32 = 0;
 
@@ -110,6 +114,9 @@ const PASS_MS: u32 = 40;
 /// Operations of the load for [`PASS_MS`], when it is on. CPU0, once per pass.
 pub fn step() {
     let start = crate::systick::millis();
+    if unsafe { CUT_AT } != 0 && start.wrapping_sub(unsafe { CUT_AT }) < 0x8000_0000 {
+        fire_cut();
+    }
     while unsafe { ON } && crate::systick::millis().wrapping_sub(start) < PASS_MS {
         one();
     }
@@ -144,6 +151,43 @@ fn one() {
         exynos_4412_rs::println!("ferrite: stress step {} ERROR {}; stopping", seq, e);
         unsafe { ON = false };
     }
+}
+
+/// Asks for a cut in 1 s (time for the HTTP answer): `CUT.BIN` and a log record are written,
+/// committed to the journal only, and the board resets at once. After the restart the mount
+/// (uart_boot's) must replay them: [`check`] then finds `CUT.BIN` with this sequence.
+pub fn cut() -> Result<String, String> {
+    if !ext4::available() {
+        return Err("cut needs USERDATA
+".into());
+    }
+    let seq = unsafe { SEQ }.wrapping_add(100_000);
+    unsafe {
+        ON = false;
+        CUT_SEQ = seq;
+        CUT_AT = crate::systick::millis().wrapping_add(1000).max(1);
+    }
+    ext4::make_dirs(DIR);
+    Ok(format!("cut in 1 s: cut.bin with sequence {}, committed to the journal only, then reset
+", seq))
+}
+
+fn fire_cut() {
+    let seq = unsafe {
+        CUT_AT = 0;
+        CUT_SEQ
+    };
+    // Make sure only this transaction is pending: everything before it reaches home.
+    let _ = ext4::commit();
+    let r = ext4::write_new(DIR, "CUT.BIN", &file(seq, 50_000 + seq as usize % 4096))
+        .and_then(|()| ext4::append(DIR, "LOG.BIN", &record(seq), false))
+        .and_then(|()| ext4::commit_to_log_only());
+    match r {
+        Ok(()) => exynos_4412_rs::println!("ferrite: stress cut: sequence {} in the journal only; resetting", seq),
+        Err(e) => exynos_4412_rs::println!("ferrite: stress cut ERROR {}; resetting anyway", e),
+    }
+    exynos_4412_rs::console::flush();
+    <crate::platform::Exynos4412Platform as ferrite_core::runtime::PlatformRuntime>::reset();
 }
 
 /// The whole file system checked, then every stress file. The text is the report; `Ok` when
@@ -200,6 +244,10 @@ pub fn check() -> Result<String, String> {
             files += 1;
         } else {
             match file_ok(&data) {
+                Ok(seq) if upper == "CUT.BIN" => {
+                    let _ = writeln!(s, "cut.bin: whole, sequence {}", seq);
+                    files += 1;
+                }
                 Ok(_) => files += 1,
                 Err(why) => {
                     let _ = writeln!(s, "PROBLEM {}: {} ({} bytes)", name, why, data.len());

@@ -1242,16 +1242,21 @@ impl State {
     /// is at most a screen wide: the fragment shader's texel coordinates are exact across
     /// 1280 texels (`gpu.rs` self-test), not across a 2560-wide pager. False to decline.
     fn layer(&mut self, objs: &ObjPool, ui: &Ui, s: usize, r: &R, screen: &R) -> bool {
-        let slot = &objs.layers.slots[s];
-        let shown = r.meet(screen);
-        if shown.is_empty() || slot.alpha == 0 {
+        self.layer_quad(ui.any_565_stride, s, r, &r.meet(screen), objs.layers.slots[s].alpha)
+    }
+
+    /// [`State::layer`]'s quad: layer `s`'s surface with its top-left at `r`'s, the part
+    /// `shown` (inside `r`), times `alpha`. Also the GPU player's `Op::LayerCompose`.
+    fn layer_quad(&mut self, any_565: bool, s: usize, r: &R, shown: &R, alpha: u8) -> bool {
+        let shown = shown.meet(r);
+        if shown.is_empty() || alpha == 0 {
             return true;
         }
         let (sx, sy) = ((shown.x0 - r.x0) as usize, (shown.y0 - r.y0) as usize);
         let (w, h) = (shown.w() as usize, shown.h() as usize);
         let Some((base, lw, lh)) = lcd::layer_texture(s, sx, sy, w, h) else { return false };
         let stride = lw * 4;
-        if sx + w > lw || sy + h > lh || (!ui.any_565_stride && stride % 64 != 0) {
+        if sx + w > lw || sy + h > lh || (!any_565 && stride % 64 != 0) {
             return false;
         }
         let addr = base + (sy * lw + sx) * 4;
@@ -1260,7 +1265,7 @@ impl State {
         let (tw, th) = (tex.w as f32, tex.h as f32);
         let u = ((shift as f32 - shown.x0 as f32) / tw, 1.0 / tw);
         let v = (-(shown.y0 as f32) / th, 1.0 / th);
-        let a = slot.alpha as f32 / 255.0;
+        let a = alpha as f32 / 255.0;
         self.prims.push(Prim::Flat { rect: shown, u, v, color: Lin::flat([a; 4]), tex });
         true
     }

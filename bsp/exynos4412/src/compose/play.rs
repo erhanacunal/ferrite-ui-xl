@@ -13,7 +13,9 @@
 //!
 //! Retained layers (`Op::Layer` markers, core `render::layer_areas`): a layer's areas are in
 //! its coordinates and drawn into its surface (`lcd::layer_gpu_target`), cleared transparent
-//! first; each target's areas are drawn on their own (the screen's, then each layer's).
+//! first; each target's areas are drawn on their own, the layers' before the screen's: a
+//! composed layer's root (`Op::LayerCompose`) is a quad sampling its surface (as
+//! [`compose`]'s), drawn after this frame's changes to it.
 //!
 //! The pixels are the compositor's, not the CPU's (anti-aliasing within a few 1/255).
 
@@ -85,6 +87,8 @@ pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
     if groups.is_empty() {
         return verdict(OUTSIDE);
     }
+    // The layers' surfaces before the screen, which may sample them (`Op::LayerCompose`).
+    groups.sort_by_key(|g| g.0.is_none());
     let all = || groups.iter().flat_map(|g| g.1.iter().map(R::of));
     let frames: i32 = all().map(|a| frames_of(&a)).sum();
     let kpx: i32 = all().map(|a| a.w() * a.h() / 1000).sum();
@@ -195,6 +199,16 @@ impl State {
                 }
                 // The frame starts the area transparent (`State::draw` on a layer).
                 Op::LayerClear(_) => true,
+                // A composed layer's root: its surface (drawn by an earlier group).
+                Op::LayerCompose { n, x, y, w, h, clip: c, alpha } => {
+                    let shown = R::of(&c).meet(&clip);
+                    match lcd::layer_gpu_target(n as usize) {
+                        // Only a surface the GPU draws (uncached for the CPU): one the CPU
+                        // replay drew may still be in its caches.
+                        Some(_) => self.layer_quad(self.any_565, n as usize, &rect(x as i32, y as i32, w as i32, h as i32), &shown, alpha),
+                        None => false,
+                    }
+                }
                 Op::SetScissor(r) => {
                     clip = match r {
                         Some(r) => R::of(&r).meet(&area),

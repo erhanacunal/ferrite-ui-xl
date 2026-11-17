@@ -71,7 +71,7 @@ pub static BYTES: AtomicU32 = AtomicU32::new(0);
 /// `POST /api/rcore?ops=1`): what a GPU player of the lists must cover.
 pub static OP_STATS: AtomicBool = AtomicBool::new(false);
 /// Opcodes 0..`OPCODES`: calls and words (header included) since boot.
-pub const OPCODES: usize = 39;
+pub const OPCODES: usize = 40;
 pub static OP_CALLS: [AtomicU32; OPCODES] = [const { AtomicU32::new(0) }; OPCODES];
 pub static OP_WORDS: [AtomicU32; OPCODES] = [const { AtomicU32::new(0) }; OPCODES];
 
@@ -82,6 +82,7 @@ pub const OP_NAMES: [&str; OPCODES] = [
     "pen_to", "pen_finish", "pen_end", "fill_polygon", "circle", "fill_circle", "ellipse", "fill_ellipse",
     "stroke_ellipse", "oval", "arc", "thin_arc", "rounded_rect", "fill_rounded_rect", "fill_rounded_rect_at",
     "gradient_rounded_rect_at", "stroke_rounded_rect", "image", "text", "area", "layer", "layer_clear",
+    "layer_compose",
 ];
 
 /// Image / text calls replayed whose image or font the replaying side
@@ -201,6 +202,9 @@ pub enum Op<'a> {
     Layer(Option<(usize, u16, u16)>),
     /// `Canvas::clear_layer`: this rect of the targeted layer's surface made transparent.
     LayerClear(Rect),
+    /// `Canvas::compose_layer`: layer `n`'s `w`×`h` surface, its top-left at (`x`, `y`),
+    /// blended over the screen inside `clip`, times `alpha`.
+    LayerCompose { n: u8, x: i16, y: i16, w: u16, h: u16, clip: Rect, alpha: u8 },
 }
 
 impl Op<'_> {
@@ -245,6 +249,7 @@ impl Op<'_> {
             Op::Area(..) => code::AREA,
             Op::Layer(..) => code::LAYER,
             Op::LayerClear(..) => code::LAYER_CLEAR,
+            Op::LayerCompose { .. } => code::LAYER_COMPOSE,
         }
     }
 }
@@ -322,6 +327,8 @@ mod code {
     pub const LAYER: u8 = 37;
     /// `x|y` `w|h` (`Canvas::clear_layer`).
     pub const LAYER_CLEAR: u8 = 38;
+    /// `[n]{alpha}` `x|y` `w|h` `clip x|y` `clip w|h` (`Canvas::compose_layer`).
+    pub const LAYER_COMPOSE: u8 = 39;
 
     /// TEXT: bit 16 of the `bg` word.
     pub const HAS_BG: u32 = 1 << 16;
@@ -763,6 +770,7 @@ impl List {
                 Op::Area(r) => c.area(r),
                 Op::Layer(t) => c.target_layer(t),
                 Op::LayerClear(r) => c.clear_layer(r),
+                Op::LayerCompose { n, x, y, w, h, clip, alpha } => c.compose_layer(n as usize, x, y, w, h, clip, alpha),
             }
         }
     }
@@ -1028,6 +1036,11 @@ impl<'a> Iterator for Ops<'a> {
                 let [p, sz] = self.args();
                 Op::LayerClear(Rect::new(lo(p) as i16, hi(p) as i16, lo(sz), hi(sz)))
             }
+            code::LAYER_COMPOSE => {
+                let [p, sz, cp, csz] = self.args();
+                let clip = Rect::new(lo(cp) as i16, hi(cp) as i16, lo(csz), hi(csz));
+                Op::LayerCompose { n: a, x: lo(p) as i16, y: hi(p) as i16, w: lo(sz), h: hi(sz), clip, alpha: b as u8 }
+            }
             op => panic!("dl: bad opcode {op} at word {}", self.i - 1),
         })
     }
@@ -1241,6 +1254,11 @@ impl Canvas for Recorder {
     }
     fn clear_layer(&self, r: Rect) {
         self.l().call(&[header(code::LAYER_CLEAR, 0, 0), pki(r.x, r.y), pk(r.w, r.h)]);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compose_layer(&self, n: usize, x: i16, y: i16, w: u16, h: u16, clip: Rect, alpha: u8) {
+        let head = header(code::LAYER_COMPOSE, n as u8, alpha as u16);
+        self.l().call(&[head, pki(x, y), pk(w, h), pki(clip.x, clip.y), pk(clip.w, clip.h)]);
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
@@ -1613,6 +1631,7 @@ mod tests {
         r.target_layer(Some((2, 2560, 560)));
         r.clear_layer(Rect::new(-16, 32, 64, 48));
         r.target_layer(None);
+        r.compose_layer(1, -40, 120, 2560, 560, Rect::new(0, 120, 1280, 560), 200);
         r.set_scissor(None);
 
         let want = [
@@ -1657,6 +1676,7 @@ mod tests {
             Op::Layer(Some((2, 2560, 560))),
             Op::LayerClear(Rect::new(-16, 32, 64, 48)),
             Op::Layer(None),
+            Op::LayerCompose { n: 1, x: -40, y: 120, w: 2560, h: 560, clip: Rect::new(0, 120, 1280, 560), alpha: 200 },
             Op::SetScissor(None),
         ];
         let l = r.list();

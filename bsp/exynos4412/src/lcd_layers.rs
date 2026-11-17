@@ -179,8 +179,18 @@ impl Layer {
             return;
         }
         if want {
-            mmu::clean_dcache_range(self.base, bytes);
-            mmu::invalidate_dcache_range(self.base, bytes);
+            let l2 = L2c::new();
+            if bytes >= CLEAN_ALL_BYTES && l2.is_enabled() {
+                // A big surface (a 2560-wide pager: 5.7 MB, ~45 ms by lines when a program's
+                // layers become GPU targets): the whole caches by set/way. No line of it is
+                // left dirty, so none is written back over the GPU's or the alias's pixels;
+                // clean ones may stay, the CPU reads the alias from now on.
+                mmu::clean_l1_all();
+                l2.clean_all();
+            } else {
+                mmu::clean_dcache_range(self.base, bytes);
+                mmu::invalidate_dcache_range(self.base, bytes);
+            }
             self.px = alias.unwrap_or(self.base);
         } else {
             // SAFETY: a barrier only: the alias's stores are in DRAM first.

@@ -11,7 +11,7 @@
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/wifi` | JSON: what the last scan saw of the configured network (BSSIDs, channels, their information elements as hex), the BSSID joined, the last RSN mismatch (diagnostics) |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
-//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?merge=0\|1` pieces merged into fewer draws / a draw per run of pieces; `?round_px=N` largest `ui_round` box drawn as four quarters (0 = always nine pieces); `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
+//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?merge=0\|1` pieces merged into fewer draws / a draw per run of pieces; `?round_px=N` largest `ui_round` box drawn as four quarters (0 = always nine pieces); `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`); `?direct=0\|1` GPU player frames straight into the back scan buffer / into the shadow (`lcd::DIRECT`); `?boxes=1..4` damage boxes (`lcd::region::BOXES`); `?layer_compose=0\|1` mode 3 composes layers on the GPU / draws them in the tree (`render::AREAS_COMPOSE`) |
 //! | `POST /api/backlight?percent=N` | backlight 0..100 % (applied by CPU0 in `frame_end`; boots at 6 %) |
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/storage` | where the files are (`medium=USERDATA fs=ext4 size_mib=… free_mib=…`, or `medium=CACHE fs=fat32`) |
@@ -371,6 +371,12 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             if let Some(v @ (b"1" | b"2" | b"3" | b"4")) = query_param(query, b"boxes") {
                 crate::lcd::region::BOXES.store((v[0] - b'0') as usize, Ordering::Relaxed);
                 text(socket, "200 OK", "Damage boxes set\n").await?;
+                return Ok(false);
+            }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"layer_compose") {
+                let on = v == b"1";
+                ferrite_core::render::AREAS_COMPOSE.store(on, Ordering::Relaxed);
+                text(socket, "200 OK", if on { "Mode 3 composes layers on the GPU\n" } else { "Mode 3 draws composed layers in the tree\n" }).await?;
                 return Ok(false);
             }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"direct") {

@@ -49,6 +49,11 @@ pub const MODE_AREAS: u8 = 3;
 
 /// Frames recorded for the render side to play (`MODE_PLAY`), their
 /// commands and their bytes, since boot.
+/// `MODE_AREAS` keeps composed layers (a root over which something is drawn records
+/// `Canvas::compose_layer`, the GPU player samples the surface); off = such a layer goes
+/// back to the tree, as before (exynos `POST /api/compose?layer_compose=0|1`).
+pub static AREAS_COMPOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 pub static PLAYS: [core::sync::atomic::AtomicU32; 3] = [const { core::sync::atomic::AtomicU32::new(0) }; 3];
 
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
@@ -979,10 +984,10 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
     };
     // Plain drawing: no layers (dropped ones go back to the tree below). Areas
     // (`MODE_AREAS`) record the layers' areas for the player too (`layer_areas`),
-    // but not composed layers (`LcdImpl::layer_compose` draws past the recording).
+    // composed ones too: a composed root records `Canvas::compose_layer`.
     let areas = ctx.objs.render.areas;
     let count = if ctx.objs.render.plain && !areas { 0 } else { ctx.lcd.layer_count() };
-    let can_compose = ctx.lcd.can_compose() && !areas;
+    let can_compose = ctx.lcd.can_compose() && (!areas || AREAS_COMPOSE.load(core::sync::atomic::Ordering::Relaxed));
     let mut active = 0;
     let mut composed = 0u8;
     for s in 0..MAX_LAYERS {
@@ -1863,9 +1868,9 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
     if let Some(s) = ctx.objs.composed_root(id) {
         // A composed layer's root on the screen: its surface.
         let slot = &ctx.objs.layers.slots[s];
-        let (at, size) = (Offset { x: abs.x, y: abs.y }, crate::types::Size { w: slot.w, h: slot.h });
+        // Through the canvas: recorded for the GPU player in `MODE_AREAS`.
         for r in clip.iter() {
-            ctx.lcd.layer_compose(s, at, size, r, slot.alpha);
+            screen!(ctx, |c| c.compose_layer(s, abs.x, abs.y, slot.w, slot.h, *r, slot.alpha));
         }
         crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
         return;

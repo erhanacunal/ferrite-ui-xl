@@ -134,6 +134,12 @@ pub trait Canvas {
 
     /// Makes `r` of the targeted layer's surface transparent (`LcdImpl::layer_clear`).
     fn clear_layer(&self, _r: Rect) {}
+
+    /// Blends layer `n`'s `w`×`h` surface, its top-left at (`x`, `y`), over the screen
+    /// inside `clip` (and the scissor), times `alpha` (a composed layer's root:
+    /// `LcdImpl::layer_compose`); a recording canvas notes it for the GPU player.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_layer(&self, _n: usize, _x: i16, _y: i16, _w: u16, _h: u16, _clip: Rect, _alpha: u8) {}
 }
 
 /// The immediate canvas: everything goes straight to the backend.
@@ -172,6 +178,9 @@ impl<B: LcdBackend> Canvas for LcdImpl<B> {
     }
     fn clear_layer(&self, r: Rect) {
         LcdImpl::layer_clear(self, &r)
+    }
+    fn compose_layer(&self, n: usize, x: i16, y: i16, w: u16, h: u16, clip: Rect, alpha: u8) {
+        LcdImpl::layer_compose(self, n, crate::types::Offset { x, y }, crate::types::Size { w, h }, &clip, alpha)
     }
 
     #[inline]

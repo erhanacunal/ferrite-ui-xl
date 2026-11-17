@@ -2,7 +2,11 @@
 //! triangles whose vertices carry a coverage (HWUI's "vertex alpha" anti-aliasing,
 //! `PathTessellator::getFillVerticesFromPerimeterAA`). An edge gets a fringe one pixel wide:
 //! coverage 1 on its inner side, 0 on its outer side, interpolated between, so the fragment
-//! shader only multiplies its colour by the interpolated coverage.
+//! shader only multiplies its colour by the interpolated coverage. A vertex's `a` runs 0..2
+//! and the coverage is `min(a, 2 − a)` (the fragment shader's tent): 0..1 is the coverage
+//! itself, and a strip from 0 on one side to 2 on the other peaks at 1 along its middle, so a
+//! 1 px line's segment is one quad, not two (Impeller's way: the shader shapes the
+//! anti-aliasing, the geometry only bounds it).
 //!
 //! The geometry is `smooth.rs`'s, in continuous coordinates (pixel `px` spans `px..px + 1`,
 //! its centre `px + 0.5` is where a GPU samples it):
@@ -19,7 +23,7 @@
 
 use alloc::vec::Vec;
 
-/// A vertex: position in pixels, coverage 0..1.
+/// A vertex: position in pixels, `a` 0..2 (coverage `min(a, 2 − a)`, see the module).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vtx {
     pub x: f32,
@@ -270,8 +274,8 @@ const DISK: [(f32, f32); 8] = [
 /// it: coverage 1 − the distance from the line (`smooth.rs` `Stroke::cov` with a radius of
 /// ½), round ends.
 ///
-/// Each segment is a strip from coverage 0 on one side through 1 on the line to 0 on the
-/// other, along its own normal; the two ends get a disk (1 at the centre, 0 at radius 1).
+/// Each segment is one quad from `a` 0 on one side to 2 on the other along its own normal
+/// (coverage 0, 1 on the line, 0); the two ends get a disk (1 at the centre, 0 at radius 1).
 /// Where strips overlap inside a turn, the GPU blends one colour "over" itself
 /// (`a + b·(1 − a)`, never past 1) while the CPU takes the strongest segment: the two agree
 /// along straight runs and differ a little inside sharp turns. Points within
@@ -308,8 +312,7 @@ pub fn polyline_within(m: &mut Mesh<'_>, pts: &[(i32, i32)], within: f32) {
         let o = (-dy / l, dx / l);
         let (la, lb) = ((a.0 + o.0, a.1 + o.1), (b.0 + o.0, b.1 + o.1));
         let (ra, rb) = ((a.0 - o.0, a.1 - o.1), (b.0 - o.0, b.1 - o.1));
-        m.quad(v(la, 0.0), v(lb, 0.0), v(b, 1.0), v(a, 1.0));
-        m.quad(v(a, 1.0), v(b, 1.0), v(rb, 0.0), v(ra, 0.0));
+        m.quad(v(la, 0.0), v(lb, 0.0), v(rb, 2.0), v(ra, 2.0));
         if i % POLY_CHUNK == 0 {
             m.end(s);
             s = m.begin();
@@ -986,7 +989,8 @@ pub(crate) mod raster {
                     let w2 = cross(a, b, x, y);
                     let inside = |w: i64, p, q| w > 0 || (w == 0 && owns(p, q));
                     if inside(w0, b, c) && inside(w1, c, a) && inside(w2, a, b) {
-                        let cov = (w0 as f32 * a.2 + w1 as f32 * b.2 + w2 as f32 * c.2) / area as f32;
+                        let a = (w0 as f32 * a.2 + w1 as f32 * b.2 + w2 as f32 * c.2) / area as f32;
+                        let cov = a.min(2.0 - a);
                         add(&mut out[py * n + px], cov);
                     }
                 }

@@ -6,7 +6,7 @@
 //! flash shadow's pictures), so frames can draw into any of them and sample textures where they
 //! are. Each user points the GPU at its own target before a frame (`Gpu::set_target`).
 //!
-//! **UI programs.** The compositor's two shader pairs (`shaders/ui_flat`, `shaders/ui_round`,
+//! **UI programs.** The compositor's shader pairs (`shaders/ui_flat`, `shaders/ui_round`, `shaders/ui_cov`,
 //! compiled into `compose/shaders.rs` by the HAL's `tools/shaderc`) are loaded once, then a
 //! self-test frame ([`self_test`]) checks what the compositor relies on and the documentation
 //! leaves open: which way round the descriptor's red/blue bit is for ARGB words and RGB565,
@@ -21,7 +21,7 @@ use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::gpu::{Area, Blend, Gpu, Shaders, Target};
 use exynos_4412_rs::{heap, mmu};
 
-use crate::compose::shaders::{UI_FLAT, UI_ROUND};
+use crate::compose::shaders::{UI_COV, UI_FLAT, UI_ROUND};
 use crate::lcd;
 
 /// What the compositor draws with: see the module's documentation.
@@ -29,6 +29,8 @@ use crate::lcd;
 pub struct Ui {
     pub flat: Shaders,
     pub round: Shaders,
+    /// The tessellator's anti-aliased triangles (`Prim::Tris`).
+    pub cov: Shaders,
     /// Little-endian 0xAARRGGBB words (sprites, model buffers).
     pub argb: TexelFormat,
     /// RGB565, red in the top bits (pictures in the flash shadow).
@@ -196,19 +198,19 @@ fn ui(gpu: &mut Gpu) -> Option<Ui> {
     if !cfg!(feature = "gpu_compose") {
         return None;
     }
-    if UI_FLAT.vertex.is_empty() || UI_ROUND.vertex.is_empty() {
+    if UI_FLAT.vertex.is_empty() || UI_ROUND.vertex.is_empty() || UI_COV.vertex.is_empty() {
         note(format_args!("GPU compositor off: compose/shaders.rs has no compiled shaders"));
         return None;
     }
-    let loaded = gpu.shaders(&UI_FLAT).and_then(|flat| Ok((flat, gpu.shaders(&UI_ROUND)?)));
-    let (flat, round) = match loaded {
+    let loaded = gpu.shaders(&UI_FLAT).and_then(|flat| Ok((flat, gpu.shaders(&UI_ROUND)?, gpu.shaders(&UI_COV)?)));
+    let (flat, round, cov) = match loaded {
         Ok(loaded) => loaded,
         Err(e) => {
             note(format_args!("GPU compositor off: shaders: {:?}", e));
             return None;
         }
     };
-    let ui = Ui { flat, round, argb: TexelFormat::BGRA_BYTES, rgb565: TexelFormat::RGB_565, any_565_stride: false };
+    let ui = Ui { flat, round, cov, argb: TexelFormat::BGRA_BYTES, rgb565: TexelFormat::RGB_565, any_565_stride: false };
     match self_test(gpu, ui) {
         Ok(ui) => {
             note(format_args!(
@@ -402,7 +404,11 @@ fn self_test(gpu: &mut Gpu, mut ui: Ui) -> Result<Ui, &'static str> {
         frame.draw(&mesh).uniform("scale", &scale).blend(Blend::Premultiplied);
     }
     frame.show().map_err(|_| "frame")?;
-    // Read what the GPU wrote: no stale line of it is cached (discarded above).
+    // Read what the GPU wrote: invalidated, as the CPU or the L2 may have pulled lines of the
+    // target (its zeros) back in while the frame ran (the discard before it only kept dirty
+    // lines off the GPU's output). A slower frame start (0.3 ms cleaning all of the PPs'
+    // streams) used to hide this; a faster one failed the test at random.
+    mmu::invalidate_dcache_range(target.addr(), SIDE * SIDE * 4);
     let px = |x: usize, y: usize| unsafe { core::ptr::read_volatile(target.ptr.add(y * SIDE + x)) };
     let (red, blue) = (0x00FF_0000u32, 0x0000_00FFu32);
     let rgb_of = |p: u32| p & 0x00FF_FFFF;

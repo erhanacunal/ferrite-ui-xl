@@ -190,10 +190,10 @@ enum Prim {
     /// `ui_flat`: `tex` over `rect`, texel coordinates `u.0 + u.1 * x` (and v likewise),
     /// times `color` (solid colours: the white texel times it).
     Flat { rect: R, u: (f32, f32), v: (f32, f32), color: Lin, tex: Tex },
-    /// `ui_flat` with the white texel: triangles `start..start + len` of `State::tverts`
-    /// (`ferrite_core::lcd::tess`, coverage per vertex) inside `bbox`, times `color`. Not cut
-    /// to a frame: the GPU clips them to it.
-    Tris { bbox: R, start: u32, len: u32, color: Lin, white: usize },
+    /// `ui_cov`: triangles `start..start + len` of `State::tverts` (`ferrite_core::lcd::tess`,
+    /// coverage per vertex as the tent of `a`) inside `bbox`, times `color`. Not cut to a
+    /// frame: the GPU clips them to it.
+    Tris { bbox: R, start: u32, len: u32, color: Lin },
 }
 
 impl Prim {
@@ -208,7 +208,7 @@ impl Prim {
         match *self {
             Prim::Round { .. } => Batch::Round,
             Prim::Flat { tex, .. } => Batch::Flat(tex),
-            Prim::Tris { white, .. } => Batch::Flat(Tex { addr: white, w: 1, h: 1, stride: 64, fmt: Fmt::Argb }),
+            Prim::Tris { .. } => Batch::Cov,
         }
     }
 }
@@ -216,6 +216,7 @@ impl Prim {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Batch {
     Round,
+    Cov,
     Flat(Tex),
 }
 
@@ -256,6 +257,8 @@ struct State {
     border: Vec<[f32; 4]>,
     uv: Vec<[f32; 2]>,
     color: Vec<[f32; 4]>,
+    /// `ui_cov`'s `a` (the tessellator's vertex coverage).
+    tri_a: Vec<[f32; 1]>,
     /// Anti-aliased triangles of this render's `Prim::Tris` (`tess`), and the tessellator's
     /// chunks of the shape being added.
     tverts: Vec<tess::Vtx>,
@@ -306,6 +309,7 @@ static mut STATE: State = State {
     border: Vec::new(),
     uv: Vec::new(),
     color: Vec::new(),
+    tri_a: Vec::new(),
     tverts: Vec::new(),
     tchunks: Vec::new(),
     meshes: MeshCache { entries: Vec::new(), clock: 0 },
@@ -1459,7 +1463,7 @@ impl State {
                     }
                 }
             }
-            self.prims.push(Prim::Tris { bbox, start: start as u32, len: len as u32, color, white: self.white });
+            self.prims.push(Prim::Tris { bbox, start: start as u32, len: len as u32, color });
         }
     }
 
@@ -2119,9 +2123,8 @@ impl State {
             let (ox, oy) = (c.x0 as f32, c.y0 as f32);
             for v in &self.tverts[start..start + len] {
                 self.pos.push([v.x - ox, v.y - oy]);
-                self.uv.push([0.5, 0.5]);
-                let k = color.at(v.x, v.y);
-                self.color.push([k[0] * v.a, k[1] * v.a, k[2] * v.a, k[3] * v.a]);
+                self.color.push(color.at(v.x, v.y));
+                self.tri_a.push([v.a]);
             }
             return;
         }
@@ -2164,6 +2167,15 @@ impl State {
                 .map(|mesh| {
                     frame.draw(&mesh).uniform("scale", &scale).blend(Blend::Premultiplied);
                 }),
+            Batch::Cov => frame
+                .mesh(&ui.cov)
+                .attribute("pos", &self.pos)
+                .attribute("color", &self.color)
+                .attribute("a", &self.tri_a)
+                .build()
+                .map(|mesh| {
+                    frame.draw(&mesh).uniform("scale", &scale).blend(Blend::Premultiplied);
+                }),
             Batch::Flat(t) => {
                 let format = match t.fmt {
                     Fmt::Argb => ui.argb,
@@ -2192,6 +2204,7 @@ impl State {
         self.border.clear();
         self.uv.clear();
         self.color.clear();
+        self.tri_a.clear();
         result
     }
 }

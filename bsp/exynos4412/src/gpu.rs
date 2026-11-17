@@ -6,7 +6,7 @@
 //! flash shadow's pictures), so frames can draw into any of them and sample textures where they
 //! are. Each user points the GPU at its own target before a frame (`Gpu::set_target`).
 //!
-//! **UI programs.** The compositor's shader pairs (`shaders/ui_flat`, `shaders/ui_round`, `shaders/ui_cov`,
+//! **UI programs.** The compositor's shader pairs (`shaders/ui_flat`, `shaders/ui_round`, `shaders/ui_cov`, `shaders/ui_band`,
 //! compiled into `compose/shaders.rs` by the HAL's `tools/shaderc`) are loaded once, then a
 //! self-test frame ([`self_test`]) checks what the compositor relies on and the documentation
 //! leaves open: which way round the descriptor's red/blue bit is for ARGB words and RGB565,
@@ -21,7 +21,7 @@ use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::gpu::{Area, Blend, Gpu, Shaders, Target};
 use exynos_4412_rs::{heap, mmu};
 
-use crate::compose::shaders::{UI_COV, UI_FLAT, UI_ROUND};
+use crate::compose::shaders::{UI_BAND, UI_COV, UI_FLAT, UI_ROUND};
 use crate::lcd;
 
 /// What the compositor draws with: see the module's documentation.
@@ -31,6 +31,8 @@ pub struct Ui {
     pub round: Shaders,
     /// The tessellator's anti-aliased triangles (`Prim::Tris`).
     pub cov: Shaders,
+    /// Circles' edge bands of them (`tess::quarter_band`).
+    pub band: Shaders,
     /// Little-endian 0xAARRGGBB words (sprites, model buffers).
     pub argb: TexelFormat,
     /// RGB565, red in the top bits (pictures in the flash shadow).
@@ -198,19 +200,19 @@ fn ui(gpu: &mut Gpu) -> Option<Ui> {
     if !cfg!(feature = "gpu_compose") {
         return None;
     }
-    if UI_FLAT.vertex.is_empty() || UI_ROUND.vertex.is_empty() || UI_COV.vertex.is_empty() {
+    if UI_FLAT.vertex.is_empty() || UI_ROUND.vertex.is_empty() || UI_COV.vertex.is_empty() || UI_BAND.vertex.is_empty() {
         note(format_args!("GPU compositor off: compose/shaders.rs has no compiled shaders"));
         return None;
     }
-    let loaded = gpu.shaders(&UI_FLAT).and_then(|flat| Ok((flat, gpu.shaders(&UI_ROUND)?, gpu.shaders(&UI_COV)?)));
-    let (flat, round, cov) = match loaded {
+    let loaded = gpu.shaders(&UI_FLAT).and_then(|flat| Ok((flat, gpu.shaders(&UI_ROUND)?, gpu.shaders(&UI_COV)?, gpu.shaders(&UI_BAND)?)));
+    let (flat, round, cov, band) = match loaded {
         Ok(loaded) => loaded,
         Err(e) => {
             note(format_args!("GPU compositor off: shaders: {:?}", e));
             return None;
         }
     };
-    let ui = Ui { flat, round, cov, argb: TexelFormat::BGRA_BYTES, rgb565: TexelFormat::RGB_565, any_565_stride: false };
+    let ui = Ui { flat, round, cov, band, argb: TexelFormat::BGRA_BYTES, rgb565: TexelFormat::RGB_565, any_565_stride: false };
     match self_test(gpu, ui) {
         Ok(ui) => {
             note(format_args!(

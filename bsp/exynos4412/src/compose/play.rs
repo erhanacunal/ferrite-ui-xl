@@ -32,9 +32,10 @@ const FAILED: usize = 5;
 pub static PLAY_LAST_OP: AtomicU32 = AtomicU32::new(0);
 /// Measurement (HTTP `POST /api/compose?play_hist=1|0`, off at boot; on = zeroed): per
 /// opcode, the calls played, the pieces they made, those pieces' pixels (their rects,
-/// triangles' boxes) and the µs turning them into pieces, summed over the lists (`/api/status` `compositor.play_hist`).
+/// triangles' boxes), the µs turning them into pieces and the triangles' vertices, summed over
+/// the lists (`/api/status` `compositor.play_hist`).
 pub static PLAY_HIST_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-pub static PLAY_HIST: [[AtomicU32; 4]; ferrite_core::dl::OPCODES] = [const { [const { AtomicU32::new(0) }; 4] }; ferrite_core::dl::OPCODES];
+pub static PLAY_HIST: [[AtomicU32; 5]; ferrite_core::dl::OPCODES] = [const { [const { AtomicU32::new(0) }; 5] }; ferrite_core::dl::OPCODES];
 
 fn verdict(slot: usize) -> bool {
     PLAY_COUNTS[slot].fetch_add(1, Relaxed);
@@ -318,6 +319,8 @@ impl State {
                 PLAY_HIST[code][0].fetch_add(1, Relaxed);
                 PLAY_HIST[code][1].fetch_add((self.prims.len() - before) as u32, Relaxed);
                 PLAY_HIST[code][2].fetch_add(px, Relaxed);
+                let verts: u32 = self.prims[before..].iter().map(|p| if let Prim::Tris { len, .. } = *p { len } else { 0 }).sum();
+                PLAY_HIST[code][4].fetch_add(verts, Relaxed);
             }
             if !ok {
                 result = Err(code as u8);

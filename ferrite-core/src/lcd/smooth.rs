@@ -1263,6 +1263,10 @@ mod tests {
             (40, 40, 30, 4),
             (11, 7, 2, 0),
             (12, 12, 6, 6),
+            // Fills with a band a corner (`tess::quarter_band`): large radii, a circle.
+            (86, 60, 29, 0),
+            (86, 86, 43, 0),
+            (85, 85, 42, 0),
         ];
         for (w, h, r, t) in cases {
             let (cpu, _) = draw(|l| {
@@ -1297,6 +1301,7 @@ mod tests {
             // The corner ramps: chords for arcs, coverage interpolated across a triangle
             // instead of by distance.
             // 2.5·√r segments a quarter: at most ~0.07 here (0.11 with 1.8·√r, 0.04 with 3.6·√r).
+            // Fills (a band a corner, the distance in the shader): at most ~0.03.
             assert!(worst.0 < 0.08, "rrect {w}x{h} r={r} t={t}: ({}, {}) off by {}", worst.1, worst.2, worst.0);
         }
     }

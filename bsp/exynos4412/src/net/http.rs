@@ -1096,13 +1096,14 @@ fn status_json() -> String {
             let name = ferrite_core::dl::OP_NAMES.get(code).copied().unwrap_or("?");
             let _ = write!(
                 s,
-                "{}\"{}\":[{},{},{},{}]",
+                "{}\"{}\":[{},{},{},{},{}]",
                 if first { "" } else { "," },
                 name,
                 calls,
                 row[1].load(core::sync::atomic::Ordering::Relaxed),
                 row[2].load(core::sync::atomic::Ordering::Relaxed),
-                row[3].load(core::sync::atomic::Ordering::Relaxed)
+                row[3].load(core::sync::atomic::Ordering::Relaxed),
+                row[4].load(core::sync::atomic::Ordering::Relaxed)
             );
             first = false;
         }

@@ -23,16 +23,21 @@
 
 use alloc::vec::Vec;
 
-/// A vertex: position in pixels, `a` 0..2 (coverage `min(a, 2 − a)`, see the module).
+/// A vertex: position in pixels, `a` 0..2 (coverage `min(a, 2 − a)`, see the module); in a
+/// circle's edge band ([`Chunk::band`]) the coverage is `clamp(a − t²·k)` instead, `a` and `t`
+/// the radial and tangential terms in the band's own frame (see `quarter_band`), 0 elsewhere.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vtx {
     pub x: f32,
     pub y: f32,
     pub a: f32,
+    pub t: f32,
+    pub k: f32,
 }
 
 /// Triangles `start..start + len` of the vertex list (`len` a multiple of 3), inside the box
-/// `x0..x1` × `y0..y1` (whole pixels, rounded outwards).
+/// `x0..x1` × `y0..y1` (whole pixels, rounded outwards). `band`: a circle's edge band, whose
+/// coverage is `clamp(a − t²·k)` (a GPU draws it with its own fragment shader).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chunk {
     pub start: usize,
@@ -41,6 +46,7 @@ pub struct Chunk {
     pub y0: i32,
     pub x1: i32,
     pub y1: i32,
+    pub band: bool,
 }
 
 /// Collects triangles into chunks.
@@ -56,6 +62,10 @@ impl Mesh<'_> {
     }
 
     fn end(&mut self, start: usize) {
+        self.end_as(start, false);
+    }
+
+    fn end_as(&mut self, start: usize, band: bool) {
         let len = self.verts.len() - start;
         if len == 0 {
             return;
@@ -74,6 +84,7 @@ impl Mesh<'_> {
             y0: libm::floorf(y0) as i32,
             x1: libm::ceilf(x1) as i32,
             y1: libm::ceilf(y1) as i32,
+            band,
         });
     }
 
@@ -92,7 +103,7 @@ impl Mesh<'_> {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let v = |x, y| Vtx { x, y, a: 1.0 };
+        let v = |x, y| Vtx { x, y, a: 1.0, t: 0.0, k: 0.0 };
         self.quad(v(x0, y0), v(x1, y0), v(x1, y1), v(x0, y1));
     }
 }
@@ -123,9 +134,9 @@ fn quarter(m: &mut Mesh<'_>, cx: f32, cy: f32, sx: f32, sy: f32, rings: &[(f32, 
     }
     let at = |i: usize, rad: f32, a: f32| {
         let (c, s) = dirs[i];
-        Vtx { x: cx + sx * rad * c, y: cy + sy * rad * s, a }
+        Vtx { x: cx + sx * rad * c, y: cy + sy * rad * s, a, t: 0.0, k: 0.0 }
     };
-    let centre = Vtx { x: cx, y: cy, a: rings[0].1 };
+    let centre = Vtx { x: cx, y: cy, a: rings[0].1, t: 0.0, k: 0.0 };
     for i in 0..n {
         let (r0, a0) = rings[0];
         if a0 > 0.0 && r0 > 0.0 {
@@ -139,6 +150,62 @@ fn quarter(m: &mut Mesh<'_>, cx: f32, cy: f32, sx: f32, sy: f32, rings: &[(f32, 
             m.quad(at(i, ra, aa), at(i, rb, ab), at(i + 1, rb, ab), at(i + 1, ra, aa));
         }
     }
+}
+
+/// Segments per quarter of a filled corner's band ([`quarter_band`]): the band is about
+/// `1 + r·h²` px wide (h the half angle of a segment), ~2 px here; at least 3, so the band's
+/// approximation of the distance stays within ~0.02 px.
+fn band_segments(r: f32) -> usize {
+    (libm::ceilf(0.8 * libm::sqrtf(r.max(0.0))) as usize).clamp(3, 32)
+}
+
+/// A filled quarter disk of radius `r` around (`cx`, `cy`), towards (`sx`, `sy`), covered as
+/// [`quarter`] with rings `[(r, 1), (r + 1, 0)]` covers it (`smooth.rs`'s disk: solid to `r`,
+/// empty from `r + 1`, linear between) but with a few segments (Impeller's way, its
+/// `circle.frag`: the shader works out the edge, geometry only bounds it):
+/// - a fan from the centre to points on radius `r` (coverage 1: its chords are inside);
+/// - a band chunk ([`Chunk::band`]): a quad a segment from those points out to radius
+///   `(r + 1) / cos h`, whose chord passes outside `r + 1`. Its vertices carry, in the
+///   segment's own frame (ρ along the middle ray, τ across it), `a = r + 1 − ρ`, `t = τ`,
+///   `k = 1 / (2r + 1)`: `a − t²·k` is `r + 1 −` the distance to within `τ²/4r²` + `ρh⁴/8`,
+///   and every term stays small, as a GPU's half floats need (an absolute distance of 250 px
+///   would be off by 0.12 there).
+fn quarter_band(m: &mut Mesh<'_>, cx: f32, cy: f32, sx: f32, sy: f32, r: f32) {
+    let n = band_segments(r);
+    let mut dirs = [(0.0f32, 0.0f32); 33];
+    for (i, d) in dirs.iter_mut().enumerate().take(n + 1) {
+        let t = core::f32::consts::FRAC_PI_2 * i as f32 / n as f32;
+        *d = match i {
+            0 => (1.0, 0.0),
+            _ if i == n => (0.0, 1.0),
+            _ => (libm::cosf(t), libm::sinf(t)),
+        };
+    }
+    let h = core::f32::consts::FRAC_PI_4 / n as f32;
+    let (ch, sh) = (libm::cosf(h), libm::sinf(h));
+    let outer = (r + 1.0) / ch;
+    let k = 1.0 / (2.0 * r + 1.0);
+    let s = m.begin();
+    let centre = Vtx { x: cx, y: cy, a: 1.0, t: 0.0, k: 0.0 };
+    let inner = |i: usize| Vtx { x: cx + sx * r * dirs[i].0, y: cy + sy * r * dirs[i].1, a: 1.0, t: 0.0, k: 0.0 };
+    for i in 0..n {
+        m.tri(centre, inner(i), inner(i + 1));
+    }
+    m.end(s);
+    let s = m.begin();
+    for i in 0..n {
+        // Ray i is at −h from the segment's middle ray, ray i + 1 at +h: ρ = rad·cos h,
+        // τ = ∓rad·sin h.
+        let v = |j: usize, rad: f32, side: f32| Vtx {
+            x: cx + sx * rad * dirs[j].0,
+            y: cy + sy * rad * dirs[j].1,
+            a: r + 1.0 - rad * ch,
+            t: side * rad * sh,
+            k,
+        };
+        m.quad(v(i, r, -1.0), v(i, outer, -1.0), v(i + 1, outer, 1.0), v(i + 1, r, 1.0));
+    }
+    m.end_as(s, true);
 }
 
 /// `r` as `smooth_round_rect` takes it for a `w` × `h` box: at most `(w - 1) / 2` and
@@ -170,12 +237,9 @@ pub fn rounded_fill(m: &mut Mesh<'_>, x: i32, y: i32, w: i32, h: i32, r: i32) {
     m.rect(x0, ct, cl, cb);
     m.rect(cr, ct, x1, cb);
     m.end(s);
-    let rings = [(r as f32, 1.0), (r as f32 + 1.0, 0.0)];
     for (cx, sx) in [(cl, -1.0), (cr, 1.0)] {
         for (cy, sy) in [(ct, -1.0), (cb, 1.0)] {
-            let s = m.begin();
-            quarter(m, cx, cy, sx, sy, &rings);
-            m.end(s);
+            quarter_band(m, cx, cy, sx, sy, r as f32);
         }
     }
 }
@@ -293,7 +357,7 @@ pub fn polyline(m: &mut Mesh<'_>, pts: &[(i32, i32)]) {
 
 /// [`polyline`] with the simplification's distance `within` (px) given.
 pub fn polyline_within(m: &mut Mesh<'_>, pts: &[(i32, i32)], within: f32) {
-    let v = |(x, y): (f32, f32), a: f32| Vtx { x, y, a };
+    let v = |(x, y): (f32, f32), a: f32| Vtx { x, y, a, t: 0.0, k: 0.0 };
     let mut q: Vec<(f32, f32)> = Vec::with_capacity(pts.len());
     for &(x, y) in pts {
         let c = (x as f32 + 0.5, y as f32 + 0.5);
@@ -419,7 +483,7 @@ const SIMPLIFY_RUN: usize = 48;
 /// [`COLUMN_RUN`] columns a quad (the search is quadratic in the run), [`POLY_CHUNK`] quads
 /// a chunk.
 pub fn columns(m: &mut Mesh<'_>, cols: &[(i32, i32)], base: i32) {
-    let v = |x: f32, y: f32| Vtx { x, y, a: 1.0 };
+    let v = |x: f32, y: f32| Vtx { x, y, a: 1.0, t: 0.0, k: 0.0 };
     let mut s = m.begin();
     let mut quads = 0;
     let mut i = 0;
@@ -478,14 +542,14 @@ pub fn clip(tris: &[Vtx], x0: f32, y0: f32, x1: f32, y1: f32, out: &mut Vec<Vtx>
             continue;
         }
         // Sutherland–Hodgman against each edge: a triangle becomes at most 7 vertices.
-        let mut poly = [Vtx { x: 0.0, y: 0.0, a: 0.0 }; 9];
+        let mut poly = [Vtx { x: 0.0, y: 0.0, a: 0.0, t: 0.0, k: 0.0 }; 9];
         let mut n = 3;
         poly[..3].copy_from_slice(t);
         // (axis: 0 = x, 1 = y; bound; keep values >= bound when `low`)
         for (axis, bound, low) in [(0, x0, true), (0, x1, false), (1, y0, true), (1, y1, false)] {
             let at = |v: &Vtx| if axis == 0 { v.x } else { v.y };
             let keep = |v: &Vtx| if low { at(v) >= bound } else { at(v) <= bound };
-            let mut next = [Vtx { x: 0.0, y: 0.0, a: 0.0 }; 9];
+            let mut next = [Vtx { x: 0.0, y: 0.0, a: 0.0, t: 0.0, k: 0.0 }; 9];
             let mut m = 0;
             for i in 0..n {
                 let (a, b) = (poly[i], poly[(i + 1) % n]);
@@ -495,7 +559,7 @@ pub fn clip(tris: &[Vtx], x0: f32, y0: f32, x1: f32, y1: f32, out: &mut Vec<Vtx>
                 }
                 if keep(&a) != keep(&b) {
                     let s = (bound - at(&a)) / (at(&b) - at(&a));
-                    next[m] = Vtx { x: a.x + (b.x - a.x) * s, y: a.y + (b.y - a.y) * s, a: a.a + (b.a - a.a) * s };
+                    next[m] = Vtx { x: a.x + (b.x - a.x) * s, y: a.y + (b.y - a.y) * s, a: a.a + (b.a - a.a) * s, t: a.t + (b.t - a.t) * s, k: a.k };
                     if axis == 0 {
                         next[m].x = bound;
                     } else {
@@ -574,9 +638,9 @@ pub fn oval(m: &mut Mesh<'_>, cx: f32, cy: f32, a: f32, b: f32, hole: Option<(f3
         }
         // Past the centre (a tiny ellipse's inner fringe): the centre.
         if a + off <= 0.0 || b + off <= 0.0 {
-            return Vtx { x: cx, y: cy, a: cov };
+            return Vtx { x: cx, y: cy, a: cov, t: 0.0, k: 0.0 };
         }
-        Vtx { x: cx + px + off * c, y: cy + py + off * s, a: cov }
+        Vtx { x: cx + px + off * c, y: cy + py + off * s, a: cov, t: 0.0, k: 0.0 }
     };
     let deg = core::f32::consts::PI / 180.0;
     match arc {
@@ -588,7 +652,7 @@ pub fn oval(m: &mut Mesh<'_>, cx: f32, cy: f32, a: f32, b: f32, hole: Option<(f3
             let mut tab: Vec<[Vtx; 4]> = Vec::with_capacity(segs);
             for i in 0..segs {
                 let t = core::f32::consts::TAU * i as f32 / segs as f32;
-                let mut row = [Vtx { x: 0.0, y: 0.0, a: 0.0 }; 4];
+                let mut row = [Vtx { x: 0.0, y: 0.0, a: 0.0, t: 0.0, k: 0.0 }; 4];
                 for (k, v) in row.iter_mut().enumerate().take(rings.len()) {
                     *v = vert(k, t);
                 }
@@ -650,7 +714,7 @@ pub fn oval(m: &mut Mesh<'_>, cx: f32, cy: f32, a: f32, b: f32, hole: Option<(f3
                 let (rho, c) = arings[k];
                 let rho = rho.max(0.0);
                 if rho <= 0.0 {
-                    return Vtx { x: cx, y: cy, a: c };
+                    return Vtx { x: cx, y: cy, a: c, t: 0.0, k: 0.0 };
                 }
                 let al = libm::asinf((0.5 / rho).min(1.0));
                 let mid = (t0 + t1) * 0.5;
@@ -665,9 +729,9 @@ pub fn oval(m: &mut Mesh<'_>, cx: f32, cy: f32, a: f32, b: f32, hole: Option<(f3
                 let cs = (0.5 + rho * libm::sinf(t - t0)).clamp(0.0, 1.0);
                 let ce = (0.5 + rho * libm::sinf(t1 - t)).clamp(0.0, 1.0);
                 let sc = if wide { cs.max(ce) } else { cs.min(ce) };
-                Vtx { x: cx + rho * libm::cosf(t), y: cy + rho * libm::sinf(t), a: c * sc }
+                Vtx { x: cx + rho * libm::cosf(t), y: cy + rho * libm::sinf(t), a: c * sc, t: 0.0, k: 0.0 }
             };
-            let centre = Vtx { x: cx, y: cy, a: 1.0 };
+            let centre = Vtx { x: cx, y: cy, a: 1.0, t: 0.0, k: 0.0 };
             let mut s = m.begin();
             for i in 0..cols - 1 {
                 if hole.is_none() {
@@ -704,7 +768,7 @@ pub fn wedge(m: &mut Mesh<'_>, ax: f32, ay: f32, bx: f32, by: f32, ra: f32, rb: 
     let (pa, pb) = (prof(ra), prof(rb));
     let s = m.begin();
     if l > 1e-6 {
-        let p = |cx: f32, cy: f32, off: f32, a: f32| Vtx { x: cx + nx * off, y: cy + ny * off, a };
+        let p = |cx: f32, cy: f32, off: f32, a: f32| Vtx { x: cx + nx * off, y: cy + ny * off, a, t: 0.0, k: 0.0 };
         for side in [1.0f32, -1.0] {
             // Fringe, then the inner band up to the axis.
             m.quad(p(ax, ay, side * pa.2, 0.0), p(bx, by, side * pb.2, 0.0), p(bx, by, side * pb.0, pb.1), p(ax, ay, side * pa.0, pa.1));
@@ -727,9 +791,9 @@ pub fn wedge(m: &mut Mesh<'_>, ax: f32, ay: f32, bx: f32, by: f32, ra: f32, rb: 
                 let t = base + span * i as f32 / n as f32;
                 (libm::cosf(t), libm::sinf(t))
             };
-            Vtx { x: cx + c * r, y: cy + s * r, a }
+            Vtx { x: cx + c * r, y: cy + s * r, a, t: 0.0, k: 0.0 }
         };
-        let centre = Vtx { x: cx, y: cy, a: c1 };
+        let centre = Vtx { x: cx, y: cy, a: c1, t: 0.0, k: 0.0 };
         for i in 0..n {
             if o1 > 0.0 {
                 m.tri(centre, at(i, o1, c1), at(i + 1, o1, c1));
@@ -851,7 +915,7 @@ pub fn convex_fill(m: &mut Mesh<'_>, pts: &[(f32, f32)]) -> bool {
     // where the CPU's exact area is ~0.15 (vertex alpha's limit, HWUI's too). Giving the
     // points their own coverage dragged the whole edge between them down instead.
     let s = m.begin();
-    let v = |(x, y): (f32, f32), a: f32| Vtx { x, y, a };
+    let v = |(x, y): (f32, f32), a: f32| Vtx { x, y, a, t: 0.0, k: 0.0 };
     for i in 0..n {
         let j = (i + 1) % n;
         m.quad(v(inner[i], 1.0), v(outer[i][1], 0.0), v(outer[j][0], 0.0), v(inner[j], 1.0));
@@ -878,7 +942,7 @@ pub fn outline(m: &mut Mesh<'_>, pts: &[(f32, f32)], r: f32, closed: bool) {
     }
     let o1 = (r - 0.5).max(0.0);
     let (c1, o2) = ((r + 0.5 - o1).min(1.0), r + 0.5);
-    let v = |x: f32, y: f32, a: f32| Vtx { x, y, a };
+    let v = |x: f32, y: f32, a: f32| Vtx { x, y, a, t: 0.0, k: 0.0 };
     let s = m.begin();
     let segs = if closed && n > 2 { n } else { n - 1 };
     for i in 0..segs {
@@ -920,8 +984,8 @@ pub fn outline(m: &mut Mesh<'_>, pts: &[(f32, f32)], r: f32, closed: bool) {
 
 /// A fan around `c`: coverage 1 at the centre, 0 at radius 1.
 fn disk(m: &mut Mesh<'_>, c: (f32, f32)) {
-    let centre = Vtx { x: c.0, y: c.1, a: 1.0 };
-    let at = |i: usize| Vtx { x: c.0 + DISK[i % 8].0, y: c.1 + DISK[i % 8].1, a: 0.0 };
+    let centre = Vtx { x: c.0, y: c.1, a: 1.0, t: 0.0, k: 0.0 };
+    let at = |i: usize| Vtx { x: c.0 + DISK[i % 8].0, y: c.1 + DISK[i % 8].1, a: 0.0, t: 0.0, k: 0.0 };
     for i in 0..8 {
         m.tri(centre, at(i), at(i + 1));
     }
@@ -955,10 +1019,10 @@ pub(crate) mod raster {
 
     fn raster(verts: &[Vtx], n: usize, add: impl Fn(&mut f32, f32)) -> Vec<f32> {
         let mut out = vec![0.0f32; n * n];
-        let snap = |v: Vtx| (libm::roundf(v.x * SUB) as i64, libm::roundf(v.y * SUB) as i64, v.a);
+        let snap = |v: Vtx| (libm::roundf(v.x * SUB) as i64, libm::roundf(v.y * SUB) as i64, v.a, v.t, v.k);
         for t in verts.chunks_exact(3) {
             let (mut a, mut b, c) = (snap(t[0]), snap(t[1]), snap(t[2]));
-            let cross = |p: (i64, i64, f32), q: (i64, i64, f32), x: i64, y: i64| (q.0 - p.0) * (y - p.1) - (q.1 - p.1) * (x - p.0);
+            let cross = |p: (i64, i64, f32, f32, f32), q: (i64, i64, f32, f32, f32), x: i64, y: i64| (q.0 - p.0) * (y - p.1) - (q.1 - p.1) * (x - p.0);
             let area = cross(a, b, c.0, c.1);
             if area == 0 {
                 continue;
@@ -969,7 +1033,7 @@ pub(crate) mod raster {
             let area = area.abs();
             // Top-left rule, y down, counter-clockwise on screen (interior on the positive
             // side): a top edge goes left, a left edge goes down.
-            let owns = |p: (i64, i64, f32), q: (i64, i64, f32)| {
+            let owns = |p: (i64, i64, f32, f32, f32), q: (i64, i64, f32, f32, f32)| {
                 let (dx, dy) = (q.0 - p.0, q.1 - p.1);
                 (dy == 0 && dx < 0) || dy > 0
             };
@@ -989,8 +1053,10 @@ pub(crate) mod raster {
                     let w2 = cross(a, b, x, y);
                     let inside = |w: i64, p, q| w > 0 || (w == 0 && owns(p, q));
                     if inside(w0, b, c) && inside(w1, c, a) && inside(w2, a, b) {
-                        let a = (w0 as f32 * a.2 + w1 as f32 * b.2 + w2 as f32 * c.2) / area as f32;
-                        let cov = a.min(2.0 - a);
+                        let at = |f: fn(&(i64, i64, f32, f32, f32)) -> f32| (w0 as f32 * f(&a) + w1 as f32 * f(&b) + w2 as f32 * f(&c)) / area as f32;
+                        let (va, vt, vk) = (at(|v| v.2), at(|v| v.3), at(|v| v.4));
+                        // The two fragment shaders: a band's clamp, else the tent.
+                        let cov = if vk > 0.0 { (va - vt * vt * vk).clamp(0.0, 1.0) } else { va.min(2.0 - va) };
                         add(&mut out[py * n + px], cov);
                     }
                 }
@@ -1193,7 +1259,7 @@ mod tests {
     fn a_square_box_is_two_triangles() {
         let (verts, chunks) = mesh_of(|m| rounded_fill(m, 3, 4, 10, 6, 0));
         assert_eq!(verts.len(), 6);
-        assert_eq!(chunks, [Chunk { start: 0, len: 6, x0: 3, y0: 4, x1: 13, y1: 10 }]);
+        assert_eq!(chunks, [Chunk { start: 0, len: 6, x0: 3, y0: 4, x1: 13, y1: 10, band: false }]);
     }
 }
 

@@ -191,9 +191,10 @@ enum Prim {
     /// times `color` (solid colours: the white texel times it).
     Flat { rect: R, u: (f32, f32), v: (f32, f32), color: Lin, tex: Tex },
     /// `ui_cov`: triangles `start..start + len` of `State::tverts` (`ferrite_core::lcd::tess`,
-    /// coverage per vertex as the tent of `a`) inside `bbox`, times `color`. Not cut to a
+    /// coverage per vertex as the tent of `a`) inside `bbox`, times `color`; `ui_band` for a
+    /// circle's edge band (`tess::Chunk::band`: coverage `clamp(a − t²k)`). Not cut to a
     /// frame: the GPU clips them to it.
-    Tris { bbox: R, start: u32, len: u32, color: Lin },
+    Tris { bbox: R, start: u32, len: u32, color: Lin, band: bool },
 }
 
 impl Prim {
@@ -208,7 +209,8 @@ impl Prim {
         match *self {
             Prim::Round { .. } => Batch::Round,
             Prim::Flat { tex, .. } => Batch::Flat(tex),
-            Prim::Tris { .. } => Batch::Cov,
+            Prim::Tris { band: false, .. } => Batch::Cov,
+            Prim::Tris { band: true, .. } => Batch::Band,
         }
     }
 }
@@ -217,6 +219,7 @@ impl Prim {
 enum Batch {
     Round,
     Cov,
+    Band,
     Flat(Tex),
 }
 
@@ -259,6 +262,8 @@ struct State {
     color: Vec<[f32; 4]>,
     /// `ui_cov`'s `a` (the tessellator's vertex coverage).
     tri_a: Vec<[f32; 1]>,
+    /// `ui_band`'s `cov` (a, t, k).
+    tri_band: Vec<[f32; 3]>,
     /// Anti-aliased triangles of this render's `Prim::Tris` (`tess`), and the tessellator's
     /// chunks of the shape being added.
     tverts: Vec<tess::Vtx>,
@@ -310,6 +315,7 @@ static mut STATE: State = State {
     uv: Vec::new(),
     color: Vec::new(),
     tri_a: Vec::new(),
+    tri_band: Vec::new(),
     tverts: Vec::new(),
     tchunks: Vec::new(),
     meshes: MeshCache { entries: Vec::new(), clock: 0 },
@@ -1424,7 +1430,7 @@ impl State {
             self.tverts.extend_from_slice(&e.verts);
         } else {
             let (fx, fy) = (dx as f32, dy as f32);
-            self.tverts.extend(e.verts.iter().map(|v| tess::Vtx { x: v.x + fx, y: v.y + fy, a: v.a }));
+            self.tverts.extend(e.verts.iter().map(|v| tess::Vtx { x: v.x + fx, y: v.y + fy, ..*v }));
         }
         self.tchunks.clear();
         self.tchunks.extend(e.chunks.iter().map(|c| tess::Chunk {
@@ -1434,6 +1440,7 @@ impl State {
             y0: c.y0 + dy,
             x1: c.x1 + dx,
             y1: c.y1 + dy,
+            band: c.band,
         }));
         self.emit(color, clip);
     }
@@ -1463,7 +1470,7 @@ impl State {
                     }
                 }
             }
-            self.prims.push(Prim::Tris { bbox, start: start as u32, len: len as u32, color });
+            self.prims.push(Prim::Tris { bbox, start: start as u32, len: len as u32, color, band: c.band });
         }
     }
 
@@ -2117,14 +2124,18 @@ impl State {
     /// Two triangles of `p` over `rect` (inside the frame `c`) into the batch's vertices; a
     /// `Prim::Tris` whole (the GPU clips it to the frame).
     fn push(&mut self, p: &Prim, rect: &R, c: &R) {
-        if let Prim::Tris { start, len, color, .. } = *p {
+        if let Prim::Tris { start, len, color, band, .. } = *p {
             let (start, len) = (start as usize, len as usize);
             TRI_VERTS.fetch_add(len as u32, core::sync::atomic::Ordering::Relaxed);
             let (ox, oy) = (c.x0 as f32, c.y0 as f32);
             for v in &self.tverts[start..start + len] {
                 self.pos.push([v.x - ox, v.y - oy]);
                 self.color.push(color.at(v.x, v.y));
-                self.tri_a.push([v.a]);
+                if band {
+                    self.tri_band.push([v.a, v.t, v.k]);
+                } else {
+                    self.tri_a.push([v.a]);
+                }
             }
             return;
         }
@@ -2176,6 +2187,15 @@ impl State {
                 .map(|mesh| {
                     frame.draw(&mesh).uniform("scale", &scale).blend(Blend::Premultiplied);
                 }),
+            Batch::Band => frame
+                .mesh(&ui.band)
+                .attribute("pos", &self.pos)
+                .attribute("color", &self.color)
+                .attribute("cov", &self.tri_band)
+                .build()
+                .map(|mesh| {
+                    frame.draw(&mesh).uniform("scale", &scale).blend(Blend::Premultiplied);
+                }),
             Batch::Flat(t) => {
                 let format = match t.fmt {
                     Fmt::Argb => ui.argb,
@@ -2205,6 +2225,7 @@ impl State {
         self.uv.clear();
         self.color.clear();
         self.tri_a.clear();
+        self.tri_band.clear();
         result
     }
 }

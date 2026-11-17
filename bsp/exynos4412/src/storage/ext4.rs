@@ -1,4 +1,4 @@
-//! USERDATA (p10, ~13 GiB): ext4 with a journal, through `exynos_4412_rs::ext4` (the
+//! USERDATA (p10, ~13 GiB): ext4 with a journal, through `exynos_4412_ext4` (the
 //! `ext4_rs` crate, which formats it itself: [`format`]). The same tree as on CACHE, and the
 //! same API as `fat.rs`, but every name on disk is lower case (`ferrite/flash.bin`,
 //! `ferrite/user/…`, `system/wifi.txt`): callers keep using the upper-case 8.3 names, and
@@ -23,8 +23,8 @@ use exynos_4412_rs::drivers::i2c::{Bus, I2c};
 use exynos_4412_rs::drivers::max77686::Rtc;
 use exynos_4412_rs::drivers::mmc::{self, Mmc};
 use exynos_4412_rs::drivers::timer::Mct;
-use exynos_4412_rs::ext4::PartitionBlocks;
-use exynos_4412_rs::ext4::ext4_rs::{self, BlockDevice, Error as E, Ext4, FormatOptions, Kind as FsKind, MountOptions};
+use exynos_4412_ext4::PartitionBlocks;
+use exynos_4412_ext4::ext4_rs::{self, BlockDevice, Error as E, Ext4, FormatOptions, Kind as FsKind, MountOptions};
 use exynos_4412_rs::fat::MctClock;
 use exynos_4412_rs::println;
 use exynos_4412_rs::time::DateTime;

@@ -292,6 +292,9 @@ struct State {
     told: bool,
     /// Drawing into a layer's surface ([`State::draw`]): cleared transparent, not black.
     on_layer: bool,
+    /// The GPU player's screen frames may go straight to the back scan buffer
+    /// (`lcd::direct_begin`; set by `play` around its screen group).
+    may_direct: bool,
     /// The frame's draws while it is gathered (`frame`), kept for their room.
     groups: Vec<Group>,
     /// One opaque white texel (heap, 64-byte aligned, cleaned): solid pieces are `ui_flat`
@@ -333,6 +336,7 @@ static mut STATE: State = State {
     any_565: false,
     told: false,
     on_layer: false,
+    may_direct: false,
     groups: Vec::new(),
     white: 0,
     od_cells: Vec::new(),
@@ -1841,9 +1845,11 @@ impl State {
 
     /// Runs the frames of every area into the shadow. False if the GPU failed.
     fn draw(&mut self, ui: &Ui, gpu: &mut Gpu, areas: &[Rect], layer: Option<(usize, Target)>) -> bool {
-        let target = match layer {
-            Some((_, t)) => t,
-            None => {
+        let direct = if layer.is_none() && self.may_direct { lcd::direct_begin(areas) } else { None };
+        let target = match (layer, direct) {
+            (Some((_, t)), _) => t,
+            (None, Some((address, stride, width, height))) => Target { address, stride, width, height },
+            (None, None) => {
                 let Some((address, stride, width, height)) = lcd::gpu_target() else { return false };
                 if !lcd::gpu_begin() {
                     return false;
@@ -1851,10 +1857,14 @@ impl State {
                 Target { address, stride, width, height }
             }
         };
+        let direct = direct.is_some();
         // SAFETY: the shadow (mapped at the GPU's start; between `gpu_begin` and `gpu_drew`
         // only the GPU writes it), or a layer's (`lcd::layer_gpu_target`: on the heap the GPU
         // maps, nothing else draws it during a render job).
         if unsafe { gpu.set_target(target) }.is_err() {
+            if direct {
+                lcd::direct_end(false);
+            }
             return false;
         }
         self.on_layer = layer.is_some();
@@ -1871,7 +1881,7 @@ impl State {
             let mut y = a.y0;
             while y < a.y1 {
                 let c = R { x0: a.x0, y0: y, x1: a.x1, y1: (y + lines).min(a.y1) };
-                if layer.is_none() {
+                if layer.is_none() && !direct {
                     lcd::gpu_fence(c.y0 as usize, c.y1 as usize);
                 }
                 if let Err(e) = self.frame(ui, gpu, &c) {
@@ -1879,14 +1889,21 @@ impl State {
                         self.told = true;
                         exynos_4412_rs::println!("ferrite: GPU compositor frame failed: {:?}", e);
                     }
+                    if direct {
+                        lcd::direct_end(false);
+                    }
                     return false;
                 }
                 match layer {
+                    None if direct => lcd::direct_drew(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize),
                     None => lcd::gpu_drew(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize),
                     Some((n, _)) => lcd::layer_gpu_drew(n, c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize),
                 }
                 y = c.y1;
             }
+        }
+        if direct {
+            lcd::direct_end(true);
         }
         true
     }

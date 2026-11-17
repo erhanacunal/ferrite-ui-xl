@@ -162,6 +162,13 @@ fn start() -> Option<Shared> {
         note(format_args!("GPU cannot map the heap: {:?}", e));
         return None;
     }
+    // The scan buffers too: the GPU player draws straight into the back one (`lcd::direct_begin`).
+    let (buffers, bytes) = lcd::buffers_region();
+    // SAFETY: plain memory; frames write a scan buffer only while it is the back one.
+    if let Err(e) = unsafe { gpu.map(buffers, bytes) } {
+        note(format_args!("GPU cannot map the scan buffers: {:?} (no direct frames)", e));
+        lcd::DIRECT.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
     let hz = raise_clock();
     note(format_args!("GPU started (offscreen, heap mapped, {} MHz)", hz / 1_000_000));
     let ui = ui(&mut gpu);

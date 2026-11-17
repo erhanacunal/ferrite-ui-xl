@@ -16,6 +16,7 @@
 //! | `POST /api/snapshot?track=0\|1&stale=0\|1` | render-owned reads (`ferrite_core::snapshot`): count `W_GET`s of animated props / scroll offsets, answer them from the last render's snapshot (counters in `/api/status` `snapshot`) |
 //! | `GET /api/storage` | where the files are (`medium=USERDATA fs=ext4 size_mib=… free_mib=…`, or `medium=CACHE fs=fat32`) |
 //! | `POST /api/storage/migrate` | formats USERDATA (ext4), copies `FERRITE/` and `SYSTEM/` from CACHE, verifies and switches to it (`storage::migrate`); 409 with the report if it refused or failed. Blocks the UI for its seconds |
+//! | `GET /api/screen?buf=scan` | the screenshot from the scan buffer the FIMD shows (+ the layers), not the shadow: checks direct frames (`lcd::DIRECT`) |
 //! | `POST /api/touch?swipe=X0,Y0,X1,Y1,MS` | a scripted one-finger swipe through the touch backend (`touch::swipe`: a press, a move every 8 ms, a lift), screen pixels; for measuring slides |
 //! | `POST /api/storage/stress?on=0\|1` | power-loss test load on USERDATA (`storage::stress`), off again after a restart; `?cut=1`: in 1 s `cut.bin` is committed to the journal only and the board resets, so the next mount must replay it |
 //! | `GET /api/storage/check` | `Ext4::check` of USERDATA plus the stress files' contents; 409 when something is wrong |
@@ -317,7 +318,12 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 },
             }
         }
-        (b"GET", b"/api/screen") => match super::screenshot().await {
+        (b"GET", b"/api/screen") => match {
+            if query_param(query, b"buf") == Some(b"scan") {
+                crate::lcd::GRAB_SCAN.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            super::screenshot().await
+        } {
             Some(px) => screen_bmp(socket, &px).await?,
             None => text(socket, "503 Service Unavailable", "No screenshot (no memory or no answer)
 ").await?,
@@ -360,6 +366,14 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 crate::compose::PLAY_HIST_ON.store(on, Ordering::Relaxed);
                 text(socket, "200 OK", "Play histogram set\n").await?;
+                return Ok(false);
+            }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"direct") {
+                let on = v == b"1";
+                crate::lcd::DIRECT.store(on, Ordering::Relaxed);
+                text(socket, "200 OK", if on { "GPU player frames straight into the back scan buffer
+" } else { "GPU player frames into the shadow
+" }).await?;
                 return Ok(false);
             }
             if let Some(v @ (b"0" | b"1")) = query_param(query, b"tiled") {
@@ -1300,6 +1314,16 @@ fn status_json() -> String {
         }
         let op = PLAY_LAST_OP.load(Relaxed) as usize;
         let _ = write!(s, "\"last_op\":\"{}\"}}", ferrite_core::dl::OP_NAMES.get(op).copied().unwrap_or("?"));
+        let d = &crate::lcd::DIRECT_COUNTS;
+        let _ = write!(
+            s,
+            ",\"direct\":{{\"on\":{},\"frames\":{},\"declined\":{},\"syncs\":{},\"sync_bytes\":{}}}",
+            crate::lcd::DIRECT.load(Relaxed),
+            d[0].load(Relaxed),
+            d[1].load(Relaxed),
+            d[2].load(Relaxed),
+            d[3].load(Relaxed)
+        );
     }
     {
         // Display lists (`/api/dl`): counters since boot, bytes held now.

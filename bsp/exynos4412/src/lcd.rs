@@ -456,8 +456,143 @@ macro_rules! timed {
 /// still read one of them.
 #[inline]
 fn fence(y0: usize, y1: usize) {
+    if STALE_ANY.load(Ordering::Relaxed) {
+        sync_shadow();
+    }
     if STATE.load(Ordering::Relaxed) == COPY {
         wait_rows(y0, y1);
+    }
+}
+
+// ============================================================================
+//  Direct GPU frames (the GPU player draws the back scan buffer)
+// ============================================================================
+
+/// The GPU player draws a frame straight into the back scan buffer when it can
+/// ([`direct_begin`]; `POST /api/compose?direct=0|1`): no shadow, no present
+/// copy. The back buffer is two frames old, so it first gets the previous
+/// present's box from the front one (buffer age 2); then the frame's areas;
+/// [`flush`] only switches (`DIRECT_PENDING`). The shadow then lacks what those
+/// frames drew ([`STALE`]): before anything draws on or reads the shadow again
+/// ([`fence`], [`gpu_begin`], `g2d_op`, [`grab`]), [`sync_shadow`] copies that
+/// box back from the newest scan buffer.
+pub static DIRECT: AtomicBool = AtomicBool::new(true);
+/// Direct frames played, declined (a present in flight or the shadow's drawing
+/// waiting: drawn into the shadow as before), shadow syncs and their bytes.
+pub static DIRECT_COUNTS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// The box the shadow lacks (x0, y0, x1, y1), and that it is not empty. One core
+/// at a time (the render job's, or CPU0 between jobs), as the shadow.
+static mut STALE: Rect = EMPTY;
+static STALE_ANY: AtomicBool = AtomicBool::new(false);
+/// The scan buffer holding the newest picture while `STALE_ANY`.
+static LATEST: AtomicUsize = AtomicUsize::new(SCAN_A);
+/// A direct frame is drawn in the back buffer and waits for [`flush`] to show
+/// it; `DIRECT_BOX` = what it drew there (its present's box).
+static DIRECT_PENDING: AtomicBool = AtomicBool::new(false);
+static mut DIRECT_BOX: Rect = EMPTY;
+
+/// The scan buffer the direct frame draws.
+static DIRECT_TARGET: AtomicUsize = AtomicUsize::new(SCAN_B);
+
+/// The render core (a job: CPU0 neither presents nor draws meanwhile, so the present state
+/// holds still), before a GPU frame of the screen: the buffer the next present goes to as its
+/// target (physical address, stride, width, height) if a direct frame can be drawn now: no
+/// present copying, nothing drawn on the shadow waiting, none pending. After a switch not on
+/// screen yet (FLIP) that is the old front: once the FIMD scans the new one. Brings the last
+/// present's box into it first (it lacks that), unless one of `areas` covers it (they are
+/// repainted whole).
+pub fn direct_begin(areas: &[UiRect]) -> Option<(usize, usize, usize, usize)> {
+    if !DIRECT.load(Ordering::Relaxed) || PRESENTER.load(Ordering::Acquire) || !G2D_ON.load(Ordering::Relaxed) {
+        return None;
+    }
+    let waiting = unsafe { !is_empty(&*(&raw const DIRTY)) };
+    let state = STATE.load(Ordering::Acquire);
+    if state == COPY || waiting || DIRECT_PENDING.load(Ordering::Acquire) {
+        DIRECT_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let p = present_state();
+    let addr = |i: usize| p.fb[i].as_ref().map(|fb| fb.address());
+    // (the buffer shown, the one to draw, what the latter lacks)
+    let (front, back, prev) = if state == FLIP { (1 - p.front, p.front, p.req) } else { (p.front, 1 - p.front, p.prev) };
+    let (src, dst) = (addr(front)?, addr(back)?);
+    if state == FLIP {
+        let fimd = Fimd::new();
+        while fimd.scan_address() != src as u32 && systick::millis().wrapping_sub(FLIP_AT.load(Ordering::Relaxed)) < FLIP_MS {
+            core::hint::spin_loop();
+        }
+    }
+    DIRECT_TARGET.store(back, Ordering::Relaxed);
+    let covered = areas.iter().any(|a| {
+        let (x, y) = (a.x.max(0) as usize, a.y.max(0) as usize);
+        x <= prev[0] && y <= prev[1] && prev[2] <= x + a.w as usize && prev[3] <= y + a.h as usize
+    });
+    if !is_empty(&prev) && !covered {
+        let (x, y, w, h) = (prev[0], prev[1], prev[2] - prev[0], prev[3] - prev[1]);
+        if !g2d_copy_argb(src, dst, W, H, x, y, w, h) {
+            let (s, d) = (p.nc[front] as *const u32, p.nc[back] as *mut u32);
+            if s.is_null() || d.is_null() {
+                return None;
+            }
+            for row in y..y + h {
+                // SAFETY: both scan buffers' aliases; the box is on the screen.
+                unsafe { copy_row(s.add(row * W + x), d.add(row * W + x), w) };
+            }
+        }
+        COPY_BYTES.fetch_add((w * h * 4) as u32, Ordering::Relaxed);
+    }
+    unsafe { *(&raw mut DIRECT_BOX) = EMPTY };
+    Some((dst, W * 4, W, H))
+}
+
+/// The GPU drew rect (`x`, `y`, `w`, `h`) of the direct frame.
+pub fn direct_drew(x: usize, y: usize, w: usize, h: usize) {
+    unsafe {
+        let b = &mut *(&raw mut DIRECT_BOX);
+        *b = union(*b, [x, y, x + w, y + h]);
+    }
+}
+
+/// The direct frame is complete (`ok`): it waits for [`flush`]; the shadow lacks
+/// what it drew. Not `ok`: given up (the CPU repaints its areas on the shadow,
+/// and the present of those copies them over what the GPU left).
+pub fn direct_end(ok: bool) {
+    // SAFETY: a barrier only: the GPU's writes before the FIMD's reads.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    let b = unsafe { *(&raw const DIRECT_BOX) };
+    if !ok || is_empty(&b) {
+        return;
+    }
+    unsafe { *(&raw mut STALE) = union(*(&raw const STALE), b) };
+    LATEST.store(DIRECT_TARGET.load(Ordering::Relaxed), Ordering::Relaxed);
+    STALE_ANY.store(true, Ordering::Release);
+    DIRECT_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+    DIRECT_PENDING.store(true, Ordering::Release);
+}
+
+/// The shadow gets the box direct frames drew into the scan buffers (from the newest one),
+/// before anything draws on it or reads it again.
+#[cold]
+#[inline(never)]
+fn sync_shadow() {
+    let b = unsafe { core::mem::replace(&mut *(&raw mut STALE), EMPTY) };
+    STALE_ANY.store(false, Ordering::Release);
+    if is_empty(&b) {
+        return;
+    }
+    let i = LATEST.load(Ordering::Relaxed);
+    let (x, y, w, h) = (b[0], b[1], b[2] - b[0], b[3] - b[1]);
+    DIRECT_COUNTS[2].fetch_add(1, Ordering::Relaxed);
+    DIRECT_COUNTS[3].fetch_add((w * h * 4) as u32, Ordering::Relaxed);
+    if g2d_copy_argb(buf_ptr(i) as usize, buf_ptr(SHADOW) as usize, W, H, x, y, w, h) {
+        return;
+    }
+    let s = present_state().nc[i] as *const u32;
+    let s = if s.is_null() { buf_ptr(i) as *const u32 } else { s };
+    let d = back();
+    for row in y..y + h {
+        // SAFETY: the box is on the screen; the scan buffer and the shadow are distinct.
+        unsafe { copy_row(s.add(row * W + x), d.add(row * W + x), w) };
     }
 }
 
@@ -513,7 +648,7 @@ pub fn g2d_state() -> (bool, bool, bool) {
 /// that present is done; drawing more meanwhile is wasted.
 pub fn render_due() -> bool {
     let nothing_waits = unsafe { is_empty(&*(&raw const DIRTY)) };
-    let nothing_waits = nothing_waits && !layers::pending();
+    let nothing_waits = nothing_waits && !layers::pending() && !DIRECT_PENDING.load(Ordering::Acquire);
     nothing_waits || STATE.load(Ordering::Acquire) == IDLE
 }
 
@@ -539,6 +674,19 @@ pub fn flush() {
     if STATE.load(Ordering::Acquire) == IDLE {
         // A layer flip not on screen yet: window 0 waits too (same frame).
         let Some(commit) = layers::prepare() else { return };
+        if DIRECT_PENDING.load(Ordering::Acquire) {
+            // A direct frame: drawn in the back buffer already, only the switch.
+            let p = present_state();
+            debug_assert_eq!(DIRECT_TARGET.load(Ordering::Relaxed), 1 - p.front);
+            p.layers = commit;
+            p.req = unsafe { *(&raw const DIRECT_BOX) };
+            DIRECT_PENDING.store(false, Ordering::Release);
+            FRAMES.fetch_add(1, Ordering::Relaxed);
+            let _ = show(p, 1 - p.front);
+            FLIP_AT.store(systick::millis(), Ordering::Relaxed);
+            STATE.store(FLIP, Ordering::Release);
+            return;
+        }
         if is_empty(d) {
             layers::commit_now(&commit);
             return;
@@ -596,7 +744,11 @@ pub fn service_present() {
 /// error screens that must be visible before what follows).
 pub fn flush_wait() {
     flush();
-    while unsafe { !is_empty(&*(&raw const DIRTY)) } || STATE.load(Ordering::Acquire) != IDLE || layers_pending() {
+    while unsafe { !is_empty(&*(&raw const DIRTY)) }
+        || STATE.load(Ordering::Acquire) != IDLE
+        || layers_pending()
+        || DIRECT_PENDING.load(Ordering::Acquire)
+    {
         match STATE.load(Ordering::Acquire) {
             // The G2D present: drive it to its end.
             COPY if !PRESENTER.load(Ordering::Acquire) => wait_rows(0, H),
@@ -611,7 +763,7 @@ pub fn flush_wait() {
 /// Nothing drawn waits to be presented and no present or layer change is in
 /// flight: `flush` has nothing to drive (CPU0 may sleep longer than a pass).
 pub fn settled() -> bool {
-    let nothing_drawn = unsafe { is_empty(&*(&raw const DIRTY)) };
+    let nothing_drawn = unsafe { is_empty(&*(&raw const DIRTY)) } && !DIRECT_PENDING.load(Ordering::Acquire);
     nothing_drawn && STATE.load(Ordering::Acquire) == IDLE && !layers_pending()
 }
 
@@ -1450,6 +1602,17 @@ fn g2d_give_up() {
 /// (then the caller draws with the CPU).
 #[cfg(feature = "g2d_render")]
 fn g2d_op(what: &str, px: usize, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> bool {
+    // An operation on the shadow (or reading it) needs what direct frames drew there first.
+    if STALE_ANY.load(Ordering::Relaxed) {
+        sync_shadow();
+    }
+    g2d_op_any(what, px, op)
+}
+
+/// [`g2d_op`] for operations that neither read nor write the shadow (scan buffer and layer
+/// copies; [`sync_shadow`]'s own): no shadow sync first.
+#[cfg(feature = "g2d_render")]
+fn g2d_op_any(what: &str, px: usize, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> bool {
     if !G2D_DRAW.load(Ordering::Relaxed) {
         return false;
     }
@@ -1884,6 +2047,14 @@ fn g2d_global_alpha_matches() -> bool {
     bad.is_none()
 }
 
+/// The next [`grab`] reads the scan buffer the FIMD shows instead of the shadow.
+pub static GRAB_SCAN: AtomicBool = AtomicBool::new(false);
+
+/// The scan buffers (both, with the shadow after them), for the GPU's MMU: start, bytes.
+pub fn buffers_region() -> (usize, usize) {
+    (buf_ptr(SCAN_A) as usize, 3 * PIXELS * 4)
+}
+
 /// The shadow as a GPU target: physical address, stride in bytes, width,
 /// height. None unless G2D drawing is on: only then is the shadow drawn
 /// through the uncached alias, so the CPU sees what the GPU writes there.
@@ -1911,6 +2082,20 @@ pub fn layer_gpu_drew(n: usize, x: usize, y: usize, w: usize, h: usize) {
 pub fn grab() -> Option<alloc::vec::Vec<u32>> {
     let mut copy = alloc::vec::Vec::new();
     copy.try_reserve_exact(PIXELS).ok()?;
+    if GRAB_SCAN.swap(false, Ordering::Relaxed) {
+        // The scan buffer the FIMD shows (HTTP `GET /api/screen?buf=scan`), not the shadow.
+        let p = present_state();
+        let shown = Fimd::new().scan_address() as usize;
+        let i = (0..2).find(|&i| p.fb[i].as_ref().is_some_and(|fb| fb.address() == shown)).unwrap_or(p.front);
+        let src = if p.nc[i] != 0 { p.nc[i] as *const u32 } else { buf_ptr(i) as *const u32 };
+        // SAFETY: a scan buffer holds PIXELS words.
+        copy.extend_from_slice(unsafe { core::slice::from_raw_parts(src, PIXELS) });
+        layers::composite(&mut copy, W, H);
+        return Some(copy);
+    }
+    if STALE_ANY.load(Ordering::Relaxed) {
+        sync_shadow();
+    }
     // SAFETY: the shadow holds PIXELS words; nothing draws while CPU0 is here.
     copy.extend_from_slice(unsafe { core::slice::from_raw_parts(back() as *const u32, PIXELS) });
     // What the FIMD shows over it.
@@ -1925,6 +2110,9 @@ pub fn grab() -> Option<alloc::vec::Vec<u32>> {
 pub fn gpu_begin() -> bool {
     if !g2d_draw_ready() {
         return false;
+    }
+    if STALE_ANY.load(Ordering::Relaxed) {
+        sync_shadow();
     }
     // SAFETY: a barrier only.
     unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
@@ -2004,7 +2192,7 @@ pub(crate) fn g2d_copy_argb(src: usize, dst: usize, sw: usize, sh: usize, x: usi
         let from = Surface { address: src, stride: sw * 4, width: sw, height: sh, format: Format::Argb8888 };
         let to = Surface { address: dst, ..from };
         let r = g2d::Rect::new(x, y, w, h);
-        g2d_op("layer copy", w * h, |g| g.copy(&from, r, &to, r, Filter::Nearest))
+        g2d_op_any("layer copy", w * h, |g| g.copy(&from, r, &to, r, Filter::Nearest))
     }
     #[cfg(not(feature = "g2d_render"))]
     {

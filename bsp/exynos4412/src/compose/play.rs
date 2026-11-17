@@ -142,8 +142,15 @@ pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
                 PLAY_LAST_OP.store(op as u32, Relaxed);
                 result = UNSUPPORTED;
             }
-            Ok(()) if s.draw(&ui, gpu, &g.1, *target) => {}
-            Ok(()) => result = FAILED,
+            Ok(()) => {
+                // The screen's frames may go straight to the back scan buffer.
+                s.may_direct = g.0.is_none();
+                let drawn = s.draw(&ui, gpu, &g.1, *target);
+                s.may_direct = false;
+                if !drawn {
+                    result = FAILED;
+                }
+            }
         }
         if result != PLAYED {
             // The CPU replays the whole list: it repaints these areas too.

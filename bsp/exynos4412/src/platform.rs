@@ -158,8 +158,6 @@ impl PlatformRuntime for Exynos4412Platform {
     const FG_COLOR: u16 = COLOR_WHITE;
     // Cortex-A9 at 1.4 GHz: long bursts per main-loop pass.
     const VM_STEPS_PER_TICK: u32 = 20_000;
-    // Programs up to 16 MB are copied to RAM (larger ones run from the region).
-    const MAX_CODE_SIZE: usize = 16 << 20;
     type Input = FullInput;
 
     fn reset() -> ! {

@@ -52,10 +52,6 @@ pub const ERR_BAD_IMAGE: u8 = 9;
 /// Recovery mode — skip program load, suppress the error screen.
 pub const ERR_EMPTY_RUN: u8 = 0xFE;
 
-/// Default maximum RAM-resident program image size (see
-/// `PlatformRuntime::MAX_CODE_SIZE`).
-pub const MAX_CODE_SIZE: usize = 4096;
-
 // === Gesture tuning (shared with lib/touch.fl constants) ===
 
 /// Hold time before a long press. Time-based, not frame-based: the main loop
@@ -92,11 +88,6 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     /// YIELD / a blocking state, so a program that yields each frame is
     /// unaffected.
     const VM_STEPS_PER_TICK: u32 = 1;
-
-    /// Largest program image loaded into RAM (`exec_mode: "ram"`). A larger
-    /// image executes from flash instead. The default suits the 20 KB GD32;
-    /// SDRAM boards raise it (64 KB max — the VM program counter is `u16`).
-    const MAX_CODE_SIZE: usize = MAX_CODE_SIZE;
 
     /// Per-frame input handling strategy.
     type Input: InputHandler<Self>;
@@ -902,20 +893,12 @@ fn load_program_code<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, program:
     };
 
     let mut err = 0;
-    // A RAM image over the platform limit runs from flash rather than being
-    // truncated (which would cut off the functions at the end of the image).
+    // Always copied to RAM (no execution from flash: `RES_FLAG_FLASH_EXEC`
+    // is ignored); the heap is the only limit.
     let size = entry.size as usize;
     let mut img = Vec::new();
-    // Too big for the RAM limit, or the heap can't hold it: also run from flash.
-    let flash_exec = entry.flags & fs::RES_FLAG_FLASH_EXEC != 0
-        || size > P::MAX_CODE_SIZE
-        || img.try_reserve_exact(size).is_err();
-    if flash_exec {
-        // The VM keeps its own (cloned) flash handle for cache refills; the
-        // backend is a stateless MMIO driver so the clone shares no state.
-        if !vm.load_flash(ctx.flash.clone(), entry.offset, entry.size as usize) {
-            err = ERR_PROGRAM_ERROR;
-        }
+    if img.try_reserve_exact(size).is_err() {
+        err = ERR_PROGRAM_ERROR;
     } else {
         img.resize(size, 0);
         if let Some(fs) = ctx.fs.as_ref() {

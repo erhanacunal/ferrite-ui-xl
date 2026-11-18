@@ -2,7 +2,6 @@ extern crate alloc;
 
 use crate::canvas::Canvas;
 use crate::ctx::Ctx;
-use crate::flash::{FlashBackend, FlashImpl};
 use crate::platform::Platform;
 use crate::proto::{
     self, PROP_ALPHA, PROP_BG_COLOR, PROP_BORDER_B, PROP_BORDER_COLOR, PROP_BORDER_EDGES,
@@ -60,141 +59,37 @@ macro_rules! canvas {
 
 // === Code source — owned by VM ===
 
-/// Flash read-ahead cache size. Inline in VmCode enum (no heap allocation).
-/// 128B covers most loop bodies and avoids per-byte SPI transactions.
-const FLASH_CACHE_SIZE: usize = 1024;
-
-/// Code source enum — VM owns its bytecode source.
-pub enum VmCode {
-    /// No code loaded.
-    None,
-    /// RAM-backed: VM owns the bytecode buffer.
-    Ram(Vec<u8>),
-    /// Flash-backed: inline read-ahead cache, no separate heap allocation.
-    /// The bytecode source is a type-erased flash handle so `VmCode`/`Vm` stay
-    /// non-generic; dyn dispatch only happens on a cache-miss SPI refill.
-    Flash {
-        flash: alloc::boxed::Box<dyn FlashBackend>,
-        base_addr: u32,
-        code_len: usize,
-        cache: [u8; FLASH_CACHE_SIZE],
-        cache_pos: usize,
-        cache_len: usize,
-    },
-}
+/// The program's bytecode. Always in RAM: XL has no execution from flash
+/// (programs are megabytes at most; the heap holds them).
+#[derive(Default)]
+pub struct VmCode(Vec<u8>);
 
 impl VmCode {
     #[inline]
     pub fn len(&self) -> usize {
-        match self {
-            VmCode::None => 0,
-            VmCode::Ram(data) => data.len(),
-            VmCode::Flash { code_len, .. } => *code_len,
-        }
+        self.0.len()
     }
 
+    /// The byte at `pos`, 0 past the end.
     #[inline]
-    pub fn byte_at(&mut self, pos: usize) -> u8 {
-        match self {
-            VmCode::None => 0,
-            VmCode::Ram(data) => {
-                if pos < data.len() {
-                    data[pos]
-                } else {
-                    0
-                }
-            }
-            VmCode::Flash {
-                flash,
-                base_addr,
-                code_len,
-                cache,
-                cache_pos,
-                cache_len,
-            } => {
-                if pos >= *code_len {
-                    return 0;
-                }
-                if pos >= *cache_pos && pos < *cache_pos + *cache_len {
-                    return cache[pos - *cache_pos];
-                }
-                // Cache miss — refill
-                let avail = code_len.saturating_sub(pos);
-                let n = avail.min(FLASH_CACHE_SIZE);
-                if n > 0 {
-                    flash.read(*base_addr + pos as u32, &mut cache[..n]);
-                }
-                *cache_pos = pos;
-                *cache_len = n;
-                if n > 0 { cache[0] } else { 0 }
-            }
-        }
+    pub fn byte_at(&self, pos: usize) -> u8 {
+        self.0.get(pos).copied().unwrap_or(0)
     }
 
-    /// Run `f` on the `len` code bytes at `pos` (caller checks the range):
-    /// borrowed in place from RAM code, gathered into a heap buffer from
-    /// flash code (`read_bytes` returns at most one cache line per call).
-    fn with_bytes<R>(&mut self, pos: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
-        if let VmCode::Ram(data) = self {
-            return f(&data[pos..pos + len]);
-        }
-        let mut buf = alloc::vec![0u8; len];
-        let mut got = 0;
-        while got < len {
-            let n = self.read_bytes(pos + got, &mut buf[got..]);
-            if n == 0 {
-                break;
-            }
-            got += n;
-        }
-        f(&buf[..got])
+    /// Run `f` on the `len` code bytes at `pos` (caller checks the range).
+    fn with_bytes<R>(&self, pos: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+        f(&self.0[pos..pos + len])
     }
 
+    /// Copy code bytes from `pos` into `buf`; the count copied.
     #[inline]
-    pub fn read_bytes(&mut self, pos: usize, buf: &mut [u8]) -> usize {
-        match self {
-            VmCode::None => 0,
-            VmCode::Ram(data) => {
-                if pos >= data.len() {
-                    return 0;
-                }
-                let avail = data.len() - pos;
-                let n = buf.len().min(avail);
-                buf[..n].copy_from_slice(&data[pos..pos + n]);
-                n
-            }
-            VmCode::Flash {
-                flash,
-                base_addr,
-                code_len,
-                cache,
-                cache_pos,
-                cache_len,
-            } => {
-                if pos >= *code_len {
-                    return 0;
-                }
-                let avail = *code_len - pos;
-                let n = buf.len().min(avail);
-                // Check if fully within cache
-                if pos >= *cache_pos && pos + n <= *cache_pos + *cache_len {
-                    let start = pos - *cache_pos;
-                    buf[..n].copy_from_slice(&cache[start..start + n]);
-                    return n;
-                }
-                // Cache miss — refill from pos
-                let fill_avail = code_len.saturating_sub(pos);
-                let fill_n = fill_avail.min(FLASH_CACHE_SIZE);
-                if fill_n > 0 {
-                    flash.read(*base_addr + pos as u32, &mut cache[..fill_n]);
-                }
-                *cache_pos = pos;
-                *cache_len = fill_n;
-                let from_cache = n.min(fill_n);
-                buf[..from_cache].copy_from_slice(&cache[..from_cache]);
-                from_cache
-            }
-        }
+    pub fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
+        let Some(src) = self.0.get(pos..) else {
+            return 0;
+        };
+        let n = buf.len().min(src.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        n
     }
 }
 
@@ -916,7 +811,7 @@ impl Vm {
             fault_pc: 0,
             op_pc: 0,
             wait_until: 0,
-            code: VmCode::None,
+            code: VmCode::default(),
             functions: Vec::new(),
             cb_frames: Vec::new(),
             sp_floor: 0,
@@ -1046,7 +941,7 @@ impl Vm {
             image.drain(..opcode_start);
             let opcodes = image;
             self.wide_addr = wide;
-            self.code = VmCode::Ram(opcodes);
+            self.code = VmCode(opcodes);
             self.functions = funcs;
             self.global_count = gc;
             self.frame_base = gc;
@@ -1059,64 +954,9 @@ impl Vm {
         }
     }
 
-    /// Load a VM image from flash. Reads only the header into RAM;
-    /// opcodes are read on demand from flash via SPI.
-    pub fn load_flash<F: FlashBackend + 'static>(
-        &mut self,
-        flash: FlashImpl<F>,
-        base: u32,
-        total_len: usize,
-    ) -> bool {
-        // Fixed header first, then exactly the header + function table it
-        // announces, on the heap: the table grows with the program, so a
-        // fixed stack buffer would cap the function count.
-        let mut fixed = [0u8; IMAGE_HEADER_SIZE_V4];
-        let n = total_len.min(IMAGE_HEADER_SIZE_V4);
-        flash.read(base, &mut fixed[..n]);
-        let Some(hdr_len) = image_header_len(&fixed[..n]) else {
-            return false;
-        };
-        if hdr_len > total_len {
-            return false;
-        }
-        let mut hdr_buf = Vec::new();
-        if hdr_buf.try_reserve_exact(hdr_len).is_err() {
-            return false;
-        }
-        hdr_buf.resize(hdr_len, 0);
-        flash.read(base, &mut hdr_buf);
-
-        if let Some((funcs, opcode_start, gc, hint, wide, portrait)) = parse_image_header(&hdr_buf) {
-            let opcode_base = base + opcode_start as u32;
-            let opcode_len = total_len.saturating_sub(opcode_start);
-            if !code_addressable(wide, opcode_len) {
-                return false;
-            }
-            self.wide_addr = wide;
-            // Move the caller's flash handle into the code source (no singleton).
-            self.code = VmCode::Flash {
-                flash: alloc::boxed::Box::new(flash.into_backend()),
-                base_addr: opcode_base,
-                code_len: opcode_len,
-                cache: [0u8; FLASH_CACHE_SIZE],
-                cache_pos: 0,
-                cache_len: 0,
-            };
-            self.functions = funcs;
-            self.global_count = gc;
-            self.frame_base = gc;
-            self.frame_size = 0;
-            self.portrait = portrait;
-            self.tree_hint = hint;
-            true
-        } else {
-            false
-        }
-    }
-
     /// Load raw bytecode (no image header). Used for page bytecode.
     pub fn load_raw(&mut self, data: Vec<u8>) {
-        self.code = VmCode::Ram(data);
+        self.code = VmCode(data);
         self.tree_hint = None;
         self.wide_addr = false;
         self.functions.clear();
@@ -1789,7 +1629,7 @@ impl Vm {
         self.fault = fault::NONE;
         self.vars.fill(0);
         self.wait_until = 0;
-        self.code = VmCode::None;
+        self.code = VmCode::default();
         self.functions.clear();
         self.cb_frames.clear();
         self.sp_floor = 0;
@@ -1836,15 +1676,12 @@ impl Vm {
 
     // --- Byte reading helpers (read from self.code) ---
 
-    /// `fast_vm`: RAM code is read inline; flash code and the out-of-range
-    /// fault go through `read_u8_slow`.
+    /// Read inline; the out-of-range fault goes through `read_u8_slow`.
     #[inline(always)]
     fn read_u8(&mut self) -> u8 {
-        if let VmCode::Ram(data) = &self.code {
-            if let Some(&b) = data.get(self.pc as usize) {
-                self.pc += 1;
-                return b;
-            }
+        if let Some(&b) = self.code.0.get(self.pc as usize) {
+            self.pc += 1;
+            return b;
         }
         self.read_u8_slow()
     }
@@ -1867,19 +1704,16 @@ impl Vm {
         self.read_u8() as i8
     }
 
-    /// The next `N` code bytes. `fast_vm`: one bounds check for RAM code
-    /// instead of one per byte; flash code and the out-of-range fault go
-    /// byte by byte through `read_u8_slow` (first fault wins, as before).
+    /// The next `N` code bytes, with one bounds check; the out-of-range fault
+    /// goes byte by byte through `read_u8_slow` (first fault wins, as before).
     #[inline(always)]
     fn fetch<const N: usize>(&mut self) -> [u8; N] {
-        if let VmCode::Ram(data) = &self.code {
-            let pc = self.pc as usize;
-            if let Some(s) = data.get(pc..pc + N) {
-                let mut out = [0u8; N];
-                out.copy_from_slice(s);
-                self.pc += N as CodeAddr;
-                return out;
-            }
+        let pc = self.pc as usize;
+        if let Some(s) = self.code.0.get(pc..pc + N) {
+            let mut out = [0u8; N];
+            out.copy_from_slice(s);
+            self.pc += N as CodeAddr;
+            return out;
         }
         self.fetch_slow()
     }
@@ -4025,24 +3859,6 @@ fn parse_image_header(
     ))
 }
 
-/// Size of an image's header including its function table, from the fixed
-/// part (`IMAGE_HEADER_SIZE_V4` bytes suffice for every version). `None` if
-/// `fixed` is too short or not a known version.
-fn image_header_len(fixed: &[u8]) -> Option<usize> {
-    let version = *fixed.first()?;
-    let size = match version {
-        1 | 2 => IMAGE_HEADER_SIZE_V2,
-        3 => IMAGE_HEADER_SIZE_V3,
-        4 => IMAGE_HEADER_SIZE_V4,
-        _ => return None,
-    };
-    if fixed.len() < size {
-        return None;
-    }
-    let func_count = u16::from_le_bytes([fixed[1], fixed[2]]) as usize;
-    Some(size + func_count * FUNC_ENTRY_SIZE)
-}
-
 /// Whether this build can address an image's bytecode: every offset in
 /// `code_len` must fit `CodeAddr`, and wide (u32-operand) images need the
 /// `wide_code` feature to decode at all.
@@ -4694,7 +4510,7 @@ mod anim_tests {
         let mut ctx = mock_ctx();
         let mut vm = Vm::new();
         assert!(vm.configure(4, 0, 0, 0));
-        vm.code = VmCode::Ram(alloc::vec![OP_PUSH_1; 5]);
+        vm.code = VmCode(alloc::vec![OP_PUSH_1; 5]);
         vm.run(&mut ctx);
         assert_eq!(vm.fault(), fault::STACK_OVERFLOW);
         assert_eq!(vm.fault_pc(), 4, "5th push overflows a 4-deep stack");
@@ -4704,7 +4520,7 @@ mod anim_tests {
         assert!(vm.configure(48, 0, 0, 0));
         let mut code = alloc::vec![OP_PUSH_1; 40];
         code.push(OP_HALT);
-        vm.code = VmCode::Ram(code);
+        vm.code = VmCode(code);
         vm.run(&mut ctx);
         assert!(vm.state != VmState::Error);
         assert_eq!(vm.sp, 40);
@@ -4715,7 +4531,7 @@ mod anim_tests {
     /// VM with `code` loaded and 4 globals (callback locals start above them).
     fn cb_vm(code: &[u8]) -> Vm {
         let mut vm = Vm::new();
-        vm.code = VmCode::Ram(code.to_vec());
+        vm.code = VmCode(code.to_vec());
         vm.global_count = 4;
         vm.state = VmState::Running;
         vm
@@ -5283,7 +5099,7 @@ mod anim_tests {
     fn run_code(code: &[u8]) -> Vm {
         let mut ctx = mock_ctx();
         let mut vm = Vm::new();
-        vm.code = VmCode::Ram(code.to_vec());
+        vm.code = VmCode(code.to_vec());
         vm.run(&mut ctx);
         vm
     }
@@ -5483,7 +5299,7 @@ mod anim_tests {
         for (name, code) in [("plain", &plain), ("fused", &fused)] {
             let mut ctx = mock_ctx();
             let mut vm = Vm::new();
-            vm.code = VmCode::Ram(code.clone());
+            vm.code = VmCode(code.clone());
             let runs = 200;
             let t0 = std::time::Instant::now();
             let mut acc = 0;
@@ -5636,21 +5452,6 @@ mod anim_tests {
         img
     }
 
-    /// Flash backed by a byte vector (reads past the end return 0xFF).
-    struct RomFlash(Vec<u8>);
-    impl FlashBackend for RomFlash {
-        fn read(&self, addr: u32, buf: &mut [u8]) {
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = *self.0.get(addr as usize + i).unwrap_or(&0xFF);
-            }
-        }
-        fn write(&self, _: u32, _: &[u8]) {}
-        fn erase_sector(&self, _: u32) {}
-        fn read_id(&self) -> (u8, u8, u8) {
-            (0, 0, 0)
-        }
-    }
-
     /// `OP_STR_LIT` with a `len`-byte literal, then HALT.
     fn long_literal(len: usize) -> (Vec<u8>, Vec<u8>) {
         let text: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
@@ -5666,7 +5467,7 @@ mod anim_tests {
         let (code, text) = long_literal(255);
         let mut ctx = mock_ctx();
         let mut vm = Vm::new();
-        vm.code = VmCode::Ram(code);
+        vm.code = VmCode(code);
         vm.run(&mut ctx);
         assert!(vm.state == VmState::Halted);
         let id = vm.stack[vm.sp as usize - 1] as ObjPtr;
@@ -5674,26 +5475,7 @@ mod anim_tests {
     }
 
     #[test]
-    fn str_lit_from_flash_spans_cache_refills() {
-        // Literal straddles the end of the first flash cache line.
-        let (lit, text) = long_literal(200);
-        let at = (FLASH_CACHE_SIZE - 100) as u16;
-        let mut code = alloc::vec![0xEE; at as usize];
-        code[..3].copy_from_slice(&[OP_JMP, at as u8, (at >> 8) as u8]);
-        code.extend_from_slice(&lit);
-        let img = image(0, &code);
-        let len = img.len();
-        let mut vm = Vm::new();
-        assert!(vm.load_flash(FlashImpl::with_backend(RomFlash(img)), 0, len));
-        let mut ctx = mock_ctx();
-        vm.run(&mut ctx);
-        assert!(vm.state == VmState::Halted);
-        let id = vm.stack[vm.sp as usize - 1] as ObjPtr;
-        assert_eq!(ctx.objs.str_get(id), &text[..]);
-    }
-
-    #[test]
-    fn load_flash_reads_the_whole_function_table() {
+    fn load_reads_the_whole_function_table() {
         // 300 functions — well past the old 64-entry stack buffer.
         const FUNCS: u16 = 300;
         let [c0, c1] = FUNCS.to_le_bytes();
@@ -5707,27 +5489,19 @@ mod anim_tests {
         let code = alloc::vec![OP_HALT; FUNCS as usize];
         img.extend_from_slice(&code);
 
-        // Image at a non-zero flash offset, followed by unrelated bytes.
-        let base = 0x100u32;
-        let mut rom = alloc::vec![0xAA; base as usize];
-        rom.extend_from_slice(&img);
-        rom.extend_from_slice(&[0x55; 64]);
-
         let mut vm = Vm::new();
-        let flash = FlashImpl::with_backend(RomFlash(rom));
-        assert!(vm.load_flash(flash, base, img.len()));
+        assert!(vm.load_ram(&img));
         assert_eq!(vm.functions.len(), FUNCS as usize);
         assert_eq!(vm.find_func(FUNCS).map(|f| f.offset), Some(FUNCS as u32 - 1));
         assert_eq!(vm.code.len(), code.len());
     }
 
     #[test]
-    fn load_flash_rejects_a_truncated_function_table() {
+    fn load_rejects_a_truncated_function_table() {
         // Header announces 300 functions but the image is cut short.
         let img = alloc::vec![4, 0x2C, 0x01, 0, 0, 0, 0, 0, 0, 1, 0, 0];
         let mut vm = Vm::new();
-        let flash = FlashImpl::with_backend(RomFlash(img.clone()));
-        assert!(!vm.load_flash(flash, 0, img.len()));
+        assert!(!vm.load_ram(&img));
     }
 
     #[test]
@@ -5737,13 +5511,8 @@ mod anim_tests {
         let ptr = img.as_ptr();
         assert!(vm.load_ram_owned(img).is_ok());
         // Header stripped in place: same allocation, opcodes only.
-        match &vm.code {
-            VmCode::Ram(code) => {
-                assert_eq!(code.as_slice(), &[OP_PUSH_1, OP_HALT]);
-                assert_eq!(code.as_ptr(), ptr);
-            }
-            _ => panic!("expected RAM code"),
-        }
+        assert_eq!(vm.code.0.as_slice(), &[OP_PUSH_1, OP_HALT]);
+        assert_eq!(vm.code.0.as_ptr(), ptr);
         // A bad header hands the buffer back untouched (raw-bytecode fallback).
         let raw = alloc::vec![0xFFu8, 1, 2];
         assert_eq!(vm.load_ram_owned(raw.clone()), Err(raw));

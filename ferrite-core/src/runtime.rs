@@ -2838,6 +2838,36 @@ mod class_tests {
 }
 
 #[cfg(all(test, feature = "mock"))]
+mod call_tests {
+    //! Void calls (no value pushed before RET, none popped by the caller):
+    //! `testdata/calls/calls.fl`, compiled by `testdata/calls/gen.py` with
+    //! and without superops.
+    use super::*;
+    use crate::pool::ObjPtr;
+
+    fn run(code: &[u8]) {
+        let mut rt = super::multi_tests::boot(&[(b"main", code.to_vec())]);
+        for _ in 0..3 {
+            rt.step();
+        }
+        assert_eq!(rt.error_code, 0);
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let r = rt.ctx.objs.arr(rt.tasks.main.var(0) as ObjPtr).expect("r[]").to_vec();
+        assert_eq!(&r[..9], &[1000, 1010, 1110, 3, 10, 7, 1120, 6, 42]);
+    }
+
+    #[test]
+    fn void_calls() {
+        run(include_bytes!("../testdata/calls/calls.prg"));
+    }
+
+    #[test]
+    fn void_calls_superops() {
+        run(include_bytes!("../testdata/calls/calls_super.prg"));
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
 mod widget_ctor_tests {
     //! Widget constructors (`Button(text: .., children: [..])`, lowered by the
     //! compiler to alloc/parent/set): `testdata/widgets/ctor.fl`, compiled by

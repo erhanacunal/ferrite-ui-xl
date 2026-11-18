@@ -1,0 +1,39 @@
+// Void calls (runtime::call_tests): a function with no `return <value>`
+// pushes nothing before RET and its callers don't pop. Results go to `r`,
+// the first global, which the test reads back.
+
+var r[10];
+var count = 0;
+
+fn bump(k) { count += k; }                         // void, with an arg
+fn bump_twice(k) { bump(k); bump(k); }             // void calling void
+fn early(k) { if (k > 3) { return; } count += 100; }  // void with `return;`
+fn rec(n) { if (n == 0) { return; } count += 1; rec(n - 1); }
+fn val(k) { return k * 2; }                        // returns a value
+fn maybe(k) { if (k == 0) { return 7; } }          // a value or the implicit 0
+
+fn setup() {
+    // 1000 calls each: a value pushed and not popped (or popped and not
+    // pushed) would overflow (underflow) the 32-entry eval stack.
+    var i = 0;
+    while (i < 1000) { bump(1); i += 1; }
+    r[0] = count;               // 1000
+    bump_twice(5);
+    r[1] = count;               // 1010
+    early(5);
+    early(1);
+    r[2] = count;               // 1110
+    var x = bump(0);            // a void call's value is 0
+    r[3] = x + bump(0) + 3;     // 3
+    r[4] = val(4) + val(1);     // 10
+    r[5] = maybe(0) + maybe(1); // 7
+    rec(10);
+    r[6] = count;               // 1120
+    i = 0;
+    while (i < 1000) { val(i); maybe(1); i += 1; }  // discarded values are popped
+    r[7] = val(3);              // 6
+    r[8] = 42;                  // setup ran to the end
+}
+
+fn loop() {
+}

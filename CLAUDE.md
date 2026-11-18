@@ -26,6 +26,7 @@ Working branch: `main` (commit and push there).
 - Firmware: `cd bsp/exynos4412 && cargo build --release` (or `./exynos4412.ps1` from the repo root)
 - After changing `lib/flex.fl`: `python ferrite-core/testdata/flex/gen.py`
 - After changing the compiler's class support: `python ferrite-core/testdata/classes/gen.py`
+- After changing the compiler's calling convention (void functions, call/return codegen): `python ferrite-core/testdata/calls/gen.py`
 - After changing the compiler's widget constructors (`widget` declarations, lib/core.fl / lib/flex.fl declarations): `python ferrite-core/testdata/widgets/gen.py`
 - After changing `bsp/exynos4412/shaders/*`: from `bsp/exynos4412`, `wsl python3 ../../vendor/exynos_4412_rs/tools/shaderc/shaderc.py -o src/compose/shaders.rs shaders/*.vert` (WSL Debian; `tools/shaderc/setup.sh` once; the header's paths then read `../shaders/`, keep them `shaders/`)
 - After changing `system/setup/main.fl` or ferrite-ui `lib/system.fl`: `python scripts/build_setup.py` (rebuilds the embedded `system/setup/setup.img`; `--check` compares), then the firmware

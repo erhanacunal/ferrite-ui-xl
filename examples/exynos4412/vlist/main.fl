@@ -1,0 +1,13 @@
+// main.fl — a virtualized list (rows recycled as it scrolls)
+//
+// ITEMS rows of a list, but only enough row widgets to fill the view plus two. A spacer
+// child at the bottom makes the container ITEMS rows tall, so dragging, flinging and the
+// scrollbar work as for a full list; loop() reads the scroll value and moves each row whose
+// slot (index % SLOTS) now holds another item there, with that item's text. full.fl is the
+// same list with one widget per item, to compare (project_full.json).
+//
+// Limit: child locations are i16 and the content height u16, so the list is at most
+// ~32 767 px tall (ITEMS * ITEM_H).
+
+const VIRTUAL = 1;
+#include "vlist.fl"

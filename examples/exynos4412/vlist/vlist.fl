@@ -1,0 +1,249 @@
+// vlist.fl — the list shared by main.fl (VIRTUAL = 1) and full.fl (VIRTUAL = 0).
+//
+// "Auto scroll" scrolls the list from end to end and back at a steady speed (set from loop():
+// an animation this long would move in steps of 1/256 of its range), so the cost can be
+// measured without touching (/api/status, or the line at the bottom). Drag the list to
+// scroll it by hand.
+
+#include "core.fl"
+#include "color.fl"
+#include "sysinfo.fl"
+
+const ITEMS = 580;
+const ITEM_H = 56;
+const VIEW_H = 600;
+// Row widgets of the virtual list: the rows the view can show at once, plus one.
+const SLOTS = 13;  // also the size of rows[] and shown[]
+// Auto scroll speed, px/s.
+const SPEED = 1500;
+
+var list;
+var auto_btn;
+var auto_lbl;
+var info_lbl;
+var auto_on = 1;
+var auto_t0 = 0;
+var auto_from = 0;
+var since = 0;
+var passes0 = 0;
+var frames0 = 0;
+var setup_ms = 0;
+var binds = 0;
+// The scroll value update_rows last placed the rows for.
+var placed = -1;
+var rows[13];
+var shown[13];
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+// Shows item `idx` in row widget `row`.
+fn bind(row: widget, idx) {
+    target(row);
+    set(location, 4, idx * ITEM_H);
+    set(bg_color, rgb565(36 + (idx % 4) * 8, 38, 58));
+    set(text, concat(concat(str("Item "), itos(idx + 1)), str(" - drag the list to scroll")));
+    binds++;
+}
+
+fn new_row() {
+    var item = alloc();
+    target(item);
+    set(kind, KIND_LABEL);
+    set(size, 506, ITEM_H - 6);
+    set(press_color, rgb565(50, 80, 130));
+    set(border_radius, 8);
+    set(padding, 14, 8, 10, 8);
+    set(text_color, WHITE);
+    set(font_id, 0);
+    set(clickable, ON);
+    parent(list);
+    return item;
+}
+
+// Virtual list: rows for the items in the view now.
+fn update_rows() {
+    target(list);
+    var y = get(value);
+    if (y == placed) {
+        return 0;
+    }
+    placed = y;
+    var first = y / ITEM_H;
+    var changed = 0;
+    var k = 0;
+    while (k < SLOTS) {
+        var idx = first + k;
+        if (idx < ITEMS) {
+            var s = idx % SLOTS;
+            if (shown[s] != idx) {
+                if (!changed) {
+                    strClear();
+                    changed = 1;
+                }
+                shown[s] = idx;
+                bind(rows[s], idx);
+            }
+        }
+        k++;
+    }
+}
+
+fn make_list() {
+    list = alloc();
+    target(list);
+    set(location, 60, 90);
+    set(size, 540, VIEW_H + 12);
+    set(bg_color, rgb565(20, 22, 34));
+    set(border, 2, 2, 2, 2);
+    set(border_color, rgb565(60, 70, 110));
+    set(border_radius, 12);
+    set(padding, 4, 4, 4, 4);
+    set(clip_children, ON);
+    set(clickable, ON);
+    parent(0);
+
+    var i = 0;
+    if (VIRTUAL) {
+        // The spacer: the list's content is ITEMS rows tall.
+        var sp = alloc();
+        target(sp);
+        set(location, 0, ITEMS * ITEM_H - 1);
+        set(size, 1, 1);
+        set(bg_color, rgb565(20, 22, 34));
+        parent(list);
+        while (i < SLOTS) {
+            rows[i] = new_row();
+            shown[i] = -1;
+            i++;
+        }
+        update_rows();
+    } else {
+        while (i < ITEMS) {
+            bind(new_row(), i);
+            i++;
+        }
+    }
+    return 0;
+}
+
+fn set_auto() {
+    if (auto_on) {
+        target(list);
+        auto_from = get(value);
+        auto_t0 = millis();
+        target(auto_lbl);
+        set(text, "Auto scroll: on");
+    } else {
+        target(auto_lbl);
+        set(text, "Auto scroll: off");
+    }
+    dirty();
+    return 0;
+}
+
+fn on_auto(wid) {
+    auto_on = 1 - auto_on;
+    set_auto();
+}
+
+fn setup() {
+    var t0 = millis();
+    target(0);
+    set(bg_color, rgb565(12, 12, 18));
+
+    var title = alloc();
+    target(title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 24);
+    set(size, 1280, 40);
+    if (VIRTUAL) {
+        set(text, "Virtual list: 580 items, 13 row widgets");
+    } else {
+        set(text, "Full list: 580 items, 580 row widgets");
+    }
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(font_id, 0);
+    parent(0);
+
+    make_list();
+
+    auto_btn = alloc();
+    target(auto_btn);
+    set(kind, KIND_BUTTON);
+    set(location, 60, 722);
+    set(size, 240, 56);
+    set(bg_color, rgb565(60, 80, 140));
+    set(press_color, rgb565(100, 130, 210));
+    set(border_radius, 12);
+    set(clickable, ON);
+    set(on_click, @on_auto);
+    parent(0);
+
+    auto_lbl = alloc();
+    target(auto_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 0);
+    set(size, 240, 56);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(font_id, 0);
+    parent(auto_btn);
+
+    info_lbl = alloc();
+    target(info_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 340, 722);
+    set(size, 900, 56);
+    set(text_color, rgb565(160, 170, 200));
+    set(font_id, 0);
+    parent(0);
+
+    set_auto();
+    setup_ms = millis() - t0;
+    since = millis();
+    passes0 = sysPasses();
+    frames0 = sysFrames();
+    return 0;
+}
+
+// Auto scroll: SPEED px/s, from end to end and back.
+fn auto_scroll() {
+    var range = ITEMS * ITEM_H - VIEW_H + 8;
+    var d = (auto_from + (millis() - auto_t0) * SPEED / 1000) % (2 * range);
+    if (d > range) {
+        d = 2 * range - d;
+    }
+    target(list);
+    if (get(value) != d) {
+        set(value, d);
+    }
+}
+
+fn loop() {
+    if (auto_on) {
+        auto_scroll();
+    }
+    if (VIRTUAL) {
+        update_rows();
+    }
+    var now = millis();
+    if (now - since >= 2000) {
+        var p = sysPasses();
+        var f = sysFrames();
+        if (!VIRTUAL) {
+            strClear();
+        }
+        target(info_lbl);
+        set(text, concat(concat(concat(concat(concat(concat(str("setup ms "), itos(setup_ms)),
+                         str("   passes/s ")), itos((p - passes0) * 1000 / (now - since))),
+                         str("   frames/s ")), itos((f - frames0) * 1000 / (now - since))),
+                         concat(str("   row binds "), itos(binds))));
+        dirty();
+        since = now;
+        passes0 = p;
+        frames0 = f;
+    }
+}

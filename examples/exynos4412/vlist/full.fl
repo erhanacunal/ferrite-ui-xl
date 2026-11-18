@@ -1,0 +1,4 @@
+// full.fl — the list of main.fl with one widget per item (no virtualization), to compare.
+
+const VIRTUAL = 0;
+#include "vlist.fl"

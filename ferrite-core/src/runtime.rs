@@ -2853,7 +2853,7 @@ mod call_tests {
         assert_eq!(rt.error_code, 0);
         assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
         let r = rt.ctx.objs.arr(rt.tasks.main.var(0) as ObjPtr).expect("r[]").to_vec();
-        assert_eq!(&r[..9], &[1000, 1010, 1110, 3, 10, 7, 1120, 6, 42]);
+        assert_eq!(&r[..13], &[1000, 1010, 1110, 3, 10, 7, 1120, 6, 42, 10002000, 5, 7, 6135]);
     }
 
     #[test]

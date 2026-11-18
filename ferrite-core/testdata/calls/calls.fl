@@ -2,7 +2,7 @@
 // pushes nothing before RET and its callers don't pop. Results go to `r`,
 // the first global, which the test reads back.
 
-var r[10];
+var r[16];
 var count = 0;
 
 fn bump(k) { count += k; }                         // void, with an arg
@@ -11,6 +11,26 @@ fn early(k) { if (k > 3) { return; } count += 100; }  // void with `return;`
 fn rec(n) { if (n == 0) { return; } count += 1; rec(n - 1); }
 fn val(k) { return k * 2; }                        // returns a value
 fn maybe(k) { if (k == 0) { return 7; } }          // a value or the implicit 0
+
+// Methods: void unless the method they override or one of its overrides
+// returns a value (a virtual call runs any of them).
+class Counter {
+    var n;
+    fn init(n0) { self.n = n0; }               // void
+    fn add(k) { self.n += k; count += k; }     // void, overridden by a void
+    fn get() -> int { return self.n; }
+    fn mixed(k) { count += k; }                // not void: an override returns
+    fn drop() { count += 1000; }               // void, run by free()
+}
+class Double : Counter {
+    fn add(k) { super.add(k); super.add(k); }
+    fn mixed(k) { count += k; return k; }
+}
+class Solo {                                   // no hierarchy: static calls
+    var v;
+    fn put(k) { self.v = k; count += k; }
+    fn drop() { count += 1; }                  // free() calls it directly
+}
 
 fn setup() {
     // 1000 calls each: a value pushed and not popped (or popped and not
@@ -32,6 +52,19 @@ fn setup() {
     i = 0;
     while (i < 1000) { val(i); maybe(1); i += 1; }  // discarded values are popped
     r[7] = val(3);              // 6
+    var c: Counter = Counter(0);
+    var d: Counter = Double(0);
+    i = 0;
+    while (i < 1000) { c.add(1); d.add(1); c.mixed(0); d.mixed(0); i += 1; }
+    r[9] = c.get() * 10000 + d.get();  // 10002000; count 4120
+    r[10] = c.add(5) + d.mixed(4) + 1; // 5; count 4129
+    var s: Solo = Solo();
+    s.put(3);
+    r[11] = s.put(2) + 7;              // 7; count 4134
+    free(s);                           // 4135
+    free(d);                           // 5135
+    free(c);                           // 6135
+    r[12] = count;                     // 6135
     r[8] = 42;                  // setup ran to the end
 }
 

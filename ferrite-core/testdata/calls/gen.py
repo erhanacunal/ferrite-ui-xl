@@ -38,5 +38,6 @@ for superops, name in ((False, "calls.prg"), (True, "calls_super.prg")):
     (HERE / name).write_bytes(bytes(image))
     print(f"{name}: {len(image)} bytes")
 
-expected = {"bump", "bump_twice", "early", "rec"}
+expected = {"bump", "bump_twice", "early", "rec", "Counter.init", "Counter.add", "Double.add",
+            "Counter.drop", "Solo.put", "Solo.drop"}
 assert all(v == expected for v in voids), f"void functions: {voids}, expected {expected}"

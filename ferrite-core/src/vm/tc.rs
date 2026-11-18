@@ -93,7 +93,10 @@ fn slow_exec<P: Platform>(vm: &mut Vm, ctx: usize) {
 /// Runs `vm` (state `Running`, `budget` >= 1) until it leaves `Running` or
 /// `budget` instructions ran (more in a critical section); the count run.
 pub(super) fn run<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, budget: u32) -> u32 {
-    vm.tc_ctx = ctx as *mut Ctx<P> as usize;
+    let cp = ctx as *mut Ctx<P>;
+    vm.tc_ctx = cp as usize;
+    // SAFETY: from the same pointer, valid for the burst.
+    vm.tc_objs = unsafe { &raw mut (*cp).objs };
     vm.tc_slow = slow_exec::<P>;
     vm.tc_limit = budget;
     vm.tc_base = 0;
@@ -429,6 +432,48 @@ fn op_call(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     jump!(vm, t, sp, n)
 }
 
+/// A plain return: no callback or modal dialog running (their returns need
+/// `exec_one`'s bookkeeping), a frame to pop.
+fn op_ret(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    let depth = vm.call_sp as usize;
+    if depth == 0 || !vm.cb_frames.is_empty() || !vm.modal_stack.is_empty() {
+        become slow(vm, pc, sp, n)
+    }
+    // SAFETY: 0 < depth <= call_stack.len() (op_call / exec_one check).
+    let f = unsafe { *vm.call_stack.get_unchecked(depth - 1) };
+    vm.call_sp = (depth - 1) as u8;
+    vm.frame_base = f.frame_base;
+    vm.frame_size = f.frame_size;
+    jump!(vm, f.ret_addr as usize, sp, n)
+}
+
+/// SYSCALL id argc: the platform's handler on the top `argc` values (fewer
+/// on the stack, or no handler: `exec_one`, which faults).
+fn op_syscall(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    let Some(f) = vm.syscall_fn else {
+        become slow(vm, pc, sp, n)
+    };
+    let (id, argc) = unsafe { (*pc, *pc.add(1) as usize) };
+    let k = argc.min(MAX_SYSCALL_ARGS);
+    if (sp as usize) < vm.tc_lo + 4 * k {
+        become slow(vm, pc, sp, n)
+    }
+    let mut args = [0i32; MAX_SYSCALL_ARGS];
+    // SAFETY: k values on the stack (checked); `args` holds k.
+    let sp = unsafe {
+        let sp = sp.sub(k);
+        core::ptr::copy_nonoverlapping(sp, args.as_mut_ptr(), k);
+        sp
+    };
+    // SAFETY: set by `run` from its `Ctx`, which outlives the burst; nothing
+    // else holds the pool while a handler runs.
+    let objs = unsafe { &mut *vm.tc_objs };
+    match f(id, &args[..k], objs) {
+        Some(v) => push!(vm, pc, sp, n, v, unsafe { pc.add(2) }),
+        None => fault(vm, unsafe { pc.sub(1) }, sp, n, fault::SYSCALL),
+    }
+}
+
 /// Superinstruction tail: jump to `t` if `a <cond> b`, else on at `after`.
 macro_rules! jump_if {
     ($vm:ident, $pc:ident, $sp:ident, $n:ident, $cond:expr, $a:expr, $b:expr, $t:expr, $after:expr) => {
@@ -579,5 +624,7 @@ const fn table() -> [Handler; 256] {
     t[OP_ADD_VI as usize] = op_add_vi;
     t[OP_STORE_OP as usize] = op_store_op;
     t[OP_FRAME_A as usize] = op_frame_a;
+    t[OP_RET as usize] = op_ret;
+    t[OP_SYSCALL as usize] = op_syscall;
     t
 }

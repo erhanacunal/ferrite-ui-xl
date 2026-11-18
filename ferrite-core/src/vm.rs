@@ -822,6 +822,7 @@ pub struct Vm {
     tc_lo: usize,
     tc_hi: usize,
     tc_ctx: usize,
+    tc_objs: *mut ObjPool,
     tc_slow: tc::Slow,
 }
 
@@ -886,6 +887,7 @@ impl Vm {
             tc_lo: 0,
             tc_hi: 0,
             tc_ctx: 0,
+            tc_objs: core::ptr::null_mut(),
             tc_slow: tc::no_slow,
             tree_hint: None,
             open_files: [None, None],
@@ -4597,7 +4599,7 @@ mod anim_tests {
 
     /// Threaded dispatch (`tc::run`) against the `exec_one` loop on random
     /// programs: the hot opcodes with random operands, slow ones (calls,
-    /// returns, yields, halts), jumps in and out of the
+    /// returns, syscalls, yields, halts), jumps in and out of the
     /// code, cut-off instructions, each run with a few budgets. Same state,
     /// stack, variables, pc and instruction count; on a fault the same fault
     /// and fault pc (CODE_OOB not compared, see `tc`'s docs).
@@ -4613,7 +4615,7 @@ mod anim_tests {
             (OP_FRAME, 1), (OP_FRAME_A, 2), (OP_JMP, 2), (OP_JZ, 2), (OP_JNZ, 2), (OP_CALL, 2),
             (OP_JCMP, 3), (OP_JCMP_VI, 6), (OP_JCMP_VV, 5), (OP_BIN_I, 3), (OP_BIN_I32, 5),
             (OP_BIN_V, 2), (OP_ADD_VI, 3), (OP_STORE_OP, 2), (OP_RET, 0), (OP_YIELD, 0),
-            (OP_HALT, 0), (0xEE, 0),
+            (OP_HALT, 0), (0xEE, 0), (OP_SYSCALL, 2),
         ];
         let mut seed = 0x1234_5678u32;
         let mut rnd = move || {
@@ -4639,6 +4641,8 @@ mod anim_tests {
                         (OP_JCMP | OP_JCMP_VI | OP_JCMP_VV, 0) if rnd() % 8 != 0 => OP_EQ + (rnd() % 6) as u8,
                         (OP_BIN_I | OP_BIN_I32 | OP_BIN_V | OP_STORE_OP, 0) if rnd() % 8 != 0 => OP_ADD + (rnd() % 7) as u8,
                         (OP_FRAME_A, 1) => (rnd() % 4) as u8,
+                        (OP_SYSCALL, 1) => (rnd() % 5) as u8, // argc
+                        (OP_SYSCALL, 0) => (rnd() % 8) as u8, // id 7 fails
                         _ => rnd() as u8,
                     };
                     code.push(b);
@@ -4664,7 +4668,11 @@ mod anim_tests {
                 // Some values on the stack and in the variables, so that
                 // most programs run a while before they underflow.
                 let fill: alloc::vec::Vec<i32> = (0..24).map(|_| rnd() as i32 % 50).collect();
+                fn sys(id: u8, args: &[i32], _: &mut ObjPool) -> Option<i32> {
+                    (id != 7).then(|| args.iter().fold(id as i32, |s, &x| s.wrapping_mul(31).wrapping_add(x)))
+                }
                 for v in [&mut a, &mut b] {
+                    v.syscall_fn = Some(sys);
                     v.global_count = 8;
                     v.frame_base = 8;
                     v.state = VmState::Running;

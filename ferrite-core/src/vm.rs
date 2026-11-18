@@ -362,7 +362,7 @@ const OP_W_TARGET_S: u8 = 0x42; // widget id from stack (dynamic target)
 const OP_W_PARENT_S: u8 = 0x43; // parent id from stack (dynamic parent)
 const OP_W_LOAD: u8 = 0x44; // + u16 block offset in the widget page (RES_PAGE)
 
-// Superinstructions (`superops` feature, 0x45..=0x4D). `cond`/`op` operand = the opcode
+// Superinstructions (`superops` feature, 0x45..=0x4E). `cond`/`op` operand = the opcode
 // of the fused binary op (OP_ADD..=OP_OR, OP_SHL, OP_SHR, OP_EQ..=OP_GE).
 // Keep in sync with tools/ferrite_cc.py (Op, OP_NAMES, disassembler).
 const OP_JCMP: u8 = 0x45; // + u8 cond + addr: pop a, b; jump if a <cond> b
@@ -374,6 +374,7 @@ const OP_BIN_V: u8 = 0x4A; // + u8 op + u8 slot: top = top <op> var
 const OP_ADD_VI: u8 = 0x4B; // + u8 slot + i16: var += imm (no stack)
 const OP_ARR_LOAD_V: u8 = 0x4C; // + u8 slot: pop index, push array(var)[index]
 const OP_STORE_OP: u8 = 0x4D; // + u8 op + u8 slot: pop b; var = var <op> b
+const OP_FRAME_A: u8 = 0x4E; // + u8 local_count + u8 nargs: FRAME, then pop the args into locals nargs-1..0
 
 /// The integer binary ops (and comparisons, as 0/1) by opcode, as the plain
 /// opcodes compute them. None = not a binary op.
@@ -2992,6 +2993,16 @@ impl Vm {
                     }
                 }
             }
+            OP_FRAME_A => {
+                // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
+                let [count, nargs] = self.fetch();
+                self.frame_size = count;
+                let base = self.frame_base as u16;
+                for i in (0..nargs as u16).rev() {
+                    let v = self.pop();
+                    self.var_set(base + i, v);
+                }
+            }
             OP_ARR_LOAD_V => {
                 let raw = self.read_u8();
                 let idx = self.pop();
@@ -5267,6 +5278,34 @@ mod anim_tests {
         assert!(vm.state == VmState::Error);
         assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
         assert_eq!(vm.fault_pc(), 2);
+    }
+
+    /// FRAME_A against FRAME plus a STORE per argument (last argument on top).
+    #[test]
+    fn frame_a_matches_plain_prologue() {
+        for nargs in 0..=4u8 {
+            let mut args = std::vec::Vec::new();
+            for i in 0..nargs {
+                args.extend_from_slice(&[OP_PUSH_I8, 10 + i]);
+            }
+            let mut plain = args.clone();
+            plain.extend_from_slice(&[OP_FRAME, 6]);
+            for i in (0..nargs).rev() {
+                plain.push(OP_STORE_0 + i);
+            }
+            let mut fused = args.clone();
+            fused.extend_from_slice(&[OP_FRAME_A, 6, nargs]);
+            let tail = [OP_LOAD_0, OP_LOAD_1, OP_LOAD_2, OP_LOAD_3, OP_HALT];
+            plain.extend_from_slice(&tail);
+            fused.extend_from_slice(&tail);
+            let (p, f) = (run_code(&plain), run_code(&fused));
+            assert!(f.state == VmState::Halted, "nargs {nargs}");
+            assert_eq!((f.sp, f.frame_size), (p.sp, p.frame_size), "nargs {nargs}");
+            assert_eq!(f.stack[..f.sp as usize], p.stack[..p.sp as usize], "nargs {nargs}");
+        }
+        // Too few arguments on the stack: a fault, as with the STOREs.
+        let vm = run_code(&[OP_PUSH_1, OP_FRAME_A, 2, 2, OP_HALT]);
+        assert!(vm.state == VmState::Error);
     }
 
     /// Each superinstruction against the plain sequence it replaces, over

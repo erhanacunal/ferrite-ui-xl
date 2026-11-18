@@ -39,7 +39,7 @@ pub const CAP_VIDEO: u32 = 1 << 1;
 pub const CAP_JPEG: u32 = 1 << 2;
 /// Board runs several programs at once (`multi_program` feature: task opcodes).
 pub const CAP_MULTI_PROGRAM: u32 = 1 << 3;
-/// Board's VM runs superinstructions (`superops` feature, opcodes 0x45..=0x4D).
+/// Board's VM runs superinstructions (`superops` feature, opcodes 0x45..=0x4E).
 pub const CAP_SUPEROPS: u32 = 1 << 4;
 /// `flexLayout(box)` is the native `FLEX_LAYOUT` opcode (0xDB, `vm_flex.rs`)
 /// instead of lib/flex.fl's function (`caps.native_flex`, ferrite-ui-xl).

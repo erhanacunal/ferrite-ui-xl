@@ -3675,12 +3675,13 @@ impl Vm {
             let dur = a.duration_ms.max(1) as u32;
             let elapsed = now.wrapping_sub(a.start_ms);
             let done = elapsed >= dur;
-            let t = if done { 256 } else { (elapsed * 256 / dur) as i32 };
+            // `elapsed < dur <= u16::MAX`: the shift stays in a u32.
+            let t = if done { T_ONE } else { ((elapsed << T_BITS) / dur) as i32 };
             let te = ease(a.ctrl, t);
             let val = if prop_is_color(a.prop_id) {
-                crate::lcd::lerp_rgb565(a.from as u16, a.to as u16, te as u16, 256) as i32
+                crate::lcd::lerp_rgb565(a.from as u16, a.to as u16, te as u16, T_ONE as u16) as i32
             } else {
-                a.from + ((a.to - a.from) * te) / 256
+                a.from + ((a.to as i64 - a.from as i64) * te as i64 / T_ONE as i64) as i32
             };
             if val != Self::get_scalar_prop_on(ctx, a.target, a.prop_id) {
                 Self::set_scalar_prop_on(ctx, a.target, a.prop_id, val);
@@ -4091,22 +4092,28 @@ fn prop_is_visual(prop_id: u8) -> bool {
 
 // --- Animation helpers ---
 
-/// Apply an easing curve to `t` (Q8 fixed-point, 0..=256), returning the eased
-/// position in the same Q8 range. Curve picked from the low 4 bits of `ctrl`.
+/// Animation progress, fixed point: `T_ONE` = done. Q12, so an animation of
+/// any duration (`u16` ms) moves at least every 16 ms; Q8 moved in steps of
+/// 1/256 of its range (a 21 s scroll: 125 px every 83 ms).
+const T_BITS: u32 = 12;
+const T_ONE: i32 = 1 << T_BITS;
+
+/// Apply an easing curve to `t` (Q12 fixed-point, 0..=`T_ONE`), returning the
+/// eased position in the same range. Curve picked from the low 4 bits of `ctrl`.
 /// Quadratic in/out/in-out; anything else is linear.
 fn ease(ctrl: u8, t: i32) -> i32 {
     match ctrl & EASE_CURVE_MASK {
-        EASE_IN => (t * t) >> 8,
+        EASE_IN => (t * t) >> T_BITS,
         EASE_OUT => {
-            let u = 256 - t;
-            256 - ((u * u) >> 8)
+            let u = T_ONE - t;
+            T_ONE - ((u * u) >> T_BITS)
         }
         EASE_IN_OUT => {
-            if t < 128 {
-                (2 * t * t) >> 8
+            if t < T_ONE / 2 {
+                (2 * t * t) >> T_BITS
             } else {
-                let u = 256 - t;
-                256 - ((2 * u * u) >> 8)
+                let u = T_ONE - t;
+                T_ONE - ((2 * u * u) >> T_BITS)
             }
         }
         _ => t,
@@ -4604,6 +4611,32 @@ mod anim_tests {
         // Now heading back toward 0.
         vm.tick_animations(&mut ctx, 150);
         assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_LOC_X), 50);
+    }
+
+    /// A long animation moves every frame: progress is Q12, not Q8 (a 20 s
+    /// tween over 32 000 px moved 125 px every 78 ms).
+    #[test]
+    fn long_animations_move_every_frame() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        let id = one_widget(&mut ctx);
+        Vm::set_scalar_prop_on(&mut ctx, id, PROP_VALUE, 0);
+        vm.start_anim(&ctx, id, PROP_VALUE, 32_000, 20_000, 0, 0, 0);
+        let mut last = 0;
+        for f in 1..=60 {
+            vm.tick_animations(&mut ctx, f * 16);
+            let v = Vm::get_scalar_prop_on(&ctx, id, PROP_VALUE);
+            assert!(v > last, "frame {f}: still {v}");
+            assert!((v - f as i32 * 16 * 32_000 / 20_000).abs() <= 8, "frame {f}: {v}");
+            last = v;
+        }
+        vm.tick_animations(&mut ctx, 20_000);
+        assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_VALUE), 32_000, "ends on its target");
+        // Easing keeps its ends and midpoint.
+        for c in [EASE_IN, EASE_OUT, EASE_IN_OUT] {
+            assert_eq!((ease(c, 0), ease(c, T_ONE)), (0, T_ONE));
+        }
+        assert_eq!(ease(EASE_IN_OUT, T_ONE / 2), T_ONE / 2);
     }
 
     #[test]

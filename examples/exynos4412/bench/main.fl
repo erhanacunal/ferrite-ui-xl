@@ -124,7 +124,8 @@ fn report(unit: string) {
     var dt = now - since;
     if (dt >= 1000) {
         target(rate_lbl);
-        set(text, sprintf("%d %s/s", count * 1000 / dt, unit));
+        // count * 1000 overflows past ~2.1 M/s: scale by 100, then 10.
+        set(text, sprintf("%d %s/s", count * 100 / dt * 10, unit));
         strClear();
         count = 0;
         since = now;

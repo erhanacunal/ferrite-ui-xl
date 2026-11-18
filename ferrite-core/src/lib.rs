@@ -1,4 +1,7 @@
 #![cfg_attr(not(feature = "host"), no_std)]
+// `become` in the VM's threaded dispatch (vm/tc.rs).
+#![feature(explicit_tail_calls)]
+#![allow(incomplete_features)]
 
 extern crate alloc;
 

@@ -57,34 +57,72 @@ macro_rules! canvas {
     };
 }
 
+/// Threaded dispatch of `tick`'s bursts (vm/tc.rs).
+mod tc;
+
+/// `tick` runs through `tc` (false: the `exec_one` loop, the reference).
+const THREADED: bool = true;
+
 // === Code source — owned by VM ===
 
+/// Bytes after the code: the threaded dispatch (`tc`) reads an instruction's
+/// operands and the next opcode without a bounds check, so an instruction
+/// cut off by the end of the code (at most 9 bytes) stays in the buffer.
+/// They are `TC_PAD`, an undefined opcode, so running into them takes the
+/// checked path (`exec_one`: CODE_OOB).
+pub(crate) const CODE_PAD: usize = 16;
+const TC_PAD: u8 = 0xFF;
+
 /// The program's bytecode. Always in RAM: XL has no execution from flash
-/// (programs are megabytes at most; the heap holds them).
+/// (programs are megabytes at most; the heap holds them). `buf` holds the
+/// `len` code bytes, then `CODE_PAD` bytes of `TC_PAD`.
 #[derive(Default)]
-pub struct VmCode(Vec<u8>);
+pub struct VmCode {
+    buf: Vec<u8>,
+    len: usize,
+}
 
 impl VmCode {
+    /// Takes the bytecode buffer (no copy unless it has no room for the pad).
+    pub fn new(mut buf: Vec<u8>) -> Self {
+        let len = buf.len();
+        buf.resize(len + CODE_PAD, TC_PAD);
+        Self { buf, len }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.len
+    }
+
+    /// The code bytes (without the pad).
+    #[inline(always)]
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: len <= buf.len() (new).
+        unsafe { self.buf.get_unchecked(..self.len) }
+    }
+
+    /// Start of the buffer (code, then the pad).
+    #[inline(always)]
+    pub(crate) fn ptr(&self) -> *const u8 {
+        self.buf.as_ptr()
     }
 
     /// The byte at `pos`, 0 past the end.
     #[inline]
     pub fn byte_at(&self, pos: usize) -> u8 {
-        self.0.get(pos).copied().unwrap_or(0)
+        self.bytes().get(pos).copied().unwrap_or(0)
     }
 
     /// Run `f` on the `len` code bytes at `pos` (caller checks the range).
     fn with_bytes<R>(&self, pos: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(&self.0[pos..pos + len])
+        f(&self.bytes()[pos..pos + len])
     }
 
     /// Copy code bytes from `pos` into `buf`; the count copied.
     #[inline]
     pub fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
-        let Some(src) = self.0.get(pos..) else {
+        let Some(src) = self.bytes().get(pos..) else {
             return 0;
         };
         let n = buf.len().min(src.len());
@@ -773,6 +811,18 @@ pub struct Vm {
     /// Instructions executed (`perf` feature; read and reset by the
     /// runtime's perf report).
     pub instructions: u64,
+    // Threaded dispatch (vm/tc.rs), valid during a burst: the budget the
+    // handlers count down from and the instructions run before it, the count
+    // when it left, the eval stack's bounds as addresses (sp_floor and end),
+    // and the platform's `exec_one` with its `Ctx` for the instructions it
+    // has no handler for.
+    tc_limit: u32,
+    tc_base: u32,
+    tc_n: u32,
+    tc_lo: usize,
+    tc_hi: usize,
+    tc_ctx: usize,
+    tc_slow: tc::Slow,
 }
 
 const EMPTY_CB: CbRequest = CbRequest {
@@ -830,6 +880,13 @@ impl Vm {
             page_base: 0,
             page_len: 0,
             instructions: 0,
+            tc_limit: 0,
+            tc_base: 0,
+            tc_n: 0,
+            tc_lo: 0,
+            tc_hi: 0,
+            tc_ctx: 0,
+            tc_slow: tc::no_slow,
             tree_hint: None,
             open_files: [None, None],
             program: ProgramRef::new(b"main", 0),
@@ -941,7 +998,7 @@ impl Vm {
             image.drain(..opcode_start);
             let opcodes = image;
             self.wide_addr = wide;
-            self.code = VmCode(opcodes);
+            self.code = VmCode::new(opcodes);
             self.functions = funcs;
             self.global_count = gc;
             self.frame_base = gc;
@@ -956,7 +1013,7 @@ impl Vm {
 
     /// Load raw bytecode (no image header). Used for page bytecode.
     pub fn load_raw(&mut self, data: Vec<u8>) {
-        self.code = VmCode(data);
+        self.code = VmCode::new(data);
         self.tree_hint = None;
         self.wide_addr = false;
         self.functions.clear();
@@ -1071,31 +1128,32 @@ impl Vm {
             self.run_active_callback(ctx);
             return;
         }
-        let mut budget = budget.max(1);
-        // Same loop with the instruction body inlined, so the burst pays the
-        // large prologue of `step` once instead of per instruction.
-        {
-            let mut n: u64 = 0;
-            loop {
-                self.exec_one(ctx);
-                {
-                    n += 1;
-                }
-                if self.state != VmState::Running {
-                    break;
-                }
-                if self.critical {
-                    continue;
-                }
-                budget -= 1;
-                if budget == 0 {
-                    break;
-                }
+        let budget = budget.max(1);
+        let n = if THREADED { tc::run(self, ctx, budget) as u64 } else { self.burst_ref(ctx, budget) };
+        self.instructions = self.instructions.wrapping_add(n);
+    }
+
+    /// `tick`'s burst through `exec_one` (the reference for `tc::run`): until
+    /// the VM leaves `Running` or `budget` (>= 1) instructions outside a
+    /// critical section ran; the count run. The instruction body is inlined,
+    /// so the burst pays the large prologue of `step` once.
+    fn burst_ref<P: Platform>(&mut self, ctx: &mut Ctx<P>, mut budget: u32) -> u64 {
+        let mut n: u64 = 0;
+        loop {
+            self.exec_one(ctx);
+            n += 1;
+            if self.state != VmState::Running {
+                break;
             }
-            {
-                self.instructions = self.instructions.wrapping_add(n);
+            if self.critical {
+                continue;
+            }
+            budget -= 1;
+            if budget == 0 {
+                break;
             }
         }
+        n
     }
 
     /// Run a function to completion right now, on top of whatever is running:
@@ -1679,7 +1737,7 @@ impl Vm {
     /// Read inline; the out-of-range fault goes through `read_u8_slow`.
     #[inline(always)]
     fn read_u8(&mut self) -> u8 {
-        if let Some(&b) = self.code.0.get(self.pc as usize) {
+        if let Some(&b) = self.code.bytes().get(self.pc as usize) {
             self.pc += 1;
             return b;
         }
@@ -1709,7 +1767,7 @@ impl Vm {
     #[inline(always)]
     fn fetch<const N: usize>(&mut self) -> [u8; N] {
         let pc = self.pc as usize;
-        if let Some(s) = self.code.0.get(pc..pc + N) {
+        if let Some(s) = self.code.bytes().get(pc..pc + N) {
             let mut out = [0u8; N];
             out.copy_from_slice(s);
             self.pc += N as CodeAddr;
@@ -4510,7 +4568,7 @@ mod anim_tests {
         let mut ctx = mock_ctx();
         let mut vm = Vm::new();
         assert!(vm.configure(4, 0, 0, 0));
-        vm.code = VmCode(alloc::vec![OP_PUSH_1; 5]);
+        vm.code = VmCode::new(alloc::vec![OP_PUSH_1; 5]);
         vm.run(&mut ctx);
         assert_eq!(vm.fault(), fault::STACK_OVERFLOW);
         assert_eq!(vm.fault_pc(), 4, "5th push overflows a 4-deep stack");
@@ -4520,7 +4578,7 @@ mod anim_tests {
         assert!(vm.configure(48, 0, 0, 0));
         let mut code = alloc::vec![OP_PUSH_1; 40];
         code.push(OP_HALT);
-        vm.code = VmCode(code);
+        vm.code = VmCode::new(code);
         vm.run(&mut ctx);
         assert!(vm.state != VmState::Error);
         assert_eq!(vm.sp, 40);
@@ -4531,10 +4589,152 @@ mod anim_tests {
     /// VM with `code` loaded and 4 globals (callback locals start above them).
     fn cb_vm(code: &[u8]) -> Vm {
         let mut vm = Vm::new();
-        vm.code = VmCode(code.to_vec());
+        vm.code = VmCode::new(code.to_vec());
         vm.global_count = 4;
         vm.state = VmState::Running;
         vm
+    }
+
+    /// Threaded dispatch (`tc::run`) against the `exec_one` loop on random
+    /// programs: the hot opcodes with random operands, slow ones (calls,
+    /// returns, yields, halts), jumps in and out of the
+    /// code, cut-off instructions, each run with a few budgets. Same state,
+    /// stack, variables, pc and instruction count; on a fault the same fault
+    /// and fault pc (CODE_OOB not compared, see `tc`'s docs).
+    #[test]
+    fn threaded_dispatch_matches_exec_one() {
+        const OPS: &[(u8, usize)] = &[
+            (OP_POP, 0), (OP_DUP, 0), (OP_SWAP, 0), (OP_ADD, 0), (OP_SUB, 0), (OP_MUL, 0),
+            (OP_DIV, 0), (OP_MOD, 0), (OP_NEG, 0), (OP_AND, 0), (OP_OR, 0), (OP_NOT, 0),
+            (OP_EQ, 0), (OP_NE, 0), (OP_LT, 0), (OP_LE, 0), (OP_GT, 0), (OP_GE, 0),
+            (OP_SHL, 0), (OP_SHR, 0), (OP_PUSH_0, 0), (OP_PUSH_1, 0), (OP_PUSH_2, 0),
+            (OP_PUSH_M1, 0), (OP_LOAD_0, 0), (OP_LOAD_3, 0), (OP_STORE_1, 0), (OP_STORE_4, 0),
+            (OP_PUSH_I8, 1), (OP_PUSH_I16, 2), (OP_PUSH_I32, 4), (OP_LOAD, 1), (OP_STORE, 1),
+            (OP_FRAME, 1), (OP_FRAME_A, 2), (OP_JMP, 2), (OP_JZ, 2), (OP_JNZ, 2), (OP_CALL, 2),
+            (OP_JCMP, 3), (OP_JCMP_VI, 6), (OP_JCMP_VV, 5), (OP_BIN_I, 3), (OP_BIN_I32, 5),
+            (OP_BIN_V, 2), (OP_ADD_VI, 3), (OP_STORE_OP, 2), (OP_RET, 0), (OP_YIELD, 0),
+            (OP_HALT, 0), (0xEE, 0),
+        ];
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for prog in 0..1500 {
+            let len = 4 + rnd() as usize % 60;
+            let mut code = alloc::vec::Vec::new();
+            // Instruction starts, and where each jump target goes.
+            let mut starts = alloc::vec::Vec::new();
+            let mut targets = alloc::vec::Vec::new();
+            while code.len() < len {
+                let (op, nargs) = OPS[rnd() as usize % OPS.len()];
+                starts.push(code.len());
+                code.push(op);
+                let jumpy = matches!(op, OP_JMP | OP_JZ | OP_JNZ | OP_CALL | OP_JCMP | OP_JCMP_VI | OP_JCMP_VV);
+                for k in 0..nargs {
+                    let b = match (op, k) {
+                        // Mostly valid conditions / operators, a few bad ones.
+                        (OP_JCMP | OP_JCMP_VI | OP_JCMP_VV, 0) if rnd() % 8 != 0 => OP_EQ + (rnd() % 6) as u8,
+                        (OP_BIN_I | OP_BIN_I32 | OP_BIN_V | OP_STORE_OP, 0) if rnd() % 8 != 0 => OP_ADD + (rnd() % 7) as u8,
+                        (OP_FRAME_A, 1) => (rnd() % 4) as u8,
+                        _ => rnd() as u8,
+                    };
+                    code.push(b);
+                }
+                if jumpy {
+                    targets.push(code.len() - 2);
+                }
+            }
+            // Jump to an instruction, now and then past the code.
+            for &at in &targets {
+                let t = if rnd() % 16 == 0 { len + rnd() as usize % 300 } else { starts[rnd() as usize % starts.len()] };
+                code[at..at + 2].copy_from_slice(&(t as u16).to_le_bytes());
+            }
+            if rnd() % 4 == 0 {
+                code.truncate(code.len() - 1); // an instruction cut off
+            }
+            for budget in [1u32, 3, 17, 200] {
+                let (mut ca, mut cb) = (mock_ctx(), mock_ctx());
+                let mut a = Vm::new();
+                a.load_raw(code.clone());
+                let mut b = Vm::new();
+                b.load_raw(code.clone());
+                // Some values on the stack and in the variables, so that
+                // most programs run a while before they underflow.
+                let fill: alloc::vec::Vec<i32> = (0..24).map(|_| rnd() as i32 % 50).collect();
+                for v in [&mut a, &mut b] {
+                    v.global_count = 8;
+                    v.frame_base = 8;
+                    v.state = VmState::Running;
+                    v.stack[..12].copy_from_slice(&fill[..12]);
+                    v.sp = 12;
+                    for (i, &x) in fill[12..].iter().enumerate() {
+                        v.vars[i * 11] = x;
+                    }
+                }
+                for _ in 0..4 {
+                    if a.state != VmState::Running {
+                        break;
+                    }
+                    let na = a.burst_ref(&mut ca, budget);
+                    let nb = tc::run(&mut b, &mut cb, budget) as u64;
+                    let what = alloc::format!("program {prog} budget {budget}: {code:02x?}");
+                    if a.state == VmState::Error && a.fault == fault::CODE_OOB {
+                        // Perhaps an instruction cut off by the end of the code:
+                        // `tc` runs it with operands from the pad, then faults
+                        // (past the end, on the stack, or a burst later).
+                        break;
+                    }
+                    assert!(a.state == b.state, "state, {what}");
+                    if a.state == VmState::Error {
+                        assert_eq!((a.fault, a.fault_pc), (b.fault, b.fault_pc), "fault, {what}");
+                        break;
+                    }
+                    assert_eq!(na, nb, "instructions, {what}");
+                    assert_eq!((a.pc, a.sp, a.call_sp), (b.pc, b.sp, b.call_sp), "pc sp call_sp, {what}");
+                    assert_eq!((a.frame_base, a.frame_size, a.critical), (b.frame_base, b.frame_size, b.critical), "frame, {what}");
+                    assert_eq!(&a.stack[..a.sp as usize], &b.stack[..b.sp as usize], "stack, {what}");
+                    assert_eq!(&a.vars[..], &b.vars[..], "vars, {what}");
+                    if a.state == VmState::Yielded {
+                        a.state = VmState::Running;
+                        b.state = VmState::Running;
+                    }
+                }
+            }
+        }
+        // A critical section runs past the budget up to its YIELD.
+        // g0 = 0; CRITICAL; loop: g0 += 1; if g0 < 40 goto loop; YIELD; g0 = 99
+        let code = [
+            OP_PUSH_0, OP_STORE, 0, OP_CRITICAL, // 0..4
+            OP_ADD_VI, 0, 1, 0, OP_JCMP_VI, OP_LT, 0, 40, 0, 4, 0, // 4..15
+            OP_YIELD, OP_PUSH_I8, 99, OP_STORE, 0, OP_HALT, // 15..21
+        ];
+        for budget in [1u32, 2, 5] {
+            let (mut ca, mut cb) = (mock_ctx(), mock_ctx());
+            let (mut a, mut b) = (Vm::new(), Vm::new());
+            a.load_raw(code.to_vec());
+            b.load_raw(code.to_vec());
+            a.state = VmState::Running;
+            b.state = VmState::Running;
+            loop {
+                let na = a.burst_ref(&mut ca, budget);
+                let nb = tc::run(&mut b, &mut cb, budget) as u64;
+                assert_eq!((na, a.pc, a.var_get(0)), (nb, b.pc, b.var_get(0)), "budget {budget}");
+                assert!(a.state == b.state);
+                match a.state {
+                    VmState::Yielded => {
+                        assert_eq!(a.var_get(0), 40);
+                        a.state = VmState::Running;
+                        b.state = VmState::Running;
+                    }
+                    VmState::Running => {}
+                    _ => break,
+                }
+            }
+            assert_eq!(b.var_get(0), 99);
+        }
     }
 
     #[test]
@@ -5099,7 +5299,7 @@ mod anim_tests {
     fn run_code(code: &[u8]) -> Vm {
         let mut ctx = mock_ctx();
         let mut vm = Vm::new();
-        vm.code = VmCode(code.to_vec());
+        vm.code = VmCode::new(code.to_vec());
         vm.run(&mut ctx);
         vm
     }
@@ -5299,7 +5499,7 @@ mod anim_tests {
         for (name, code) in [("plain", &plain), ("fused", &fused)] {
             let mut ctx = mock_ctx();
             let mut vm = Vm::new();
-            vm.code = VmCode(code.clone());
+            vm.code = VmCode::new(code.clone());
             let runs = 200;
             let t0 = std::time::Instant::now();
             let mut acc = 0;
@@ -5467,7 +5667,7 @@ mod anim_tests {
         let (code, text) = long_literal(255);
         let mut ctx = mock_ctx();
         let mut vm = Vm::new();
-        vm.code = VmCode(code);
+        vm.code = VmCode::new(code);
         vm.run(&mut ctx);
         assert!(vm.state == VmState::Halted);
         let id = vm.stack[vm.sp as usize - 1] as ObjPtr;
@@ -5507,12 +5707,14 @@ mod anim_tests {
     #[test]
     fn load_ram_owned_keeps_the_buffer() {
         let mut vm = Vm::new();
-        let img = image(0, &[OP_PUSH_1, OP_HALT]);
+        let mut img = image(0, &[OP_PUSH_1, OP_HALT]);
+        // Room for the pad (a real image's function table leaves it).
+        img.reserve_exact(CODE_PAD);
         let ptr = img.as_ptr();
         assert!(vm.load_ram_owned(img).is_ok());
         // Header stripped in place: same allocation, opcodes only.
-        assert_eq!(vm.code.0.as_slice(), &[OP_PUSH_1, OP_HALT]);
-        assert_eq!(vm.code.0.as_ptr(), ptr);
+        assert_eq!(vm.code.bytes(), &[OP_PUSH_1, OP_HALT]);
+        assert_eq!(vm.code.ptr(), ptr);
         // A bad header hands the buffer back untouched (raw-bytecode fallback).
         let raw = alloc::vec![0xFFu8, 1, 2];
         assert_eq!(vm.load_ram_owned(raw.clone()), Err(raw));

@@ -1023,6 +1023,20 @@ fn status_json() -> String {
             _ => "free",
         }
     );
+    // The device settings as they are live (system/settings.txt; -1 = none set).
+    {
+        use ferrite_core::settings as fs;
+        let cur = fs::current(&fs::DeviceSettings::default());
+        let _ = write!(
+            s,
+            ",\"settings\":{{\"utc_offset\":{},\"brightness\":{},\"volume\":{},\"ntp_state\":{},\"ntp_age_s\":{}}}",
+            cur.utc_offset,
+            cur.brightness.map_or(-1, i32::from),
+            cur.volume.map_or(-1, i32::from),
+            crate::settings::NTP_STATE.load(core::sync::atomic::Ordering::Relaxed),
+            crate::settings::ntp_age()
+        );
+    }
     // The GPU player: its start message (with the self-test's failing corner), whether it
     // is switched on, and its settings.
     let _ = write!(

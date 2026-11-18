@@ -106,6 +106,12 @@ const TX_FRAMES: usize = 16;
 const SOCKETS: usize = 10;
 const BRIDGE_RX: usize = 16 * 1024;
 const BRIDGE_TX: usize = 8 * 1024;
+/// After the client closed its side: how long the session stays for the runtime to take what
+/// the client sent and for its replies to go (`ferrite_cli restart` sends two bytes and closes
+/// at once: a session ended then left them in `bridge::RX`, where the next session dropped
+/// them), and how long both rings must stay empty to count as done.
+const BRIDGE_CLOSE_WAIT: Duration = Duration::from_secs(2);
+const BRIDGE_CLOSE_QUIET: Duration = Duration::from_millis(100);
 /// A bridge client silent this long is dropped (a writefs never pauses
 /// that long; `ferrite_cli` reconnects per command).
 const BRIDGE_IDLE: Duration = Duration::from_secs(120);
@@ -835,6 +841,9 @@ async fn bridge_serve(socket: &mut TcpSocket<'_>, session: &bridge::Session) {
     let mut buf = [0u8; 2048];
     let mut pending = 0usize; // received, not yet in bridge::RX
     let mut last = Instant::now();
+    // The client closed its side: when, and since when both rings are empty.
+    let mut closed: Option<Instant> = None;
+    let mut quiet: Option<Instant> = None;
     loop {
         // Runtime → client.
         let mut out = [0u8; 1024];
@@ -850,9 +859,10 @@ async fn bridge_serve(socket: &mut TcpSocket<'_>, session: &bridge::Session) {
             buf.copy_within(taken..pending, 0);
             pending -= taken;
         }
-        if pending == 0 && socket.can_recv() {
+        if closed.is_none() && pending == 0 && socket.can_recv() {
             match socket.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
+                Ok(0) => closed = Some(Instant::now()),
+                Err(_) => return,
                 Ok(n) => {
                     pending = n;
                     last = Instant::now();
@@ -860,8 +870,22 @@ async fn bridge_serve(socket: &mut TcpSocket<'_>, session: &bridge::Session) {
                 }
             }
         }
-        if !socket.may_recv() && bridge::TX.is_empty() {
-            return;
+        if closed.is_none() && !socket.may_recv() {
+            closed = Some(Instant::now());
+        }
+        if let Some(at) = closed {
+            // Keep the bridge until the runtime has taken every byte and answered.
+            if pending == 0 && bridge::RX.is_empty() && bridge::TX.is_empty() {
+                let since = *quiet.get_or_insert_with(Instant::now);
+                if since.elapsed() >= BRIDGE_CLOSE_QUIET {
+                    return;
+                }
+            } else {
+                quiet = None;
+            }
+            if at.elapsed() >= BRIDGE_CLOSE_WAIT {
+                return;
+            }
         }
         if last.elapsed() > BRIDGE_IDLE {
             return;

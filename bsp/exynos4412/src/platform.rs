@@ -252,6 +252,13 @@ impl PlatformRuntime for Exynos4412Platform {
         0
     }
 
+    /// A `writefs` image swapped in without a restart (`Runtime::hot_swap`): the caches by
+    /// flash address (`compose` textures and glyph atlas, `renderer::picture_addr`) are keyed
+    /// by `flash::generation`, which the write bumped; the image goes to the eMMC now.
+    fn fs_replaced(_ctx: &mut Ctx<Self>) {
+        crate::flash::save_if_dirty(true);
+    }
+
     fn frame_end(ctx: &mut Ctx<Self>) {
         PASSES.fetch_add(1, Ordering::Relaxed);
         if DIAG {

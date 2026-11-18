@@ -63,6 +63,14 @@ pub static NTP_SYNCED_AT: AtomicU32 = AtomicU32::new(0);
 /// Set by a program (CPU0), taken by CPU3.
 pub static NTP_REQUEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Seconds since the last successful sync, -1 none.
+pub fn ntp_age() -> i32 {
+    match NTP_SYNCED_AT.load(Ordering::Acquire) {
+        0 => -1,
+        at => (crate::systick::millis().wrapping_sub(at) / 1000) as i32,
+    }
+}
+
 struct Ntp;
 
 impl NtpBackend for Ntp {
@@ -86,10 +94,7 @@ impl NtpBackend for Ntp {
     }
 
     fn ntp_age(&self) -> i32 {
-        match NTP_SYNCED_AT.load(Ordering::Acquire) {
-            0 => -1,
-            at => (crate::systick::millis().wrapping_sub(at) / 1000) as i32,
-        }
+        ntp_age()
     }
 
     fn ntp_server(&self) -> String {

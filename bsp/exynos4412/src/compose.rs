@@ -410,8 +410,9 @@ impl MeshCache {
 
 /// Images that are not raw opaque RGB565 (compressed, indexed, with alpha, JPEG) decoded
 /// once into premultiplied ARGB8888 textures (the image drawn into a sprite target), kept by
-/// the image's pixel data address: every widget showing it samples the same texture, whatever
-/// its box. Least recently used ones go past [`IMAGE_BYTES`], never one this render uses.
+/// the image's pixel data address and the flash write generation (a new filesystem may put
+/// another image there): every widget showing it samples the same texture, whatever its box.
+/// Least recently used ones go past [`IMAGE_BYTES`], never one this render uses.
 struct Images {
     entries: Vec<ImgTex>,
     bytes: usize,
@@ -421,6 +422,8 @@ struct Images {
 
 struct ImgTex {
     data: u32,
+    /// `flash::generation` when decoded.
+    generation: u32,
     w: usize,
     h: usize,
     /// Pixels per row (`w` rounded up to 16), the pixels from `start` words into `px`.
@@ -438,7 +441,11 @@ impl Images {
     /// than the panel.
     fn tex(&mut self, ctx: &Ctx<P>, img: &ferrite_core::image::Image) -> Option<Tex> {
         let (w, h) = (img.width as usize, img.height as usize);
-        let found = self.entries.iter().position(|e| e.data == img.data_addr() && (e.w, e.h) == (w, h));
+        let generation = crate::flash::generation();
+        let found = self
+            .entries
+            .iter()
+            .position(|e| e.data == img.data_addr() && (e.w, e.h) == (w, h) && e.generation == generation);
         let at = match found {
             Some(at) => at,
             None => {
@@ -448,6 +455,9 @@ impl Images {
                 let stride = w.next_multiple_of(16);
                 let words = stride * h + 16;
                 let render = self.render;
+                // Decoded from an older flash generation: stale.
+                self.entries.retain(|e| e.generation == generation || e.used == render);
+                self.bytes = self.entries.iter().map(|e| e.px.len() * 4).sum();
                 while self.bytes + words * 4 > IMAGE_BYTES || self.entries.len() >= IMAGE_ENTRIES {
                     let lru = (0..self.entries.len())
                         .filter(|&i| self.entries[i].used != render)
@@ -469,7 +479,7 @@ impl Images {
                 lcd::end_sprite(base, stride * h);
                 sprite_time(KIND_IMAGE, now_us() - t);
                 self.bytes += px.len() * 4;
-                self.entries.push(ImgTex { data: img.data_addr(), w, h, stride, px, start, used: render });
+                self.entries.push(ImgTex { data: img.data_addr(), generation, w, h, stride, px, start, used: render });
                 self.entries.len() - 1
             }
         };
@@ -580,6 +590,9 @@ struct Atlas {
     addr: usize,
     /// (font, codepoint) key → the glyph's top left in the atlas.
     slots: alloc::collections::BTreeMap<u64, (u16, u16)>,
+    /// `flash::generation` the slots were filled at: a flash write (a new filesystem may put
+    /// other glyphs at the same address) empties the atlas.
+    generation: u32,
     /// Where the next glyph goes: the current row's top and next free column, its height.
     x: u16,
     y: u16,
@@ -589,7 +602,7 @@ struct Atlas {
 
 impl Atlas {
     const fn new() -> Self {
-        Self { addr: 0, slots: alloc::collections::BTreeMap::new(), x: 0, y: 0, row_h: 0, full: false }
+        Self { addr: 0, slots: alloc::collections::BTreeMap::new(), generation: 0, x: 0, y: 0, row_h: 0, full: false }
     }
 
     fn tex(&self) -> Tex {
@@ -610,9 +623,11 @@ impl Atlas {
         if self.addr == 1 {
             return false;
         }
-        if self.full {
+        let generation = crate::flash::generation();
+        if self.full || generation != self.generation {
             self.slots.clear();
             (self.x, self.y, self.row_h, self.full) = (0, 0, 0, false);
+            self.generation = generation;
         }
         true
     }

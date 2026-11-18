@@ -966,11 +966,22 @@ pub fn utf8_next(bytes: &[u8], pos: &mut usize) -> Option<u16> {
 /// Application-wide font list. Heap-allocated, grows on demand.
 pub struct FontList {
     fonts: Vec<Font>,
+    /// Bumped when the filesystem was replaced ([`reset_to_embedded`](Self::reset_to_embedded)):
+    /// a copy with another epoch starts over in [`sync_from`](Self::sync_from), since the same
+    /// font ids now name other fonts.
+    epoch: u32,
 }
 
 impl FontList {
     pub fn new() -> Self {
-        Self { fonts: Vec::new() }
+        Self { fonts: Vec::new(), epoch: 0 }
+    }
+
+    /// Drops every font but the embedded one (font 0): a new filesystem (hot swap after a
+    /// `writefs`) holds other fonts under the same ids.
+    pub fn reset_to_embedded(&mut self) {
+        self.fonts.truncate(1);
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Add a font to the list.
@@ -1015,6 +1026,10 @@ impl FontList {
     /// cached bitmaps shared, not copied); starts over if it holds one
     /// `other` doesn't.
     pub fn sync_from(&mut self, other: &FontList) {
+        if self.epoch != other.epoch {
+            self.fonts.truncate(1);
+            self.epoch = other.epoch;
+        }
         if self.fonts.len() == other.fonts.len()
             && self.fonts.iter().zip(&other.fonts).all(|(a, b)| a.font_id == b.font_id)
         {

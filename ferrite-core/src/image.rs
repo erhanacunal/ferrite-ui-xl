@@ -711,6 +711,9 @@ const MAX_IMAGES: usize = 64;
 pub struct ImageList {
     images: [Image; MAX_IMAGES],
     count: u8,
+    /// Bumped when the filesystem was replaced ([`clear_for_new_fs`](Self::clear_for_new_fs)):
+    /// a copy with another epoch starts over in [`sync_from`](Self::sync_from).
+    epoch: u32,
 }
 
 impl ImageList {
@@ -718,6 +721,7 @@ impl ImageList {
         Self {
             images: [const { Image::empty() }; MAX_IMAGES],
             count: 0,
+            epoch: 0,
         }
     }
 
@@ -729,10 +733,21 @@ impl ImageList {
         self.count = 0;
     }
 
+    /// Drops every image: a new filesystem (hot swap after a `writefs`) holds other images
+    /// under the same ids.
+    pub fn clear_for_new_fs(&mut self) {
+        self.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
     /// Make this list hold the images `other` holds (the render context's
     /// copy of the VM's list): copies the ones missing (their decoded pixels
     /// shared, not copied); starts over if it holds one `other` doesn't.
     pub fn sync_from(&mut self, other: &ImageList) {
+        if self.epoch != other.epoch {
+            self.clear();
+            self.epoch = other.epoch;
+        }
         let mine = &self.images[..self.count as usize];
         let theirs = &other.images[..other.count as usize];
         if mine.len() == theirs.len() && mine.iter().zip(theirs).all(|(a, b)| a.image_id == b.image_id) {

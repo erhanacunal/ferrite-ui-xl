@@ -135,6 +135,12 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         0
     }
 
+    /// A `writefs` replaced the filesystem and the runtime swaps it in without a restart:
+    /// drop what the board keeps of the old image's resources by address, save the new one.
+    fn fs_replaced(ctx: &mut Ctx<Self>) {
+        let _ = ctx;
+    }
+
     /// Initial draw after a clean program load (epaper does a full render + EPD
     /// flush; raster panels rely on the first dirty frame instead).
     fn initial_render(ctx: &mut Ctx<Self>, vm: &Vm) {
@@ -389,6 +395,10 @@ pub struct Runtime<P: PlatformRuntime> {
     fault_dialog: WidgetId,
     /// Main-loop profile (`perf` feature).
     perf: crate::perf::Perf,
+    /// The running image's syscfg, read when a `writefs` began (`FsReady`): a new image with
+    /// the same one is swapped in without a restart ([`Runtime::hot_swap`]). `None` = not
+    /// known (no filesystem, a bad syscfg): the board restarts into the new image.
+    fs_old_cfg: Option<Option<SysCfg>>,
 }
 
 impl<P: PlatformRuntime> Runtime<P> {
@@ -459,6 +469,7 @@ impl<P: PlatformRuntime> Runtime<P> {
             last_rx_ms,
             fault_dialog: WidgetId::NONE,
             perf: crate::perf::Perf::new(),
+            fs_old_cfg: None,
         }
     }
 
@@ -753,6 +764,11 @@ impl<P: PlatformRuntime> Runtime<P> {
                 protocol::send_error(&self.ctx.usart, ERR_INSUFFICIENT_MEMORY);
             }
             RxEvent::FsReady => {
+                // Before any sector changes: the running image's pool sizes.
+                self.fs_old_cfg = match self.ctx.fs.as_ref().map(|f| SysCfg::load(f, &self.ctx.flash)) {
+                    Some(Ok(cfg)) => Some(cfg),
+                    _ => None,
+                };
                 self.drop_children();
                 self.tasks.main.reset();
                 self.ctx.storage.close_all();
@@ -792,6 +808,17 @@ impl<P: PlatformRuntime> Runtime<P> {
                 }
                 self.ack_chunk();
                 self.ctx.usart.flush();
+                // Same pool sizes: the new image runs at once (no restart). Others need the
+                // pools sized as at boot: restart into it.
+                let new_cfg = fs::Fs::mount(&self.ctx.flash, P::FS_BASE)
+                    .ok()
+                    .and_then(|f| SysCfg::load(&f, &self.ctx.flash).ok());
+                if let Some(old) = self.fs_old_cfg.take()
+                    && new_cfg == Some(old)
+                {
+                    self.hot_swap();
+                    return;
+                }
                 self.ctx.eeprom.flush();
                 self.ctx.storage.close_all();
                 self.ctx.storage.flush(true);
@@ -1093,6 +1120,42 @@ fn run_paint<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, paint: &re
 // ============================================================================
 
 impl<P: PlatformRuntime> Runtime<P> {
+    /// A `writefs` wrote a verified image with the running one's syscfg: mount it and start
+    /// its `main` as at boot, without a restart. What the old image's resources left behind
+    /// goes: the fonts (but the embedded one) and images, here and in the render context
+    /// (`FontList` / `ImageList` epochs); the BSP's caches by address go with
+    /// `P::fs_replaced` (exynos: keyed by the flash write generation).
+    fn hot_swap(&mut self) {
+        render::wait_idle(&mut self.ctx);
+        self.drop_children();
+        self.ctx.fs = fs::Fs::mount(&self.ctx.flash, P::FS_BASE).ok();
+        self.ctx.fonts.reset_to_embedded();
+        self.ctx.images.clear_for_new_fs();
+        P::fs_replaced(&mut self.ctx);
+        let ctx = &mut *self.ctx;
+        let vm = &mut *self.tasks.main;
+        ctx.objs.clear();
+        vm.reset();
+        ctx.storage.close_all();
+        ctx.audio.stop();
+        self.input.reset(ctx);
+        ctx.cursor_visible = false;
+        alloc_root(ctx);
+        let mut err = if ctx.fs.is_some() { 0 } else { ERR_NO_FILESYSTEM };
+        if err == 0 {
+            err = load_program(ctx, vm, ProgramRef::new(b"main", 0));
+        }
+        if err == 0 && vm.has_code() {
+            err = start_program(ctx, vm);
+        }
+        self.error_code = err;
+        if err != 0 && err != ERR_EMPTY_RUN {
+            show_error(ctx, err, None);
+        } else if err == 0 && vm.state != VmState::Exit {
+            P::initial_render(ctx, vm);
+        }
+    }
+
     /// End every child task (main program switch, reload, filesystem write).
     fn drop_children(&mut self) {
         {

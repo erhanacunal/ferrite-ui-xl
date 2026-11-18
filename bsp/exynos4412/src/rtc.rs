@@ -6,8 +6,13 @@
 //! read, a third of the main loop, and a dropped frame each time. So the
 //! chip is read once, then the time runs on the MCT ([`systick::millis`])
 //! and the chip is read again every [`RESYNC_MS`] and after `set_time`.
+//!
+//! The chip keeps UTC (`ferrite_core::rtc::RtcImpl` adds the UTC offset). A
+//! time from NTP (CPU3, [`set_from_ntp`]) is taken on CPU0's next read: the
+//! chip is set from it once, and every reader runs on it from then.
 
 use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use exynos_4412_rs::drivers::i2c::{Bus, I2c};
 use exynos_4412_rs::drivers::max77686::Rtc;
@@ -21,15 +26,33 @@ use crate::systick;
 /// 16 ms stall per period; the two clocks drift apart by far less).
 const RESYNC_MS: u32 = 10 * 60 * 1000;
 
+/// The last NTP time: Unix seconds, `systick::millis` at that second, and a
+/// generation (0 = none) that readers compare with theirs.
+static NTP_SECS: AtomicU32 = AtomicU32::new(0);
+static NTP_AT: AtomicU32 = AtomicU32::new(0);
+static NTP_GEN: AtomicU32 = AtomicU32::new(0);
+/// The chip is still to be set from the last NTP time.
+static NTP_CHIP: AtomicBool = AtomicBool::new(false);
+
+/// CPU3: UTC from an NTP server, `secs` Unix seconds at `systick::millis() == at_ms`.
+pub fn set_from_ntp(secs: u32, at_ms: u32) {
+    NTP_SECS.store(secs, Ordering::Relaxed);
+    NTP_AT.store(at_ms, Ordering::Relaxed);
+    NTP_CHIP.store(true, Ordering::Relaxed);
+    NTP_GEN.fetch_add(1, Ordering::Release);
+}
+
 pub struct PmicRtc {
     rtc: Rtc,
     /// Unix seconds the chip last gave, and `systick::millis` then.
     base: Cell<Option<(i64, u32)>>,
+    /// The NTP generation taken.
+    ntp_gen: Cell<u32>,
 }
 
 pub fn new() -> PmicRtc {
     // I2C0 was initialised by main (PMIC bus).
-    PmicRtc { rtc: Rtc::new(I2c::new(Bus::I2c0)), base: Cell::new(None) }
+    PmicRtc { rtc: Rtc::new(I2c::new(Bus::I2c0)), base: Cell::new(None), ntp_gen: Cell::new(0) }
 }
 
 impl PmicRtc {
@@ -42,6 +65,16 @@ impl PmicRtc {
     /// or a new reading when there is none or it is [`RESYNC_MS`] old.
     fn now(&self) -> Option<time::DateTime> {
         let ms = systick::millis();
+        let generation = NTP_GEN.load(Ordering::Acquire);
+        if generation != self.ntp_gen.get() {
+            self.ntp_gen.set(generation);
+            let (secs, at) = (i64::from(NTP_SECS.load(Ordering::Relaxed)), NTP_AT.load(Ordering::Relaxed));
+            if NTP_CHIP.swap(false, Ordering::Relaxed) {
+                let now = secs + i64::from(ms.wrapping_sub(at) / 1000);
+                let _ = self.rtc.set(time::DateTime::from_unix(now), Mct::new());
+            }
+            self.base.set(Some((secs, at)));
+        }
         if let Some((secs, at)) = self.base.get() {
             let age = ms.wrapping_sub(at);
             if age < RESYNC_MS {

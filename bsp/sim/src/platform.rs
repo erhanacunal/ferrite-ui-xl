@@ -176,7 +176,7 @@ pub const TAP_HOLD_MS: u32 = 150;
 
 /// Main-loop passes (`sysinfo::SYS_PASSES`).
 static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
@@ -212,6 +212,9 @@ impl PlatformRuntime for SimPlatform {
             // so a model widget shows its background; setters succeed, stats are 0.
             0x60..=0x63 | 0x65 => Some(1),
             0x64 => Some(0),
+            // UTC offset, NTP, the saved volume (lib/device.fl): kept for the run only; the host
+            // clock is the NTP time (a sync succeeds at once).
+            0x50..=0x56 => ferrite_core::settings::syscall(id, args, objs, systick::millis(), &mut SimNtp),
             // The setup screen's WiFi / settings syscalls (lib/system.fl): a fake chip.
             0x70..=0x7A => crate::setup::syscall(id, args, objs),
             // No heap figures on the host; frames = passes.
@@ -413,5 +416,26 @@ fn print_dl_stats() {
             dl::BYTES.load(Relaxed),
             dl::PAINTS.load(Relaxed)
         );
+    }
+}
+
+/// The host's clock stands for NTP: a sync succeeds at once.
+struct SimNtp;
+
+static SIM_NTP_AT: AtomicU32 = AtomicU32::new(0);
+
+impl ferrite_core::settings::NtpBackend for SimNtp {
+    fn ntp_request(&mut self) -> bool {
+        SIM_NTP_AT.store(systick::millis().max(1), Ordering::Relaxed);
+        true
+    }
+    fn ntp_state(&self) -> i32 {
+        ferrite_core::settings::NTP_SYNCED
+    }
+    fn ntp_age(&self) -> i32 {
+        (systick::millis().wrapping_sub(SIM_NTP_AT.load(Ordering::Relaxed)) / 1000) as i32
+    }
+    fn ntp_server(&self) -> String {
+        String::from("host clock")
     }
 }

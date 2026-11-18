@@ -14,7 +14,8 @@
 //! 3. CPU3, Embassy: the WiFi runner (host wake interrupt routed to CPU3),
 //!    embassy-net with DHCP (hostname from the config, default
 //!    [`DEFAULT_HOSTNAME`], as uart_boot, so `ferrite_cli --host` finds
-//!    both), [`http`] on port 80 and the protocol bridge on [`BRIDGE_PORT`].
+//!    both), [`http`] on port 80, the protocol bridge on [`BRIDGE_PORT`] and
+//!    the NTP client ([`ntp`]).
 //!
 //! The UI core never waits for the network: CPU0 only touches the bridge
 //! rings (`bridge.rs`) and, once per pass, [`service`] (an uploaded FS image
@@ -41,6 +42,7 @@
 //! as at boot. While CPU3 is still joining, standby leaves it running.
 
 mod http;
+mod ntp;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -100,8 +102,8 @@ const COUNTS_PER_MS: u64 = soc::MCT_CLOCK_HZ as u64 / 1000;
 
 const RX_FRAMES: usize = 16;
 const TX_FRAMES: usize = 16;
-/// DHCP + HTTP servers + the bridge, with room to spare.
-const SOCKETS: usize = 8;
+/// DHCP + DNS + HTTP servers + the bridge + NTP, with room to spare.
+const SOCKETS: usize = 10;
 const BRIDGE_RX: usize = 16 * 1024;
 const BRIDGE_TX: usize = 8 * 1024;
 /// A bridge client silent this long is dropped (a writefs never pauses
@@ -674,11 +676,12 @@ fn serve(cfg: &WifiConfig, joined: Joined) {
 
     embassy::run_until(
         |spawner| {
-            GROUP.begin(4 + http::SERVERS as u32);
+            GROUP.begin(5 + http::SERVERS as u32);
             spawner.spawn(wifi_task(runner).unwrap());
             spawner.spawn(net_task(net_runner).unwrap());
             spawner.spawn(dhcp_task(stack).unwrap());
             spawner.spawn(bridge_task(stack).unwrap());
+            spawner.spawn(ntp_task(stack).unwrap());
             for _ in 0..http::SERVERS {
                 spawner.spawn(http_task(stack).unwrap());
             }
@@ -787,6 +790,12 @@ async fn dhcp_loop(stack: Stack<'static>) {
         stack.wait_config_down().await;
         set_state(State::Joined);
     }
+}
+
+/// Sets the clock from NTP (`ntp.rs`).
+#[embassy_executor::task]
+async fn ntp_task(stack: Stack<'static>) {
+    GROUP.run(ntp::client(stack)).await
 }
 
 // --- TCP protocol bridge ----------------------------------------------------------------------

@@ -88,6 +88,7 @@ mod platform;
 mod rcore;
 mod renderer;
 mod rtc;
+mod settings;
 mod setup;
 mod storage;
 mod systick;
@@ -155,6 +156,8 @@ fn main(_args: BootArgs) -> ! {
     };
     // Resources: the CACHE partition's FAT32 (FERRITE/FLASH.BIN) → RAM region.
     storage::init();
+    // UTC offset, NTP server, the backlight and volume last set (system/settings.txt).
+    settings::load();
     flash::init();
     // Volume up held, or nothing saved: the setup screen's program instead.
     setup::install(mct);
@@ -174,6 +177,10 @@ fn main(_args: BootArgs) -> ! {
     let mut audio = audio::new(pmic);
     if !audio.power_on() {
         println!("ferrite: audio off");
+    }
+    // The volume a program last set (until the program sets its own).
+    if let Ok(v) = u8::try_from(ferrite_core::settings::volume()) {
+        ferrite_core::audio::AudioBackend::set_volume(&mut audio, v);
     }
     cpu::enable_irq();
     let rx_on_cpu0 = !usart::start_core(rx);

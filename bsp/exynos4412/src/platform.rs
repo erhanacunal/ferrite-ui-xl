@@ -189,6 +189,10 @@ impl PlatformRuntime for Exynos4412Platform {
             // setters succeed, stats are 0.
             0x60..=0x63 | 0x65 => Some(1),
             0x64 => Some(0),
+            // UTC offset, NTP, the saved volume (lib/device.fl).
+            ferrite_core::settings::SYS_UTC_OFFSET..=ferrite_core::settings::SYS_VOLUME => {
+                crate::settings::syscall(id, args, objs)
+            }
             ferrite_core::setup::SYS_WIFI_STATE..=ferrite_core::setup::SYS_WIFI_SCANS => {
                 crate::setup::syscall(id, args, objs)
             }
@@ -240,7 +244,8 @@ impl PlatformRuntime for Exynos4412Platform {
         // `DEFAULT_BRIGHTNESS`: full drains the battery and heats the panel; programs set
         // their own with `setBrightness`.
         lcd::flush_wait();
-        ctx.backlight.set_brightness(BOOT_BRIGHTNESS);
+        // The level a program last set (`system/settings.txt`), if any.
+        ctx.backlight.set_brightness(ferrite_core::settings::boot_brightness().unwrap_or(BOOT_BRIGHTNESS));
         // Nothing saved, or volume up held: the region holds the setup
         // screen's program instead (`setup::install`, before the runtime),
         // which replaced the recovery screen.

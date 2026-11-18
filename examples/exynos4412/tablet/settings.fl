@@ -1,6 +1,8 @@
 // settings.fl — display and sound settings, two switches that the home
 // screen reads back (performance overlay, alternate wallpaper: carried in
-// the program argument), and an About card with live system figures.
+// the program argument), the time zone and network time, and an About card
+// with live system figures. Brightness, volume and the time zone are kept by
+// the firmware (system/settings.txt, lib/device.fl).
 #include "ui.fl"
 
 var bright_sl; var bright_lbl;
@@ -9,6 +11,7 @@ var sw_perf; var knob_perf;
 var sw_wall; var knob_wall;
 var chime_btn; var restart_btn; var restart_txt;
 var about_cpu; var about_mem; var about_obj; var about_up;
+var tz_lbl; var tz_minus; var tz_plus; var ntp_btn; var ntp_lbl; var now_lbl;
 var restart_armed = 0;
 
 fn section(x, y, w, h, title) {
@@ -98,15 +101,15 @@ fn show_about() {
     var mhz = sysCpuMhz();
     target(about_cpu);
     if (mhz > 0) {
-        set(text, sprintf("Samsung Exynos 4412  ·  4x Cortex-A9, CPU0 at %d MHz", mhz));
+        set(text, sprintf("Exynos 4412  ·  4x Cortex-A9  ·  %d MHz", mhz));
     } else {
-        set(text, "Samsung Exynos 4412  ·  4x Cortex-A9");
+        set(text, "Exynos 4412  ·  4x Cortex-A9");
     }
     dirty();
     var ht = sysHeapTotalKb();
     target(about_mem);
     if (ht > 0) {
-        set(text, sprintf("Heap %d / %d MB  ·  object arena %d / %d KB",
+        set(text, sprintf("Heap %d / %d MB  ·  objects %d / %d KB",
             sysHeapUsedKb() / 1024, ht / 1024, sysObjUsedKb(), sysObjTotalKb()));
     } else {
         set(text, sprintf("Object arena %d / %d KB", sysObjUsedKb(), sysObjTotalKb()));
@@ -117,9 +120,77 @@ fn show_about() {
     dirty();
     var s = millis() / 1000;
     target(about_up);
-    set(text, sprintf("Up %d:%02d:%02d  ·  display 1280 x 800, G2D present", s / 3600, (s / 60) % 60, s % 60));
+    set(text, sprintf("Up %d:%02d:%02d  ·  1280 x 800, G2D present", s / 3600, (s / 60) % 60, s % 60));
     dirty();
     strClear();
+}
+
+// --- Date & time ---
+
+fn age_text(secs) -> string {
+    if (secs < 60) {
+        return sprintf("%d s", secs);
+    }
+    if (secs < 3600) {
+        return sprintf("%d min", secs / 60);
+    }
+    return sprintf("%d h", secs / 3600);
+}
+
+fn ntp_text() -> string {
+    var st = ntpState();
+    if (st == NTP_OFF) {
+        return str("Network time is off");
+    }
+    if (st == NTP_WAITING) {
+        return str("Network time: waiting for WiFi");
+    }
+    if (st == NTP_RUNNING) {
+        return sprintf("Asking %s ...", ntpServer());
+    }
+    var age = ntpAge();
+    if (st == NTP_FAILED) {
+        if (age < 0) {
+            return sprintf("No answer from %s, retrying", ntpServer());
+        }
+        return sprintf("No answer, synced %s ago", age_text(age));
+    }
+    return sprintf("Synced %s ago from %s", age_text(age), ntpServer());
+}
+
+fn show_clock_card() {
+    target(tz_lbl); set(text, utcText(utcOffset())); dirty();
+    target(ntp_lbl); set(text, ntp_text()); dirty();
+    var now = rtcRead();
+    target(now_lbl);
+    set(text, sprintf("%d:%02d:%02d  ·  %s, %d %s 20%02d", now[2], now[1], now[0],
+        day_name(now[4]), now[3], month_name(now[5]), now[6]));
+    dirty();
+    arrFree(now);
+    strClear();
+}
+
+// Time zone steps of 30 minutes.
+fn change_tz(step) {
+    playSound("click");
+    setUtcOffset(utcOffset() + step);
+    // The status bar's clock shows the new hour at once.
+    ui_last_min = -1;
+    show_clock_card();
+}
+
+fn on_tz_minus(w) {
+    change_tz(-30);
+}
+
+fn on_tz_plus(w) {
+    change_tz(30);
+}
+
+fn on_ntp(w) {
+    playSound("click");
+    ntpSync();
+    show_clock_card();
 }
 
 fn setup() {
@@ -169,25 +240,52 @@ fn setup() {
     parent(restart_btn);
 
     // --- About ---
-    var ab: widget = section(24, 448, 1232, 300, "About this tablet");
+    var ab: widget = section(24, 448, 600, 300, "About this tablet");
     var fw = alloc();
-    style_label(28, 60, 1176, 44, F26, WHITE, ALIGN_LEFT, "ferrite-ui  ·  bare-metal Rust widget framework + bytecode VM");
+    style_label(28, 60, 544, 44, F26, WHITE, ALIGN_LEFT, "ferrite-ui  ·  Rust + bytecode VM");
     parent(ab);
     about_cpu = alloc();
-    style_label(28, 112, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    style_label(28, 112, 544, 36, F20, DIM, ALIGN_LEFT, "");
     parent(ab);
     about_mem = alloc();
-    style_label(28, 152, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    style_label(28, 152, 544, 36, F20, DIM, ALIGN_LEFT, "");
     parent(ab);
     about_obj = alloc();
-    style_label(28, 192, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    style_label(28, 192, 544, 36, F20, DIM, ALIGN_LEFT, "");
     parent(ab);
     about_up = alloc();
-    style_label(28, 232, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    style_label(28, 232, 544, 36, F20, DIM, ALIGN_LEFT, "");
     parent(ab);
+
+    // --- Date & time ---
+    var dt: widget = section(656, 448, 600, 300, "Date & time");
+    row_label(dt, 60, "Time zone");
+    tz_minus = alloc();
+    style_text_button(316, 60, 56, 48, SURFACE_HI, F26, "-");
+    set(on_click, @on_tz_minus);
+    parent(dt);
+    tz_lbl = alloc();
+    style_label(372, 60, 144, 48, F20, WHITE, ALIGN_CENTER, "");
+    parent(dt);
+    tz_plus = alloc();
+    style_text_button(516, 60, 56, 48, SURFACE_HI, F26, "+");
+    set(on_click, @on_tz_plus);
+    parent(dt);
+    row_label(dt, 124, "Network time");
+    ntp_btn = alloc();
+    style_text_button(372, 124, 200, 48, ACCENT, F20, "Sync now");
+    set(on_click, @on_ntp);
+    parent(dt);
+    ntp_lbl = alloc();
+    style_label(28, 188, 544, 36, F20, DIM, ALIGN_LEFT, "");
+    parent(dt);
+    now_lbl = alloc();
+    style_label(28, 232, 544, 36, F20, DIM, ALIGN_LEFT, "");
+    parent(dt);
 
     show_switches();
     show_about();
+    show_clock_card();
     return 0;
 }
 
@@ -198,6 +296,7 @@ fn loop() {
     if (millis() >= next_about) {
         next_about = millis() + 1000;
         show_about();
+        show_clock_card();
     }
     delay(50);
 }

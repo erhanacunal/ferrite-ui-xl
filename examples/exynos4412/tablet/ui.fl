@@ -15,6 +15,7 @@
 #include "touch.fl"
 #include "sysinfo.fl"
 #include "battery.fl"
+#include "device.fl"
 #include "shapes.fl"
 
 const SCREEN_W = 1280;
@@ -124,6 +125,9 @@ fn ui_read_arg() {
     var a = programArg();
     if ((a & 0xFF) != 0) {
         ui_volume = (a & 0xFF) - 1;
+    } else if (savedVolume() >= 0) {
+        // First program since start: the volume last set (system/settings.txt).
+        ui_volume = savedVolume();
     }
     ui_page = (a >> 8) & 0xF;
     ui_closing = (a >> 12) & 0xF;

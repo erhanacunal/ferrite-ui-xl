@@ -160,6 +160,7 @@ pub fn sync(force: bool) {
     }
     BoardStorage.flush(force);
     crate::eeprom::save_if_dirty(force);
+    crate::settings::save_if_due(force);
 }
 
 /// For `GET /api/storage`: where the files are, and how full it is.

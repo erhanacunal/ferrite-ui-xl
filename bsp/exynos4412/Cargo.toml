@@ -39,7 +39,7 @@ exynos_4412_ext4 = { path = "../../vendor/exynos_4412_rs/exynos_4412_ext4" }
 # Tasks (`#[task]`) and `yield_now`; the HAL provides the executor platform.
 embassy-executor = "0.10"
 embassy-futures = "0.1"
-embassy-net = { version = "0.9", features = ["medium-ethernet", "proto-ipv4", "dhcpv4", "dhcpv4-hostname", "tcp"], optional = true }
+embassy-net = { version = "0.9", features = ["medium-ethernet", "proto-ipv4", "dhcpv4", "dhcpv4-hostname", "tcp", "udp", "dns"], optional = true }
 embassy-time = "0.5"
 # The HAL's multi-core implementation (`rcore::job_done`: a waker shared with CPU2).
 critical-section = "1.2"

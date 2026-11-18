@@ -2460,6 +2460,8 @@ impl Vm {
             OP_SET_BRIGHTNESS => {
                 let percent = self.pop() as u8;
                 ctx.backlight.set_brightness(percent);
+                // Saved by the board, applied at the next start.
+                crate::settings::note_brightness(percent, ctx.systick.millis());
             }
             OP_BRIGHTNESS => {
                 self.push(ctx.backlight.brightness() as i32);
@@ -2569,6 +2571,7 @@ impl Vm {
             OP_SOUND_VOLUME => {
                 let vol = self.pop().clamp(0, 100) as u8;
                 ctx.audio.set_volume(vol);
+                crate::settings::note_volume(vol, ctx.systick.millis());
             }
             OP_SOUND_PLAYING => self.push(ctx.audio.playing() as i32),
 

@@ -64,9 +64,6 @@ pub trait WidgetRenderer<P: Platform> {
     /// Whether [`compose`](Self::compose) may take dirty renders over.
     const COMPOSES: bool = false;
 
-    /// Whether [`capture_begin`](Self::capture_begin) may take `on_paint` drawing.
-    const CAPTURES: bool = false;
-
     /// Repaint `areas` whole: disjoint screen rects whose corners are on the
     /// [`COMPOSE_GRID`](crate::render::COMPOSE_GRID) (or the screen's
     /// edge), at most [`COMPOSE_AREAS`](crate::render::COMPOSE_AREAS). Every
@@ -115,24 +112,6 @@ pub trait WidgetRenderer<P: Platform> {
     fn partial_redraw(_objs: &ObjPool, _id: WidgetId) -> bool {
         true
     }
-
-    /// Dirty mode, before the render: start capturing widget `id`'s `on_paint` drawing
-    /// (absolute box `abs`). Return `true` to have every primitive drawn until
-    /// [`capture_end`](Self::capture_end) kept off the screen, in a buffer of the widget's
-    /// own (`render::capture_paint` sets the scissor to `abs` meanwhile, so it holds only
-    /// what lands in the box); from then on [`draw`](Self::draw) and
-    /// [`compose`](Self::compose) draw it over the widget wherever the widget is drawn, and
-    /// the `on_paint` is not run on the screen after the render. `false` = run it on the
-    /// screen after the render, as built in, and drop any capture kept for `id` (it is
-    /// stale now).
-    #[inline(always)]
-    fn capture_begin(_ctx: &Ctx<P>, _id: WidgetId, _abs: &Rect) -> bool {
-        false
-    }
-
-    /// Ends the capture [`capture_begin`](Self::capture_begin) started.
-    #[inline(always)]
-    fn capture_end(_ctx: &Ctx<P>, _id: WidgetId) {}
 }
 
 /// The built-in drawing for every widget.
@@ -248,72 +227,8 @@ mod tests {
             CALLS.with(|c| c.borrow_mut().push((ctx.objs.get(id).kind, 0)));
             true
         }
-        // Captures widgets with the background 0xCAFE.
-        const CAPTURES: bool = true;
-        fn capture_begin(ctx: &Ctx<ComposePlatform>, id: WidgetId, abs: &Rect) -> bool {
-            let take = ctx.objs.get(id).background_color == 0xCAFE;
-            CAPTURES.with(|c| c.borrow_mut().push((id, take, *abs)));
-            take
-        }
-        fn capture_end(_: &Ctx<ComposePlatform>, id: WidgetId) {
-            CAPTURES.with(|c| c.borrow_mut().push((id, false, Rect::new(0, 0, 0, 0))));
-        }
     }
 
-    std::thread_local! {
-        /// `capture_begin` (id, taken, box) and `capture_end` (id, false, empty) calls.
-        static CAPTURES: RefCell<Vec<(WidgetId, bool, Rect)>> = const { RefCell::new(Vec::new()) };
-    }
-
-    #[test]
-    fn captured_on_paint_runs_scissored_to_the_box_before_the_render() {
-        use crate::render::{PaintList, capture_paint};
-        use crate::widget::FLAG_VISIBLE;
-        let mut ctx = compose_ctx();
-        let root = ctx.objs.alloc_widget().unwrap();
-        ctx.objs.root = root;
-        ctx.objs.get_mut(root).size = Size { w: 800, h: 480 };
-        let mk = |ctx: &mut Ctx<ComposePlatform>, x, y, bg| {
-            let id = ctx.objs.alloc_widget().unwrap();
-            ctx.objs.add_child(root, id);
-            let g = ctx.objs.get_mut(id);
-            g.location = Offset { x, y };
-            g.size = Size { w: 100, h: 50 };
-            g.background_color = bg;
-            id
-        };
-        let taken = mk(&mut ctx, 790, 20, 0xCAFE);
-        let declined = mk(&mut ctx, 10, 10, 0x1234);
-        let hidden = mk(&mut ctx, 10, 100, 0xCAFE);
-        ctx.objs.get_mut(hidden).flags &= !FLAG_VISIBLE;
-        let mut paint = PaintList::new();
-        for id in [taken, declined, hidden] {
-            paint.push(id);
-        }
-        let r = |r: Option<Rect>| r.map(|r| (r.x, r.y, r.w, r.h));
-        let mut ran = Vec::new();
-        let rest = capture_paint(&mut ctx, &paint, |ctx, one| {
-            ran.push((one.ids().iter().map(|i| i.0).collect::<Vec<_>>(), r(ctx.lcd.scissor())))
-        });
-        // The taken one painted alone, scissored to its box cut to the screen.
-        assert_eq!(ran, [(vec![taken.0], Some((790, 20, 10, 50)))]);
-        assert_eq!(r(ctx.lcd.scissor()), None, "scissor restored");
-        // The others paint on the screen after the render; a hidden one isn't offered.
-        assert!(rest.ids() == [declined, hidden]);
-        let calls: Vec<_> = CAPTURES
-            .with(|c| core::mem::take(&mut *c.borrow_mut()))
-            .into_iter()
-            .map(|(id, took, b)| (id.0, took, r(Some(b))))
-            .collect();
-        assert_eq!(
-            calls,
-            [
-                (taken.0, true, Some((790, 20, 100, 50))),
-                (taken.0, false, Some((0, 0, 0, 0))),
-                (declined.0, false, Some((10, 10, 100, 50))),
-            ]
-        );
-    }
     struct ComposePlatform;
     impl Platform for ComposePlatform {
         type LcdB = MockLcd;
@@ -476,25 +391,9 @@ mod tests {
         fn send_data(&self, _data: u16) {}
     }
 
-    /// Takes whole renders (logged, draws nothing) and captures widgets with
-    /// the background 0xCAFE.
+    /// The built-in drawing, on a screen that logs its fills.
     struct PaintRenderer;
-    impl WidgetRenderer<PaintPlatform> for PaintRenderer {
-        const COMPOSES: bool = true;
-        const CAPTURES: bool = true;
-        fn compose(_: &Ctx<PaintPlatform>, _: &[Rect]) -> bool {
-            event("render".into());
-            true
-        }
-        fn capture_begin(ctx: &Ctx<PaintPlatform>, id: WidgetId, _: &Rect) -> bool {
-            let take = ctx.objs.get(id).background_color == 0xCAFE;
-            event(std::format!("{} {}", if take { "capture" } else { "declined" }, id.0));
-            take
-        }
-        fn capture_end(_: &Ctx<PaintPlatform>, id: WidgetId) {
-            event(std::format!("captured {}", id.0));
-        }
-    }
+    impl WidgetRenderer<PaintPlatform> for PaintRenderer {}
 
     struct PaintPlatform;
     impl Platform for PaintPlatform {
@@ -550,57 +449,74 @@ mod tests {
         list
     }
 
-    /// Step 3d: the VM's drawing reaches the render side as lists, and the job
-    /// draws them where they would have gone: direct drawing first, a captured
-    /// `on_paint` into its capture (scissored to the box), then the render,
-    /// then the other `on_paint` lists on the screen.
+    /// Step 3d: the VM's drawing reaches the render side as lists. Direct
+    /// drawing is replayed before the render; an `on_paint` list is kept and
+    /// drawn with its widget (over its body, under what comes later, cut to
+    /// its box), also when a repaint doesn't run `on_paint` again.
     #[test]
-    fn the_render_job_replays_the_vms_drawing_around_the_render() {
+    fn the_render_job_draws_on_paint_lists_with_their_widgets() {
         use crate::view::Draw;
+        use crate::widget::FLAG_HAS_ON_PAINT;
         let mut ctx = paint_ctx(ObjPool::new());
         ctx.render_ctx = Some(alloc::boxed::Box::new(paint_ctx(ObjPool::view())));
         let root = ctx.objs.alloc_widget().unwrap();
         ctx.objs.root = root;
         ctx.objs.get_mut(root).size = Size { w: 800, h: 480 };
-        let mk = |ctx: &mut Ctx<PaintPlatform>, x, y, bg| {
+        let mk = |ctx: &mut Ctx<PaintPlatform>, x, y, w, h, bg| {
             let id = ctx.objs.alloc_widget().unwrap();
             ctx.objs.add_child(root, id);
             let g = ctx.objs.get_mut(id);
             g.location = Offset { x, y };
-            g.size = Size { w: 100, h: 50 };
+            g.size = Size { w, h };
             g.background_color = bg;
             id
         };
-        let taken = mk(&mut ctx, 790, 20, 0xCAFE);
-        let declined = mk(&mut ctx, 10, 10, 0x1234);
+        let panel = mk(&mut ctx, 10, 10, 100, 50, 0x1234);
+        ctx.objs.get_mut(panel).flags |= FLAG_HAS_ON_PAINT;
+        let card = mk(&mut ctx, 20, 20, 30, 20, 5);
         crate::render::render_dirty(&mut ctx);
         EVENTS.with(|v| v.borrow_mut().clear());
 
         let screen = fill_list(&ctx.lcd, 0, 400, 1);
-        let mine = fill_list(&ctx.lcd, 780, 10, 2);
-        let theirs = fill_list(&ctx.lcd, 0, 0, 3);
+        let paint = fill_list(&ctx.lcd, 0, 0, 3);
         ctx.objs.render.draws.push(Draw::Screen(screen));
-        ctx.objs.render.draws.push(Draw::Paint(taken, mine));
-        ctx.objs.render.draws.push(Draw::Paint(declined, theirs));
-        ctx.objs.mark_dirty(taken);
-        ctx.objs.mark_dirty(declined);
+        ctx.objs.render.draws.push(Draw::Paint(panel, paint));
+        ctx.objs.mark_dirty(panel);
+        crate::render::render_dirty(&mut ctx);
+        let got = EVENTS.with(|v| core::mem::take(&mut *v.borrow_mut()));
+        // The panel's body around the (opaque) card over it, then its list cut
+        // to the same region: (0, 0, 40, 40) within the box, less the card.
+        assert_eq!(
+            got,
+            [
+                "fill 1 0,400,40,40",
+                "fill 4660 10,10,100,10",
+                "fill 4660 10,40,100,20",
+                "fill 4660 10,20,10,20",
+                "fill 4660 50,20,60,20",
+                "fill 3 10,10,30,10",
+                "fill 3 10,20,10,20",
+            ]
+        );
+        let r = ctx.render_ctx.as_ref().unwrap();
+        assert!(r.objs.render.draws.is_empty() && ctx.objs.render.draws.is_empty());
+        assert_eq!(r.objs.render.paints.borrow().len(), 1, "kept");
+
+        // The card moves away: the panel is repainted where it was, with its
+        // drawing, though on_paint didn't run.
+        ctx.objs.will_move(card);
+        ctx.objs.get_mut(card).location = Offset { x: 300, y: 300 };
+        ctx.objs.mark_dirty(card);
         crate::render::render_dirty(&mut ctx);
         let got = EVENTS.with(|v| core::mem::take(&mut *v.borrow_mut()));
         assert_eq!(
             got,
             [
-                "fill 1 0,400,40,40".to_string(),
-                std::format!("capture {}", taken.0),
-                "fill 2 790,20,10,30".to_string(),
-                std::format!("captured {}", taken.0),
-                std::format!("declined {}", declined.0),
-                "render".to_string(),
-                "fill 3 0,0,40,40".to_string(),
+                "fill 0 20,20,30,20",
+                "fill 4660 20,20,30,20",
+                "fill 3 20,20,20,20",
+                "fill 5 300,300,30,20",
             ]
         );
-        let r = ctx.render_ctx.as_ref().unwrap();
-        assert!(r.objs.render.draws.is_empty() && ctx.objs.render.draws.is_empty());
-        assert_eq!(r.objs.render.paints.borrow().len(), 2, "kept for dumps");
-        assert!(!ctx.objs.needs_sync());
     }
 }

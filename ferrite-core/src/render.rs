@@ -111,45 +111,6 @@ pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
     }
 }
 
-/// Dirty mode, before `render_dirty`: offers each visible widget in `paint` to the board
-/// renderer's capture (`WidgetRenderer::capture_begin`); `run` paints the ones it takes
-/// (one-entry lists) into their captures, with the scissor on the widget's box. Returns
-/// the rest, whose `on_paint` runs on the screen after the render as before. With the
-/// default renderer nothing is taken: `paint` comes back as it was.
-pub fn capture_paint<P: Platform>(
-    ctx: &mut Ctx<P>,
-    paint: &PaintList,
-    mut run: impl FnMut(&mut Ctx<P>, &PaintList),
-) -> PaintList {
-    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || paint.is_empty() {
-        return *paint;
-    }
-    let mut rest = PaintList::new();
-    for &id in paint.ids() {
-        if !ctx.objs.is_tree_visible(id) {
-            rest.push(id);
-            continue;
-        }
-        let abs = ctx.objs.absolute_rect(id);
-        let Some(boxed) = abs.intersection(&screen_rect(&ctx.lcd)) else {
-            rest.push(id);
-            continue;
-        };
-        if !<P::Renderer as WidgetRenderer<P>>::capture_begin(ctx, id, &abs) {
-            rest.push(id);
-            continue;
-        }
-        let scissor = ctx.lcd.scissor();
-        ctx.lcd.set_scissor(Some(boxed));
-        let mut one = PaintList::new();
-        one.push(id);
-        run(ctx, &one);
-        ctx.lcd.set_scissor(scissor);
-        <P::Renderer as WidgetRenderer<P>>::capture_end(ctx, id);
-    }
-    rest
-}
-
 /// Whether DFS entry `i` (at `abs`) is left out as a scroll container's child: not wholly
 /// inside its nearest scroll container's viewport (text can't be partially clipped). Draw
 /// loops skip its whole subtree with it (`render_all` always did), so a partly visible row
@@ -272,9 +233,9 @@ pub enum RenderJob {
 
 /// Runs `job` on the render context `r` (already synced): the render side's
 /// whole work, on whichever core holds `r`. The VM's drawing handed over
-/// with the sync (`view::Draw`) goes where it would have drawn: direct
-/// drawing and captured `on_paint` before the render, the other `on_paint`
-/// lists on the screen after it.
+/// with the sync (`view::Draw`): direct drawing is replayed before the
+/// render, `on_paint` lists are kept and drawn with their widgets by it
+/// (`draw_paint`).
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let ta = crate::perf::now();
     if job == RenderJob::Play {
@@ -289,17 +250,10 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     r.objs.apply_pending();
     let t0 = crate::perf::now();
     let draws = core::mem::take(&mut r.objs.render.draws);
-    let mut later = alloc::vec::Vec::new();
     for d in draws {
         match d {
             crate::view::Draw::Screen(list) => screen!(r, |c| list.replay(c, &r.refs())),
-            crate::view::Draw::Paint(id, list) => {
-                if capture_list(r, id, &list) {
-                    keep_paint(r, id, list);
-                } else {
-                    later.push((id, list));
-                }
-            }
+            crate::view::Draw::Paint(id, list) => keep_paint(r, id, list),
         }
     }
     let t1 = crate::perf::now();
@@ -309,30 +263,19 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
         RenderJob::Play => {}
     }
     let t2 = crate::perf::now();
-    if r.objs.render.areas && !later.is_empty() {
-        // Drawing outside the areas follows (`Canvas::area`).
-        screen!(r, |c| c.area(Rect::new(0, 0, 0, 0)));
-    }
-    for (id, list) in later {
-        if r.objs.is_tree_visible(id) {
-            screen!(r, |c| list.replay(c, &r.refs()));
-            r.objs.screen_touched();
-        }
-        keep_paint(r, id, list);
-    }
-    let t3 = crate::perf::now();
     use core::sync::atomic::Ordering::Relaxed;
     JOB_TICKS[JOB_APPLY].fetch_add(t0.wrapping_sub(ta) as u64, Relaxed);
     JOB_TICKS[JOB_LISTS].fetch_add(t1.wrapping_sub(t0) as u64, Relaxed);
     JOB_TICKS[JOB_RENDER].fetch_add(t2.wrapping_sub(t1) as u64, Relaxed);
-    JOB_TICKS[JOB_PAINTS].fetch_add(t3.wrapping_sub(t2) as u64, Relaxed);
 }
 
 /// Where the render jobs' time went ([`run_job`], profiler clock ticks since
-/// boot, whichever core ran them): the VM's recorded drawing replayed before
-/// the render (screen lists, captured `on_paint` lists), the render itself,
-/// the `on_paint` lists replayed on the screen after it; and before all of
+/// boot, whichever core ran them): the VM's recorded drawing replayed or kept
+/// before the render (screen lists, `on_paint` lists), the render itself
+/// (with the `on_paint` lists, drawn with their widgets); and before all of
 /// them, taking in the commit the VM side posted (`view::Commit`).
+/// `JOB_PAINTS` (the `on_paint` lists replayed after the render until
+/// 2026-11-18) stays 0, kept for `/api/status`'s layout.
 pub static JOB_TICKS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 pub const JOB_LISTS: usize = 0;
 pub const JOB_RENDER: usize = 1;
@@ -346,28 +289,7 @@ pub fn records<P: Platform>(ctx: &Ctx<P>) -> bool {
     ctx.render_ctx.is_some() || ctx.render_away
 }
 
-/// `capture_paint` for a recorded `on_paint` list: replayed into the board
-/// renderer's capture with the scissor on the widget's box, if it takes it.
-fn capture_list<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: &crate::dl::List) -> bool {
-    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || r.objs.render.areas || !r.objs.is_tree_visible(id) {
-        return false;
-    }
-    let abs = r.objs.absolute_rect(id);
-    let Some(boxed) = abs.intersection(&screen_rect(&r.lcd)) else {
-        return false;
-    };
-    if !<P::Renderer as WidgetRenderer<P>>::capture_begin(r, id, &abs) {
-        return false;
-    }
-    let scissor = r.lcd.scissor();
-    r.lcd.set_scissor(Some(boxed));
-    list.replay(&r.lcd, &r.refs());
-    r.lcd.set_scissor(scissor);
-    <P::Renderer as WidgetRenderer<P>>::capture_end(r, id);
-    true
-}
-
-/// Keeps `list` as `id`'s last paint list (dumps).
+/// Keeps `list` as `id`'s paint list, drawn with it (`draw_paint`).
 fn keep_paint<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: crate::dl::List) {
     let mut paints = r.objs.render.paints.borrow_mut();
     paints.insert(id, list);
@@ -1874,7 +1796,30 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipR
     if ctx.objs.render.areas || !P::Renderer::draw(ctx, id, abs, clip) {
         draw_body(ctx, id, abs, clip);
     }
+    if ctx.objs.get(id).flags & FLAG_HAS_ON_PAINT != 0 {
+        draw_paint(ctx, id, abs, clip);
+    }
     crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
+}
+
+/// The last `on_paint` drawing of widget `id` (`ObjPool::render.paints`),
+/// over its body and under its children, clipped to its box: part of how the
+/// widget looks, so a repaint that doesn't run `on_paint` (something over it
+/// moved) still shows it.
+fn draw_paint<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
+    let paints = ctx.objs.render.paints.borrow();
+    let Some(list) = paints.get(&id) else {
+        return;
+    };
+    screen!(ctx, |c| {
+        let start = c.scissor();
+        for cr in clip.iter() {
+            if let Some(r) = cr.intersection(abs) {
+                list.replay_clipped(c, &ctx.refs(), r, None);
+            }
+        }
+        c.set_scissor(start);
+    });
 }
 
 /// Draw widget `id` the built-in way (what [`DefaultRenderer`] does), for a

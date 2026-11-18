@@ -1328,32 +1328,19 @@ impl Vm {
         if n == 0 {
             return;
         }
-        // With a render context the render side replays it (`render::run_job`).
-        if render::records(ctx) {
-            self.record_paint(ctx, offset, &ids[..n], false);
-            return;
-        }
-        if crate::dl::enabled() {
-            self.record_paint(ctx, offset, &ids[..n], true);
-            return;
-        }
-        let Some(arr_id) = ctx.objs.arr_from(&ids[..n]) else {
-            return;
-        };
-        self.in_paint = true;
-        self.call_now(offset, &[arr_id as i32], ctx);
-        self.in_paint = false;
-        // The id list lives only for the call (it used to leak one array per
-        // painted frame).
-        ctx.objs.arr_free(arr_id);
+        // Recorded, then drawn with each widget by the render
+        // (`render::draw_paint`): handed to the render side with a render
+        // context (`render::run_job`), else kept here.
+        let direct = !render::records(ctx);
+        self.record_paint(ctx, offset, &ids[..n], direct);
     }
 
     /// Run the `on_paint` dispatcher once per widget with the drawing
-    /// builtins recording (`draw_op`). `direct` (display lists, no render
-    /// context): replay each list where the drawing would have gone and keep
-    /// it as the widget's paint list (`ObjPool::render.paints`); else queue
-    /// it for the render side (`view::Draw::Paint`). Pixel-identical to
-    /// drawing directly.
+    /// builtins recording (`draw_op`). `direct` (no render context): keep
+    /// each list as the widget's paint list (`ObjPool::render.paints`); else
+    /// queue it for the render side (`view::Draw::Paint`). The render draws
+    /// it with the widget (`render::draw_paint`), so `on_paint` runs before
+    /// the render that shows it.
     fn record_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, offset: CodeAddr, ids: &[i32], direct: bool) {
         if !direct {
             // Direct drawing before it stays before it.
@@ -1386,8 +1373,6 @@ impl Vm {
                 ctx.objs.render.draws.push(crate::view::Draw::Paint(id, list));
                 continue;
             }
-            list.replay(&ctx.lcd, &ctx.refs());
-            ctx.objs.screen_touched();
             let state = &ctx.objs.render;
             let mut paints = state.paints.borrow_mut();
             paints.insert(id, list);
@@ -2095,9 +2080,8 @@ impl Vm {
                 if !self.in_paint {
                     let mut paint = render::PaintList::new();
                     render::collect_dirty_paint(ctx, &mut paint);
-                    let paint = render::capture_paint(ctx, &paint, |ctx, one| self.run_paint(ctx, one));
-                    render::render_dirty(ctx);
                     self.run_paint(ctx, &paint);
+                    render::render_dirty(ctx);
                 }
             }
             OP_ARR_LOAD => {

@@ -5,8 +5,8 @@
 //   - star:  24 rotating lines, redrawn every frame while "Animate" is on;
 //   - board: a static drawing, painted once, with a translucent card sliding over it
 //            (every frame repaints what the card uncovers).
-// The board captures each panel's drawing and draws it with the panel (the GPU
-// compositor samples it), so the panels survive restores. The line at the bottom shows
+// Each panel's drawing is kept and drawn with the panel (over its background,
+// under the card, cut to its box), so it survives repaints that don't run on_paint. The line at the bottom shows
 // passes/s and frames/s; `ferrite_cli.py perf` or /api/status give the details.
 
 #include "core.fl"

@@ -108,8 +108,7 @@ def main():
     ap.add_argument("--areas", action="store_true",
                     help="the board's mode: the render side only plays each frame's display list, recorded by "
                          "the VM's side in compositor order: changed areas repainted whole, back to front "
-                         "with retained layers (FERRITE_SIM_AREAS=1); matches the golden frames except paint "
-                         "(on_paint: whole areas)")
+                         "with retained layers (FERRITE_SIM_AREAS=1); must match the same golden frames")
     ap.add_argument("--hashes", help="check against / write (--update) this hash file instead of golden/hashes.json")
     a = ap.parse_args()
     global HASHES

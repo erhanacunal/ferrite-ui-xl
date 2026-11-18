@@ -1054,6 +1054,22 @@ impl ObjPool {
         }
     }
 
+    /// What of the screen the scroll containers around `id` show: the
+    /// intersection of the viewports of all of them (nested ones too);
+    /// `None` outside any. A child is drawn clipped to it, and not at all
+    /// where it doesn't meet it.
+    pub fn scroll_view(&self, id: WidgetId) -> Option<Rect> {
+        let mut view: Option<Rect> = None;
+        let mut sp = self.scroll_parent(id);
+        let mut depth = 0usize;
+        while sp.is_some() && depth <= self.count() {
+            view = Some(meet_view(view, self.scroll_viewport(sp)));
+            sp = self.scroll_parent(sp);
+            depth += 1;
+        }
+        view
+    }
+
     /// Find nearest ancestor with FLAG_CLIP_CHILDREN. Returns NONE if none found.
     pub fn scroll_parent(&self, id: WidgetId) -> WidgetId {
         let max = self.count();
@@ -1487,5 +1503,15 @@ mod tests {
         let btn = group_widget(&mut tree, KIND_BUTTON_GROUP, 5);
         tree.select_in_group(btn);
         assert!(checked(&tree, btn) && checked(&tree, g2));
+    }
+}
+
+/// `view` (what the enclosing scroll containers show, `None` = no
+/// container) narrowed by another viewport `v`; an empty rect when they don't
+/// meet.
+pub fn meet_view(view: Option<Rect>, v: Rect) -> Rect {
+    match view {
+        None => v,
+        Some(cur) => cur.intersection(&v).unwrap_or(Rect::new(v.x, v.y, 0, 0)),
     }
 }

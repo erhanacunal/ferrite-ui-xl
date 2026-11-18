@@ -111,18 +111,33 @@ pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
     }
 }
 
-/// Whether DFS entry `i` (at `abs`) is left out as a scroll container's child: not wholly
-/// inside its nearest scroll container's viewport (text can't be partially clipped). Draw
-/// loops skip its whole subtree with it (`render_all` always did), so a partly visible row
-/// doesn't leave its children drawn without it; occluder and restore loops ignore it.
-/// Board compositors apply the same rule.
+/// Whether DFS entry `i` (at `abs`) is left out as a scroll container's child: it doesn't
+/// meet what the scroll containers around it show (`ObjPool::view_at`). Draw loops skip
+/// its whole subtree with it; occluder and restore loops ignore it. A partly visible one
+/// is drawn clipped to the view (`view_clip`; its footprint is `shown_box`).
 pub fn scroll_hidden(objs: &ObjPool, i: usize, abs: &Rect) -> bool {
-    let sp = objs.scroll_parent_at(i);
-    if sp.is_none() {
-        return false;
+    match objs.view_at(i) {
+        Some(v) => !abs.intersects(&v),
+        None => false,
     }
-    let v = objs.scroll_viewport(sp);
-    abs.x < v.x || abs.y < v.y || abs.right() > v.right() || abs.bottom() > v.bottom()
+}
+
+/// The part of DFS entry `i`'s box (at `abs`) that is on the screen: cut to what the
+/// scroll containers around it show (empty when [`scroll_hidden`]).
+pub fn shown_box(objs: &ObjPool, i: usize, abs: &Rect) -> Rect {
+    match objs.view_at(i) {
+        Some(v) => abs.intersection(&v).unwrap_or(Rect::new(abs.x, abs.y, 0, 0)),
+        None => *abs,
+    }
+}
+
+/// `clip` cut to what the scroll containers around DFS entry `i` show.
+fn view_clip(objs: &ObjPool, i: usize, clip: &ClipRegion) -> ClipRegion {
+    let mut c = clip.clone();
+    if let Some(v) = objs.view_at(i) {
+        c.clip_to_bounds(&v);
+    }
+    c
 }
 
 /// Redraw widgets that sit behind widget `target_idx` (earlier in DFS order),
@@ -150,7 +165,7 @@ fn restore_behind<P: Platform>(ctx: &mut Ctx<P>, idx: usize, area: Rect) {
     let end = ctx.objs.sub_end_at(idx);
     for j in end..ctx.objs.dfs_len() {
         let jabs = ctx.objs.abs_at(j);
-        if ctx.objs.vis_at(j) && jabs.intersects(&area) && !scroll_hidden(&ctx.objs, j, &jabs) {
+        if ctx.objs.vis_at(j) && shown_box(&ctx.objs, j, &jabs).intersects(&area) {
             let jid = ctx.objs.dfs_at(j);
             if !ctx.objs.get(jid).is_dirty() {
                 ctx.objs.mark_dirty(jid);
@@ -190,10 +205,10 @@ fn redraw_behind_region<P: Platform>(
             continue;
         }
         i += 1;
-        if !u_abs.intersects(bounds) {
+        if !shown_box(&ctx.objs, i - 1, &u_abs).intersects(bounds) {
             continue;
         }
-        draw_widget(ctx, uid, &u_abs, clip);
+        draw_widget(ctx, uid, &u_abs, &view_clip(&ctx.objs, i - 1, clip));
         // Partly redrawn (possibly with a newer value than recorded).
         ctx.objs.forget_drawn(uid);
     }
@@ -500,12 +515,13 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
         }
         let abs = ctx.objs.abs_at(i);
 
-        // Children of scroll containers: outside or partly visible — skip the subtree.
+        // Children of scroll containers: outside the view — skip the subtree;
+        // partly visible — clipped to it.
         if scroll_hidden(&ctx.objs, i, &abs) {
             i = ctx.objs.sub_end_at(i);
             continue;
         }
-        draw_widget(ctx, id, &abs, &full);
+        draw_widget(ctx, id, &abs, &view_clip(&ctx.objs, i, &full));
         ctx.objs.set_rendered(id, true);
         record_drawn(ctx, id, &abs);
         i += 1;
@@ -767,8 +783,9 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         let alpha = ctx.lcd.has_alpha();
         for j in sub_end..ctx.objs.dfs_len() {
             if ctx.objs.vis_at(j) {
-                let other_abs = ctx.objs.abs_at(j);
-                if !abs.intersects(&other_abs) || scroll_hidden(&ctx.objs, j, &other_abs) {
+                // What of it is on the screen (a scroll container's child: in the view).
+                let other_abs = shown_box(&ctx.objs, j, &ctx.objs.abs_at(j));
+                if !abs.intersects(&other_abs) {
                     continue;
                 }
                 if occ_count < 32 {
@@ -809,13 +826,14 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
             }
 
             let sabs = ctx.objs.abs_at(si);
-            // Children of scroll containers: outside or partly visible — skip the subtree.
+            // Children of scroll containers: outside the view — skip the
+            // subtree; partly visible — clipped to it.
             if scroll_hidden(&ctx.objs, si, &sabs) {
                 next = ctx.objs.sub_end_at(si);
                 continue;
             }
 
-            let mut clip = ClipRegion::from_rect(sabs);
+            let mut clip = ClipRegion::from_rect(shown_box(&ctx.objs, si, &sabs));
             clip.clip_to_bounds(&screen_rect(&ctx.lcd));
             if keep {
                 // One rect cut by at most MAX_CLIP_RECTS disjoint ones: fits.
@@ -1208,7 +1226,7 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
             continue;
         }
         if ctx.objs.vis_at(di) || ctx.objs.rendered(id) {
-            areas.add(ctx.objs.abs_at(di), &screen);
+            areas.add(shown_box(&ctx.objs, di, &ctx.objs.abs_at(di)), &screen);
         }
         areas.add(ctx.objs.prev_rect(id), &screen);
     }
@@ -1253,8 +1271,8 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
 
 /// `MODE_AREAS`: repaints `areas` whole, each after its marker
 /// (`Canvas::area`): every visible widget touching it, in DFS order, clipped
-/// to it (scroll containers' children as `render_all`: only those wholly
-/// inside the viewport), then the scrollbars there. What the board's
+/// to it (scroll containers' children as `render_all`: clipped to the
+/// view), then the scrollbars there. What the board's
 /// compositor does with the tree (`WidgetRenderer::compose`), on the canvas.
 fn paint_areas<P: Platform>(ctx: &mut Ctx<P>, areas: &[Rect]) {
     let n = ctx.objs.dfs_len();
@@ -1284,9 +1302,9 @@ fn paint_areas_on<P: Platform>(ctx: &mut Ctx<P>, areas: &[Rect], lo: usize, n: u
                 i = ctx.objs.sub_end_at(i);
                 continue;
             }
-            if abs.intersects(a) {
+            if shown_box(&ctx.objs, i, &abs).intersects(a) {
                 let id = ctx.objs.dfs_at(i);
-                draw_widget(ctx, id, &abs, &clip);
+                draw_widget(ctx, id, &abs, &view_clip(&ctx.objs, i, &clip));
             }
             i += 1;
         }
@@ -4701,7 +4719,8 @@ mod shift_tests {
     /// A scroll container whose rows (each with a child) scroll under a translucent widget
     /// below it that is redrawn too: the dirty render must match a full redraw. It used to
     /// differ two ways: the restore behind the translucent widget drew rows scrolled out of
-    /// the view there, and a partly visible row's child was drawn without its row.
+    /// the view there, and a partly visible row's child was drawn without its row. Rows
+    /// at the view's edges are drawn clipped to it (they used to be left out whole).
     #[test]
     fn scrolled_children_match_a_full_redraw() {
         let build = |c: &mut Ctx<Plat<false>>| {
@@ -4748,6 +4767,43 @@ mod shift_tests {
                 );
             }
         }
+    }
+
+    /// A row cut by the view's top edge is drawn where it is in the view, and not
+    /// outside it (over the container's padding), with its child; nested containers
+    /// clip to both views.
+    #[test]
+    fn partly_visible_rows_are_drawn_clipped_to_the_view() {
+        let mut a = ctx::<false>();
+        let o = &mut a.objs;
+        let root = o.alloc_widget().unwrap();
+        o.root = root;
+        o.get_mut(root).size = Size { w: S as u16, h: S as u16 };
+        o.get_mut(root).background_color = 0x1082;
+        let list = rect(o, root, Rect::new(10, 10, 70, 60), 0x2124, 0, 255);
+        o.get_mut(list).flags |= FLAG_CLIP_CHILDREN;
+        o.update_ext(list, |e| e.padding = Edges { top: 4, right: 4, bottom: 4, left: 4 });
+        for i in 0..8 {
+            let row = rect(o, list, Rect::new(0, i * 20, 40, 18), 0x4208, 0, 255);
+            rect(o, row, Rect::new(4, 2, 10, 14), 0xFFE0, 0, 255);
+        }
+        // Scrolled by 10: row 0 spans y 4..22 of the list's content, 10 of it hidden.
+        a.objs.get_mut(list).value = 10;
+        render_all(&mut a);
+        let px = |a: &Ctx<Plat<false>>, x: usize, y: usize| a.lcd.backend().px.borrow()[y * S + x];
+        // The view starts at y 14 (10 + padding 4): row 0 is at 14 - 10 = 4..22.
+        assert_eq!(px(&a, 30, 15), 0x4208, "row 0 inside the view");
+        assert_eq!(px(&a, 20, 15), 0xFFE0, "its child too");
+        assert_eq!(px(&a, 30, 12), 0x2124, "not over the padding");
+        // The row cut by the bottom edge (view ends at 10 + 60 - 4 = 66).
+        assert_eq!(px(&a, 30, 65), 0x4208, "the last row's top part");
+        assert_eq!(px(&a, 30, 67), 0x2124, "not past the view");
+        // A dirty scroll step: row 0 now at -3..15, one row of it in the view.
+        a.objs.get_mut(list).value = 17;
+        a.objs.mark_dirty(list);
+        render_dirty(&mut a);
+        assert_eq!(px(&a, 30, 14), 0x4208, "row 0 still partly shown after scrolling");
+        assert_eq!(px(&a, 30, 13), 0x2124);
     }
 
     /// A panel and one of its children moving in the same frame: the

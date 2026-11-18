@@ -37,6 +37,11 @@ pub(crate) struct Geo {
     sp: WidgetId,
     /// `is_tree_visible`.
     vis: bool,
+    /// `scroll_view`.
+    view: Option<Rect>,
+    /// What this widget's children see (`view` narrowed by its own viewport
+    /// when it is a scroll container).
+    cview: Option<Rect>,
 }
 
 impl ObjPool {
@@ -73,7 +78,7 @@ impl ObjPool {
                     geo[top as usize].end = i as u32;
                     stack.pop();
                 }
-                let (abs, vis, sp) = match stack.last() {
+                let (abs, vis, sp, view) = match stack.last() {
                     Some(&t) => {
                         let g = &geo[t as usize];
                         let abs = Rect::new(
@@ -84,10 +89,20 @@ impl ObjPool {
                         );
                         let vis = g.vis && w.flags & FLAG_DESTROYED == 0 && w.is_visible();
                         let sp = if self.get(parent).flags & FLAG_CLIP_CHILDREN != 0 { parent } else { g.sp };
-                        (abs, vis, sp)
+                        (abs, vis, sp, g.cview)
                     }
                     // The root, or a parent missing from the order: live.
-                    None => (self.absolute_rect(id), self.is_tree_visible(id), self.scroll_parent(id)),
+                    None => (
+                        self.absolute_rect(id),
+                        self.is_tree_visible(id),
+                        self.scroll_parent(id),
+                        self.scroll_view(id),
+                    ),
+                };
+                let cview = if w.flags & FLAG_CLIP_CHILDREN != 0 {
+                    Some(crate::widget::meet_view(view, self.scroll_viewport(id)))
+                } else {
+                    view
                 };
                 let (mut ox, mut oy) = (abs.x, abs.y);
                 if w.kind != KIND_DROPDOWN {
@@ -98,7 +113,7 @@ impl ObjPool {
                 if w.flags & FLAG_CLIP_CHILDREN != 0 {
                     oy = oy.wrapping_sub(w.value as i16);
                 }
-                geo.push(Geo { abs, ox, oy, end: n as u32, sp, vis });
+                geo.push(Geo { abs, ox, oy, end: n as u32, sp, vis, view, cview });
                 stack.push(i as u32);
             }
             self.render.geo_valid = true;
@@ -144,6 +159,18 @@ impl ObjPool {
             return g.sp;
         }
         self.scroll_parent(self.dfs_at(i))
+    }
+
+    /// `scroll_view` of DFS entry `i` (in the running layer pass's
+    /// coordinates, like `abs_at`).
+    #[inline]
+    pub fn view_at(&self, i: usize) -> Option<Rect> {
+        let v = match self.geo(i) {
+            Some(g) => g.view?,
+            None => self.scroll_view(self.dfs_at(i))?,
+        };
+        let o = self.layers.origin;
+        Some(Rect::new(v.x.wrapping_sub(o.x), v.y.wrapping_sub(o.y), v.w, v.h))
     }
 
     /// DFS index one past the subtree of entry `i` (its descendants follow
@@ -208,12 +235,12 @@ mod tests {
         t.ensure_dfs();
         let n = t.dfs_len();
         let live: std::vec::Vec<_> = (0..n)
-            .map(|i| (t.abs_at(i), t.vis_at(i), t.scroll_parent_at(i).0, t.sub_end_at(i)))
+            .map(|i| (t.abs_at(i), t.vis_at(i), t.scroll_parent_at(i).0, t.sub_end_at(i), t.view_at(i)))
             .collect();
         t.geo_begin();
         assert!(t.render.geo_valid);
         for i in 0..n {
-            let got = (t.abs_at(i), t.vis_at(i), t.scroll_parent_at(i).0, t.sub_end_at(i));
+            let got = (t.abs_at(i), t.vis_at(i), t.scroll_parent_at(i).0, t.sub_end_at(i), t.view_at(i));
             assert!(got == live[i], "entry {i}");
         }
         t.geo_end();

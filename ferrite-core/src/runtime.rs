@@ -1773,8 +1773,8 @@ pub fn gesture_start(objs: &mut ObjPool, x: u16, y: u16) -> WidgetId {
         if !abs.contains(x, y) {
             continue;
         }
-        let sp = objs.scroll_parent(id);
-        if sp.is_some() && !objs.scroll_viewport(sp).contains(x, y) {
+        // A scroll container's child: only where it shows (a partly visible row too).
+        if objs.scroll_view(id).is_some_and(|v| !v.contains(x, y)) {
             continue;
         }
         let takes = w.flags & widget::FLAG_CLICKABLE != 0 || objs.gestures.get(id).is_some() || scrollable(objs, id);

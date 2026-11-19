@@ -368,3 +368,41 @@ impl StorageBackend for BoardStorage {
         }
     }
 }
+
+/// Where app packages live (ferrite-core `apps`, docs/apps.md): `ferrite/apps/` on the ext4
+/// USERDATA only (CACHE's FAT32 has 8.3 names).
+pub struct BoardApps;
+
+impl ferrite_core::apps::AppFiles for BoardApps {
+    fn available(&self) -> bool {
+        medium() == Medium::UserData
+    }
+    fn read(&self, dir: &str, name: &str, max: usize) -> Option<Vec<u8>> {
+        if !self.available() {
+            return None;
+        }
+        ext4::read_in(dir, name, max)
+    }
+    fn save(&self, dir: &str, name: &str, data: &[u8]) -> bool {
+        self.available() && ext4::make_dirs(dir) && ext4::save_in(dir, name, data)
+    }
+    fn make_dirs(&self, dir: &str) -> bool {
+        self.available() && ext4::make_dirs(dir) && ext4::commit()
+    }
+    fn list(&self, dir: &str) -> Option<Vec<(String, bool)>> {
+        if !self.available() {
+            return None;
+        }
+        ext4::list_dir(dir)
+    }
+    fn delete(&self, dir: &str, name: &str) -> bool {
+        self.available() && ext4::remove(dir, name).is_ok()
+    }
+    fn remove_dir(&self, dir: &str) -> bool {
+        let Some((parent, name)) = dir.rsplit_once('/') else { return false };
+        self.available() && ext4::remove(parent, name).is_ok()
+    }
+    fn commit(&self) -> bool {
+        ext4::commit()
+    }
+}

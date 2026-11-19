@@ -10,6 +10,7 @@ extern crate std;
 
 // --- HAL backend traits + generic wrappers + Platform ---
 
+pub mod apps;
 pub mod audio;
 pub mod backlight;
 pub mod eeprom;

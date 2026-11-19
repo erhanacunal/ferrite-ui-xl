@@ -70,14 +70,16 @@ ferrite/
   apps/
     {id}/
       app.img            the package, as uploaded (verified)
-      data/              the app's storage root (disk* opcodes)
+      appinfo.bin        its manifest (108 bytes), so listing reads no app.img
+      data/              the app's storage root (disk* opcodes) and eeprom.bin
   ferrite.bin, eeprom.bin, ...
 system/settings.txt      + key `app={id}`: the app to start at boot
 ```
 
 - Install = write `apps/{id}/app.img.new`, then rename over `app.img` (the
   USERDATA "NAME.new + rename" rule; power loss leaves the old one or the
-  new one). `data/` is created once and kept across updates; removing an
+  new one), then `appinfo.bin` the same way. `app.img`'s own manifest is
+  what runs; `appinfo.bin` only lists it. `data/` is created once and kept across updates; removing an
   app deletes the whole directory.
 - Apps need the ext4 USERDATA (the CACHE FAT32 fallback has 8.3 names);
   without it installing answers "no app storage".
@@ -87,29 +89,50 @@ system/settings.txt      + key `app={id}`: the app to start at boot
 
 ## Install paths
 
-Every path ends in the same `apps::install(image)`: mount it as an `Fs`,
-`verify` (CRC), read `appinfo` (magic, version, id rules), check the caps
-against the firmware's, check it has its entry program, then write as
-above. Errors come back as codes (`APP_ERR_*`: bad image, no appinfo, bad
-id, caps, no storage, write failed, too large).
+Every path ends in the same `apps::install` (`ferrite-core/src/apps.rs`):
+mount the image as an `Fs` at `FS_BASE` (`apps::SliceFlash`), `verify`
+(CRC), read `appinfo` (magic, version, id rules), check the caps against
+the firmware's, check it has its entry program, then write as above
+through `apps::AppFiles` (exynos4412: `storage::BoardApps`, the ext4
+USERDATA only). Errors are `apps::err` codes, which are also protocol
+error codes (ferrite_cli `ERROR_DESCRIPTIONS`):
 
-1. **HTTP:** `POST /api/apps` (body = the package) → install, JSON
-   `{"id":..,"version":..,"replaced":bool}`. `GET /api/apps` (installed:
-   id, name, version, size), `DELETE /api/apps/{id}`,
-   `POST /api/apps/{id}/run`. The body goes to a heap buffer (the 1 GiB
-   board takes packages up to the region size, 64 MB), not into the region.
+| Code | Meaning | HTTP |
+| --- | --- | --- |
+| 11 | not a valid FS image (format or CRC) | 400 |
+| 12 | no appinfo (a system image) | 400 |
+| 13 | bad `application_id` | 400 |
+| 14 | needs caps the firmware lacks | 400 |
+| 15 | no app storage (USERDATA not ext4) | 503 |
+| 16 | writing to storage failed | 500 |
+| 17 | no such app | 404 |
+| 18 | entry program not in the image | 400 |
+| 19 | package too large | 413 |
+
+1. **HTTP:** `POST /api/apps` (body = the package, `X-CRC32` optional) →
+   install, JSON `{"id","name","version","entry","icon","caps","replaced"}`
+   or `{"code","error"}`. `GET /api/apps` →
+   `{"storage":bool,"apps":[...]}`, `DELETE /api/apps/{id}`; phase 3 adds
+   `POST /api/apps/{id}/run`. The body goes to a heap buffer (up to the
+   region size, 64 MB), not into the region; CPU0 installs it between
+   passes (`net::install_app`), the running program goes on.
 2. **writefs (protocol bridge / USART):** a new header flag
    `FS_FLAG_APP` = 4. With it the device takes the sectors into a staging
    buffer instead of the region, and `FsWriteComplete` calls
-   `apps::install`, then runs the app if `writefs --run` (flag
-   `FS_FLAG_RUN` = 8). Without the flag writefs is today's system-image
-   upload. Old firmware ignores unknown flags, so `ferrite_cli` first
-   checks the reply's caps (`fs_caps`, which gains the flag) and refuses
-   with "firmware too old for apps".
-3. **CLI:** `ferrite_cli app install PKG [--run]` (HTTP with `--host`,
-   else writefs with `FS_FLAG_APP`), `app list`, `app remove ID`,
-   `app run ID`, `app default ID|--none`. `ferrite_build` prints whether
-   it built an app (`app com.acme.clock 1.2.3`) or a system image.
+   `apps::install`, answers its error code or the last ACK, and starts the
+   system image's `main` again (`hot_swap`: a writefs stops the running
+   program when it starts). `FS_FLAG_RUN` = 8 (phase 3) will run the app
+   instead. Without the flag writefs is today's system-image upload. Old
+   firmware ignores unknown flags, so the device echoes the ones it knows
+   in its FsCaps reply and `ferrite_cli` stops after the header when
+   `FS_FLAG_APP` is missing (that firmware then waits for an image: restart
+   it).
+3. **CLI:** `ferrite_cli app install PKG` (HTTP with `--host`, else
+   writefs with `FS_FLAG_APP` over `-p`; a system image is refused before
+   sending), `app list`, `app remove ID` (`--host`). Phase 3 adds
+   `install --run`, `app run ID`, `app default ID|--none`. `ferrite_build`
+   prints whether it built an app (`App: com.acme.clock 1.2.3`) or a system
+   image.
 
 ## Running an app (step 1: one at a time)
 
@@ -157,12 +180,15 @@ launcher written in `.fl` (step 2 makes it a task that stays alive).
 
 ## Phases (step 1)
 
-1. **Build:** ferrite-ui `ferrite_build` writes `appinfo` from
+1. **Build** (done 2026-11-19): ferrite-ui `ferrite_build` writes `appinfo` from
    `project.json` (`application_id`, `name`, `version`, `entry`, `icon`);
    `RES_APPINFO` in `fs.rs` / `ferrite_build.py` (keep in sync);
    `ferrite_cli` and the Designer show it. Test: build an example as an app,
    parse it back.
-2. **Install on the board:** `ferrite-core/src/apps.rs` (`install`,
+2. **Install on the board** (done 2026-11-19, board: HTTP and writefs
+   installs, update keeps `data/`, list, remove, device-side rejections,
+   ext4 check clean; a power cut during an install is still to try):
+   `ferrite-core/src/apps.rs` (`install`,
    `remove`, `list`, through `StorageBackend`, testable with `MemStorage`),
    HTTP endpoints, `FS_FLAG_APP` in `protocol.rs` + `ferrite_cli`.
    Tests: install / replace / remove / bad packages on `MemStorage`; board:

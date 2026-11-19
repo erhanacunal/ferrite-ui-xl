@@ -101,6 +101,16 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         None
     }
 
+    /// Where app packages are installed (`apps.rs`, docs/apps.md). The
+    /// default: nowhere (writefs with `FS_FLAG_APP` answers "no app storage").
+    fn app_files() -> &'static dyn crate::apps::AppFiles {
+        &crate::apps::NoAppFiles
+    }
+
+    /// Largest app package taken (a writefs with `FS_FLAG_APP` stages it in
+    /// RAM; running it puts it in the flash region).
+    const APP_MAX_BYTES: usize = 0;
+
     /// `(used, free)` stack bytes reported by the `StackInfo` USART command.
     fn stack_info() -> (u32, u32) {
         (0, 0)
@@ -793,6 +803,24 @@ impl<P: PlatformRuntime> Runtime<P> {
                 } else {
                     protocol::send_error(&self.ctx.usart, protocol::ERR_TRANSFER_CRC)
                 }
+            }
+            RxEvent::FsWriteComplete if self.protocol.fs_app() => {
+                // An app package: installed under ferrite/apps/{id}/, the
+                // system image left as it is (and started again).
+                let image = self.protocol.take_app_image();
+                let r = if image.len() > P::APP_MAX_BYTES {
+                    Err(crate::apps::err::TOO_LARGE)
+                } else {
+                    crate::apps::install(P::app_files(), &image, P::FS_BASE, P::CAPS)
+                };
+                drop(image);
+                match r {
+                    Ok(_) => self.ack_chunk(),
+                    Err(code) => protocol::send_error(&self.ctx.usart, code),
+                }
+                self.ctx.usart.flush();
+                self.fs_old_cfg = None;
+                self.hot_swap();
             }
             RxEvent::FsWriteComplete => {
                 // Check the image before rebooting into it: on a bad

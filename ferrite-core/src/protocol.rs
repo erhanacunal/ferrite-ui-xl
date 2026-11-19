@@ -129,6 +129,11 @@ struct FsWriter {
     chunk_overflow: bool,
     /// A header was taken and the image isn't complete yet.
     active: bool,
+    /// `FS_FLAG_APP`: the image is an app package, kept in `staged` (not
+    /// written to flash) for `apps::install`; `FS_FLAG_RUN`: run it after.
+    app: bool,
+    run: bool,
+    staged: Vec<u8>,
 }
 
 /// WriteFs header: 8 bytes (plain) or 16 (flags + CRC).
@@ -142,6 +147,15 @@ pub const FS_FLAG_CRC: u32 = 1;
 pub const FS_FLAG_SEQ_ACK: u32 = 2;
 /// Largest chunk kept in RAM in CRC mode; longer = corrupted length.
 const MAX_CHUNK: usize = 64 * 1024;
+/// Header flags bit 2: an app package (ferrite-core `apps.rs`): staged in RAM
+/// and installed under `ferrite/apps/{id}/`, the system image untouched.
+/// Firmware that knows it echoes it in the FsCaps reply; older firmware
+/// doesn't, and the host must stop (it would write the system image).
+pub const FS_FLAG_APP: u32 = 4;
+/// Header flags bit 3 (with `FS_FLAG_APP`): run the app once installed.
+pub const FS_FLAG_RUN: u32 = 8;
+/// What the staging buffer reserves up front at most.
+const STAGE_RESERVE_MAX: usize = 64 << 20;
 
 /// What a finished WriteFs header or chunk turned out to be.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -173,6 +187,9 @@ impl FsWriter {
             in_chunk: false,
             chunk_overflow: false,
             active: false,
+            app: false,
+            run: false,
+            staged: Vec::new(),
         }
     }
 
@@ -218,6 +235,12 @@ impl FsWriter {
         self.total_size = word(0);
         self.crc_mode = crc_mode;
         self.seq_ack = crc_mode && flags & FS_FLAG_SEQ_ACK != 0;
+        self.app = flags & FS_FLAG_APP != 0;
+        self.run = self.app && flags & FS_FLAG_RUN != 0;
+        self.staged = Vec::new();
+        if self.app {
+            self.staged.reserve((self.total_size as usize).min(STAGE_RESERVE_MAX));
+        }
         self.next_seq = 0;
         self.in_chunk = false;
         self.addr = self.fs_base;
@@ -317,6 +340,12 @@ impl FsWriter {
 
     /// Erase sector and write the full 4KB buffer to flash.
     fn flush_sector<B: FlashBackend>(&mut self, flash: &FlashImpl<B>) {
+        if self.app {
+            self.staged.extend_from_slice(&self.buf[..FS_SECTOR_SIZE]);
+            self.addr += FS_SECTOR_SIZE as u32;
+            self.buf.drain(..FS_SECTOR_SIZE);
+            return;
+        }
         flash.erase_sector(self.addr);
         let mut offset: usize = 0;
         while offset < FS_SECTOR_SIZE {
@@ -332,6 +361,11 @@ impl FsWriter {
     fn flush<B: FlashBackend>(&mut self, flash: &FlashImpl<B>) {
         let len = self.buf.len();
         if len == 0 {
+            return;
+        }
+        if self.app {
+            self.staged.extend_from_slice(&self.buf);
+            self.buf.clear();
             return;
         }
 
@@ -470,7 +504,33 @@ impl Protocol {
         if self.fs_writer.seq_ack {
             f |= FS_FLAG_SEQ_ACK;
         }
+        if self.fs_writer.app {
+            f |= FS_FLAG_APP;
+        }
+        if self.fs_writer.run {
+            f |= FS_FLAG_RUN;
+        }
         f as u8
+    }
+
+    /// The last WriteFs header carried `FS_FLAG_APP` (and `FS_FLAG_RUN`).
+    pub fn fs_app(&self) -> bool {
+        self.fs_writer.app
+    }
+
+    pub fn fs_run(&self) -> bool {
+        self.fs_writer.run
+    }
+
+    /// The bytes of the WriteFs header (the image's announced size).
+    pub fn fs_total(&self) -> u32 {
+        self.fs_writer.total_size
+    }
+
+    /// The app package received (after `FsWriteComplete` with
+    /// [`fs_app`](Self::fs_app)), leaving the staging buffer empty.
+    pub fn take_app_image(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.fs_writer.staged)
     }
 
     /// FsAck contents: the next chunk seq expected, and the CRC of the last
@@ -1102,6 +1162,28 @@ mod writefs_crc_tests {
         assert_eq!(feed(&mut p, &f, &chunk(0, &img[..4096])), [RxEvent::FsChunkDone]);
         assert_eq!(feed(&mut p, &f, &chunk(1, &img[4096..])), [RxEvent::FsWriteComplete]);
         assert_eq!(stored(&f, img.len()), img);
+    }
+
+    #[test]
+    fn app_flag_stages_the_image_and_leaves_flash_alone() {
+        let (mut p, f, img) = (Protocol::new(BASE), flash(), image(4096 * 2 + 300));
+        let mut h = Vec::new();
+        h.extend_from_slice(&(img.len() as u32).to_le_bytes());
+        h.extend_from_slice(&4096u32.to_le_bytes());
+        h.extend_from_slice(&(FS_FLAG_CRC | FS_FLAG_SEQ_ACK | FS_FLAG_APP | FS_FLAG_RUN).to_le_bytes());
+        let c = crc32(&h);
+        h.extend_from_slice(&c.to_le_bytes());
+        assert_eq!(feed(&mut p, &f, &msg(0x22, &h)), [RxEvent::FsReady]);
+        assert!(p.fs_app() && p.fs_run());
+        assert_eq!(p.fs_caps() as u32 & (FS_FLAG_APP | FS_FLAG_RUN), FS_FLAG_APP | FS_FLAG_RUN);
+        assert_eq!(feed(&mut p, &f, &chunk(0, &img[..5000])), [RxEvent::FsChunkDone]);
+        assert_eq!(feed(&mut p, &f, &chunk(1, &img[5000..])), [RxEvent::FsWriteComplete]);
+        assert_eq!(p.take_app_image(), img);
+        assert_eq!(stored(&f, img.len()), vec_ff(img.len()));
+        // The next plain writefs goes to flash again.
+        assert_eq!(feed(&mut p, &f, &header(img.len() as u32, true)), [RxEvent::FsReady]);
+        assert!(!p.fs_app());
+        assert_eq!(p.fs_caps() as u32 & FS_FLAG_APP, 0);
     }
 
     #[test]

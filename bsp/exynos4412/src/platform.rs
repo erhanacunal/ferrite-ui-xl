@@ -159,6 +159,12 @@ impl PlatformRuntime for Exynos4412Platform {
     // Cortex-A9 at 1.4 GHz: long bursts per main-loop pass.
     const VM_STEPS_PER_TICK: u32 = 20_000;
     type Input = FullInput;
+    /// A package is staged in RAM, then (run) put into the flash region.
+    const APP_MAX_BYTES: usize = crate::flash::SIZE - Self::FS_BASE as usize;
+
+    fn app_files() -> &'static dyn ferrite_core::apps::AppFiles {
+        &crate::storage::BoardApps
+    }
 
     fn reset() -> ! {
         // A reply to a network client (bridge.rs: the pong of a writefs or a

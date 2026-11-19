@@ -9,6 +9,9 @@
 //! | `POST /flash` (or `/fs`, or `PUT`) | an FS image (or a whole `FLASH.BIN`): checked, saved as `FERRITE/FLASH.BIN`, then a restart |
 //! | `POST /save` (or `PUT`) | a firmware `.bin`: checked, saved as `FERRITE/FERRITE.BIN` (uart_boot's file, with its `EXYNBOOT` header), then a restart, so uart_boot boots it |
 //! | `POST /restart` | restarts the board |
+//! | `POST /api/apps` (or `PUT`) | an app package (ferrite-core `apps`, docs/apps.md): checked and installed under `ferrite/apps/{id}/`, no restart; JSON `{"id","name","version","entry","icon","caps","replaced"}`, or `{"code","error"}` with 400/404/413/500/503 |
+//! | `GET /api/apps` | JSON: `{"storage":bool,"apps":[{"id","name","version",...}]}` |
+//! | `DELETE /api/apps/{id}` | removes the app and its data |
 //! | `GET /api/wifi` | JSON: what the last scan saw of the configured network (BSSIDs, channels, their information elements as hex), the BSSID joined, the last RSN mismatch (diagnostics) |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU player off/on (`gpu_compose`; off: the CPU replays the lists), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?merge=0\|1` pieces merged into fewer draws / a draw per run of pieces; `?round_px=N` largest `ui_round` box drawn as four quarters (0 = always nine pieces); `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`); `?direct=0\|1` GPU player frames straight into the back scan buffer / into the shadow (`lcd::DIRECT`); `?boxes=1..4` damage boxes (`lcd::region::BOXES`); `?layer_compose=0\|1` mode 3 composes layers on the GPU / draws them in the tree (`render::AREAS_COMPOSE`) |
@@ -187,6 +190,18 @@ Connection: close
     socket.flush().await
 }
 
+/// An HTTP status line for the codes the app API answers.
+fn status_line(code: &str) -> &'static str {
+    match code {
+        "200" => "200 OK",
+        "400" => "400 Bad Request",
+        "404" => "404 Not Found",
+        "413" => "413 Content Too Large",
+        "503" => "503 Service Unavailable",
+        _ => "500 Internal Server Error",
+    }
+}
+
 async fn text(socket: &mut TcpSocket<'_>, status: &str, body: &str) -> TcpResult<()> {
     answer(socket, status, "text/plain", body.as_bytes()).await
 }
@@ -268,6 +283,28 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
             let early = &request[head_end..filled];
             upload(socket, super::Upload::System(name, len as u8), length, want, expect, early).await?;
+        }
+        (b"POST" | b"PUT", b"/api/apps") => {
+            let length = header(head, b"content-length").and_then(parse_decimal);
+            let want = header(head, b"x-crc32").and_then(parse_hex);
+            let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
+            let early = &request[head_end..filled];
+            upload(socket, super::Upload::App, length, want, expect, early).await?;
+        }
+        (b"GET", b"/api/apps") => match super::storage_request(super::STORAGE_APPS, 10).await {
+            Some((_, t)) => json(socket, "200 OK", &t).await?,
+            None => text(socket, "503 Service Unavailable", "No answer from the UI core\n").await?,
+        },
+        (b"DELETE", _) if path.starts_with(b"/api/apps/") => {
+            let id = core::str::from_utf8(&path[b"/api/apps/".len()..]).unwrap_or("");
+            match super::storage_request_with(super::STORAGE_APP_REMOVE, id, 30).await {
+                Some((true, t)) => json(socket, "200 OK", &t).await?,
+                Some((false, t)) => {
+                    let (code, body) = t.split_once(' ').unwrap_or(("500", &t));
+                    json(socket, status_line(code), body).await?
+                }
+                None => text(socket, "503 Service Unavailable", "No answer from the UI core\n").await?,
+            }
         }
         (b"GET", b"/api/storage") => match super::storage_request(super::STORAGE_STATUS, 3).await {
             Some((_, t)) => text(socket, "200 OK", &t).await?,
@@ -1344,6 +1381,7 @@ async fn upload(
         super::Upload::Fs => (16, crate::flash::SIZE),
         super::Upload::Firmware => (16, FIRMWARE_MAX),
         super::Upload::System(..) => (1, SYSTEM_MAX),
+        super::Upload::App => (16, crate::flash::SIZE),
     };
     if !(min..=max).contains(&length) {
         return text(socket, "413 Content Too Large", "16 B .. 64 MiB (SYSTEM/ files: 1 B .. 4 MiB)\n").await;
@@ -1402,12 +1440,16 @@ async fn upload(
         Timer::after(Duration::from_millis(10)).await;
     };
     let result = match status {
+        super::FLASH_KEPT | super::FLASH_APP_ERROR if kind == super::Upload::App => {
+            let (code, body) = super::app_answer();
+            json(socket, status_line(&alloc::format!("{}", code)), &body).await
+        }
         super::FLASH_KEPT => text(socket, "200 OK", "CRC OK, saved in SYSTEM/; it counts from the next start\n").await,
         super::FLASH_SAVED => {
             let answer = match kind {
                 super::Upload::Fs => "CRC OK, saved FERRITE/FLASH.BIN; restarting\n",
                 super::Upload::Firmware => "CRC OK, saved FERRITE/FERRITE.BIN; restarting into it\n",
-                super::Upload::System(..) => "CRC OK, saved in SYSTEM/\n",
+                super::Upload::System(..) | super::Upload::App => "CRC OK, saved in SYSTEM/\n",
             };
             text(socket, "200 OK", answer).await
         }

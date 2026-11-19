@@ -45,9 +45,11 @@ mod http;
 mod ntp;
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
+use core::fmt::Write as _;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
@@ -916,6 +918,9 @@ pub enum Upload {
     /// `POST /api/system?name=`: a file for `SYSTEM/` (its checked 8.3 name and length),
     /// saved without a restart.
     System([u8; 12], u8),
+    /// `POST /api/apps`: an app package (ferrite-core `apps`), installed under
+    /// `ferrite/apps/{id}/` without a restart; the answer is JSON ([`app_answer`]).
+    App,
 }
 
 impl Upload {
@@ -924,6 +929,7 @@ impl Upload {
             Upload::Fs => "flash",
             Upload::Firmware => "firmware",
             Upload::System(..) => "system",
+            Upload::App => "app",
         }
     }
 }
@@ -943,6 +949,78 @@ pub const FLASH_NO_STORAGE: u8 = 5;
 pub const FLASH_SAVE_FAILED: u8 = 6;
 /// Saved, and no restart follows (a `SYSTEM/` file).
 pub const FLASH_KEPT: u8 = 7;
+/// An app upload or request failed: the JSON in [`APP_ANSWER`] says why.
+pub const FLASH_APP_ERROR: u8 = 8;
+/// The JSON answer to the last app upload (`FLASH_KEPT` or `FLASH_APP_ERROR`).
+static APP_ANSWER: CriticalSectionMutex<RefCell<Option<(u16, String)>>> = CriticalSectionMutex::new(RefCell::new(None));
+
+/// CPU3: the HTTP status code and JSON body of the last app upload.
+pub(crate) fn app_answer() -> (u16, String) {
+    APP_ANSWER.lock(|a| a.borrow_mut().take()).unwrap_or((500, String::from("{\"error\":\"no answer\"}")))
+}
+
+/// `s` as a JSON string literal.
+pub(crate) fn json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// An app error as (HTTP status, JSON).
+fn app_error(code: u8) -> (u16, String) {
+    use ferrite_core::apps::err;
+    let status = match code {
+        err::NO_STORAGE => 503,
+        err::WRITE => 500,
+        err::NOT_INSTALLED => 404,
+        err::TOO_LARGE => 413,
+        _ => 400,
+    };
+    (status, format!("{{\"code\":{},\"error\":{}}}", code, json_str(err::text(code))))
+}
+
+fn app_json(info: &ferrite_core::apps::AppInfo) -> String {
+    format!(
+        "{{\"id\":{},\"name\":{},\"version\":{},\"entry\":{},\"icon\":{},\"caps\":{}}}",
+        json_str(&info.id),
+        json_str(&info.name),
+        json_str(&info.version_text()),
+        json_str(&info.entry),
+        json_str(&info.icon),
+        info.caps
+    )
+}
+
+/// CPU0: installs an uploaded app package (`apps::install`); the answer goes to [`APP_ANSWER`].
+fn install_app(image: Vec<u8>) -> u8 {
+    use ferrite_core::platform::Platform;
+    type P = crate::platform::Exynos4412Platform;
+    let r = ferrite_core::apps::install(&crate::storage::BoardApps, &image, P::FS_BASE, P::CAPS);
+    let (status, answer) = match r {
+        Ok(done) => {
+            println!("ferrite: app {} {} installed", done.info.id, done.info.version_text());
+            let body = app_json(&done.info);
+            (200, format!("{},\"replaced\":{}}}", &body[..body.len() - 1], done.replaced))
+        }
+        Err(code) => {
+            println!("ferrite: app install failed: {}", ferrite_core::apps::err::text(code));
+            app_error(code)
+        }
+    };
+    APP_ANSWER.lock(|a| *a.borrow_mut() = Some((status, answer)));
+    if status == 200 { FLASH_KEPT } else { FLASH_APP_ERROR }
+}
+
 /// The HTTP answer has gone out: CPU0 may restart.
 static ANSWERED: AtomicBool = AtomicBool::new(false);
 /// `POST /restart` (set after its answer has gone out).
@@ -1084,11 +1162,23 @@ pub const STORAGE_STRESS_ON: u8 = 3;
 pub const STORAGE_STRESS_OFF: u8 = 4;
 pub const STORAGE_CHECK: u8 = 5;
 pub const STORAGE_CUT: u8 = 6;
+/// `GET /api/apps`: the installed apps as JSON.
+pub const STORAGE_APPS: u8 = 7;
+/// `DELETE /api/apps/{id}`: [`STORAGE_ARG`] is the id.
+pub const STORAGE_APP_REMOVE: u8 = 8;
+/// A request's argument (an app id), set before [`STORAGE_WANTED`].
+static STORAGE_ARG: CriticalSectionMutex<RefCell<String>> = CriticalSectionMutex::new(RefCell::new(String::new()));
 static STORAGE_TEXT: CriticalSectionMutex<RefCell<Option<(bool, String)>>> = CriticalSectionMutex::new(RefCell::new(None));
 
 /// CPU3: asks CPU0 for `what` (`STORAGE_STATUS` or `STORAGE_MIGRATE`); None when it does not
 /// answer within `secs`.
 pub async fn storage_request(what: u8, secs: u64) -> Option<(bool, String)> {
+    storage_request_with(what, "", secs).await
+}
+
+/// [`storage_request`] with an argument ([`STORAGE_ARG`]).
+pub async fn storage_request_with(what: u8, arg: &str, secs: u64) -> Option<(bool, String)> {
+    STORAGE_ARG.lock(|a| *a.borrow_mut() = String::from(arg));
     STORAGE_TEXT.lock(|t| *t.borrow_mut() = None);
     STORAGE_WANTED.store(what, Ordering::Release);
     let start = Instant::now();
@@ -1126,6 +1216,26 @@ fn storage_service() {
             Ok(t) => (true, t),
             Err(t) => (false, t),
         },
+        STORAGE_APPS => {
+            use ferrite_core::apps::AppFiles;
+            let apps = ferrite_core::apps::list(&crate::storage::BoardApps);
+            let items: Vec<String> = apps.iter().map(app_json).collect();
+            let available = crate::storage::BoardApps.available();
+            (true, format!("{{\"storage\":{},\"apps\":[{}]}}", available, items.join(",")))
+        }
+        STORAGE_APP_REMOVE => {
+            let id = STORAGE_ARG.lock(|a| a.borrow().clone());
+            match ferrite_core::apps::remove(&crate::storage::BoardApps, &id) {
+                Ok(()) => {
+                    println!("ferrite: app {} removed", id);
+                    (true, format!("{{\"removed\":{}}}", json_str(&id)))
+                }
+                Err(code) => {
+                    let (status, body) = app_error(code);
+                    (false, format!("{} {}", status, body))
+                }
+            }
+        }
         _ => return,
     };
     STORAGE_TEXT.lock(|t| *t.borrow_mut() = Some(answer));
@@ -1186,6 +1296,7 @@ pub fn service(screen_ok: bool) {
         let len = image.len();
         let status = match kind {
             Upload::Fs => install(image),
+            Upload::App => install_app(image),
             Upload::Firmware => install_firmware(image, crc),
             Upload::System(name, len) => {
                 let name = core::str::from_utf8(&name[..usize::from(len)]).unwrap_or("");

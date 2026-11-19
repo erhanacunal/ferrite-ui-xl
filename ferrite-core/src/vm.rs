@@ -34,6 +34,7 @@ use crate::widget::{
     WValue, WidgetId,
 };
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::syscfg::try_alloc_slice;
@@ -59,6 +60,9 @@ macro_rules! canvas {
 
 /// Threaded dispatch of `tick`'s bursts (vm/tc.rs).
 mod tc;
+/// Code units: a program's libraries (vm/units.rs).
+mod units;
+pub use units::{LibExport, LibImage, LibImport, LibTables, MAX_LIBS};
 
 /// `tick` runs through `tc` (false: the `exec_one` loop, the reference).
 const THREADED: bool = true;
@@ -75,11 +79,25 @@ const TC_PAD: u8 = 0xFF;
 
 /// The program's bytecode. Always in RAM: XL has no execution from flash
 /// (programs are megabytes at most; the heap holds them). `buf` holds the
-/// `len` code bytes, then `CODE_PAD` bytes of `TC_PAD`.
-#[derive(Default)]
+/// `len` code bytes, then `CODE_PAD` bytes of `TC_PAD`. Shared: a library's
+/// code is one buffer for every task that imports it (`vm/units.rs`); `ptr`
+/// caches its start, so a jump reads one field as before.
+#[derive(Clone)]
 pub struct VmCode {
-    buf: Vec<u8>,
+    buf: Arc<Vec<u8>>,
+    ptr: *const u8,
     len: usize,
+}
+
+// SAFETY: `ptr` points into `buf`, which never changes after `new` and lives
+// as long as any clone.
+unsafe impl Send for VmCode {}
+unsafe impl Sync for VmCode {}
+
+impl Default for VmCode {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl VmCode {
@@ -87,7 +105,9 @@ impl VmCode {
     pub fn new(mut buf: Vec<u8>) -> Self {
         let len = buf.len();
         buf.resize(len + CODE_PAD, TC_PAD);
-        Self { buf, len }
+        let buf = Arc::new(buf);
+        let ptr = buf.as_ptr();
+        Self { buf, ptr, len }
     }
 
     #[inline]
@@ -98,14 +118,14 @@ impl VmCode {
     /// The code bytes (without the pad).
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
-        // SAFETY: len <= buf.len() (new).
-        unsafe { self.buf.get_unchecked(..self.len) }
+        // SAFETY: `ptr` is `buf`'s start and len <= buf.len() (new).
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     /// Start of the buffer (code, then the pad).
     #[inline(always)]
     pub(crate) fn ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
+        self.ptr
     }
 
     /// The byte at `pos`, 0 past the end.
@@ -206,6 +226,10 @@ const IMAGE_HEADER_SIZE_V3: usize = 7;
 const IMAGE_HEADER_SIZE_V4: usize = 9;
 /// v5: + var_slots(u16): the globals + deepest locals the program needs.
 const IMAGE_HEADER_SIZE_V5: usize = 11;
+/// v6 (libraries): v5 + lib_count(1) + import_count(2) + export_count(2) + call_depth(1).
+const IMAGE_HEADER_SIZE_V6: usize = 17;
+/// Image header flags bit 4: a library (ferrite-ui ferrite_cc.py IMAGE_FLAG_LIBRARY).
+pub(crate) const IMAGE_FLAG_LIBRARY: u16 = 0x10;
 /// Each function entry: func_id(2) + kind(1) + pad(1) + offset(4) + length(4) = 12 bytes.
 const FUNC_ENTRY_SIZE: usize = 12;
 /// Image header flags bit 2: JMP/JZ/JNZ/CALL targets are u32 LE instead of u16.
@@ -310,6 +334,8 @@ const OP_ADD_VI: u8 = 0x4B; // + u8 slot + i16: var += imm (no stack)
 const OP_ARR_LOAD_V: u8 = 0x4C; // + u8 slot: pop index, push array(var)[index]
 const OP_STORE_OP: u8 = 0x4D; // + u8 op + u8 slot: pop b; var = var <op> b
 const OP_FRAME_A: u8 = 0x4E; // + u8 local_count + u8 nargs: FRAME, then pop the args into locals nargs-1..0
+const OP_CALL_IMP: u8 = 0x4F; // + u16 import: call an imported library function (vm/units.rs)
+const OP_FN_REF: u8 = 0x50; // + u16 func_id: push it tagged with the running unit
 
 /// The integer binary ops (and comparisons, as 0/1) by opcode, as the plain
 /// opcodes compute them. None = not a binary op.
@@ -518,6 +544,11 @@ pub mod fault {
     /// the image header's `var_slots`: calls nested deeper than the compiler
     /// planned for).
     pub const VARS_FULL: u8 = 18;
+    /// A library the program calls is not installed (in that major version).
+    pub const LIB_MISSING: u8 = 19;
+    /// An installed library lacks a function the program calls, or its
+    /// arguments / return kind differ.
+    pub const LIB_MISMATCH: u8 = 20;
 
     /// Short human-readable name for the error screen.
     pub fn name(code: u8) -> &'static [u8] {
@@ -540,6 +571,8 @@ pub mod fault {
             EEPROM => b"eeprom error",
             ARR_ALLOC => b"pool full: array",
             VARS_FULL => b"variable slots full",
+            LIB_MISSING => b"library missing",
+            LIB_MISMATCH => b"library mismatch",
             _ => b"unknown fault",
         }
     }
@@ -796,7 +829,23 @@ pub struct Vm {
     // one instruction (ldrh only 0..255) and a slot sum needs no masking.
     frame_base: u32,
     frame_size: u8,
-    global_count: u8,
+    // Slots before the locals: the program's globals, then its libraries'.
+    global_count: u32,
+    // Code units (vm/units.rs): empty without libraries; else unit 0 is the
+    // program, 1.. its libraries, the running one's code and functions in
+    // `code` / `functions` (its slot here parked empty). `utag` = unit << 24,
+    // the tag on code addresses saved across units; `gbase` its first global.
+    units: Vec<units::Unit>,
+    unit: u8,
+    utag: u32,
+    gbase: u32,
+    // CALL_IMP index -> tagged entry address.
+    links: Vec<CodeAddr>,
+    // The configured call-stack depth (`link` grows it for libraries).
+    call_base: u8,
+    /// A loaded program's library tables (image v6), until the runtime links
+    /// it (`Vm::link`).
+    pub lib_tables: Option<Box<LibTables>>,
     // Slots the program's globals and locals may use (image header v5, or
     // LEGACY_VAR_SLOTS): FRAME faults past it.
     var_slots: u32,
@@ -900,6 +949,13 @@ impl Vm {
             frame_base: 0,
             frame_size: 0,
             global_count: 0,
+            units: Vec::new(),
+            unit: 0,
+            utag: 0,
+            gbase: 0,
+            links: Vec::new(),
+            call_base: CALL_STACK_SIZE as u8,
+            lib_tables: None,
             var_slots: LEGACY_VAR_SLOTS as u32,
             wide_addr: false,
             portrait: false,
@@ -940,7 +996,8 @@ impl Vm {
             Some(b) => self.stack = b,
             None => ok = false,
         }
-        match try_alloc_slice(depth(call, CALL_STACK_SIZE, 1), EMPTY_FRAME) {
+        self.call_base = depth(call, CALL_STACK_SIZE, 1) as u8;
+        match try_alloc_slice(self.call_base as usize, EMPTY_FRAME) {
             Some(b) => self.call_stack = b,
             None => ok = false,
         }
@@ -988,7 +1045,7 @@ impl Vm {
         if slot & 0x80 != 0 {
             self.frame_base + (slot & 0x7F) as u32
         } else {
-            slot as u32
+            self.gbase + slot as u32
         }
     }
 
@@ -1039,8 +1096,10 @@ impl Vm {
     /// place, so loading needs no second copy of the program. On failure the
     /// buffer comes back unchanged.
     pub fn load_ram_owned(&mut self, mut image: Vec<u8>) -> Result<(), Vec<u8>> {
-        if let Some((funcs, opcode_start, gc, hint, wide, portrait, slots)) = parse_image_header(&image) {
-            if !code_addressable(wide, image.len() - opcode_start) {
+        if let Some(h) = parse_image_header(&image) {
+            let ImageHeader { functions: funcs, opcode_start, global_count: gc, tree_hint: hint, wide, portrait, var_slots: slots, libs } = h;
+            // A library runs only as a program's import.
+            if !code_addressable(wide, image.len() - opcode_start) || libs.as_ref().is_some_and(|l| l.library) {
                 return Err(image);
             }
             let slots = slots.unwrap_or(LEGACY_VAR_SLOTS).max(gc as u16);
@@ -1049,10 +1108,13 @@ impl Vm {
             }
             image.drain(..opcode_start);
             let opcodes = image;
+            // Back in the program's unit before its code is replaced.
+            self.clear_units();
             self.wide_addr = wide;
             self.code = VmCode::new(opcodes);
             self.functions = funcs;
-            self.global_count = gc;
+            self.global_count = gc as u32;
+            self.lib_tables = libs.filter(|l| !l.libs.is_empty());
             // No frame of other code survives (it could sit past the new
             // `var_slots`).
             self.call_sp = 0;
@@ -1075,6 +1137,7 @@ impl Vm {
             self.cb_frames.clear();
             self.frame_size = 0;
         }
+        self.clear_units();
         self.code = VmCode::new(data);
         self.tree_hint = None;
         self.wide_addr = false;
@@ -1083,14 +1146,20 @@ impl Vm {
 
     // === Function table lookup ===
 
-    /// Find a function by kind. Returns the first match.
+    /// The program's function of `kind` (its first; never a library's: their
+    /// dispatchers come through `dispatchers`).
     pub fn find_by_kind(&self, kind: FunctionKind) -> Option<&FuncEntry> {
-        self.functions.iter().find(|f| f.kind as u8 == kind as u8)
+        self.funcs_of(0)?.iter().find(|f| f.kind as u8 == kind as u8)
     }
 
-    /// Find a function by func_id (for widget on_click/on_tap/on_paint callbacks).
-    pub fn find_func(&self, func_id: u16) -> Option<&FuncEntry> {
-        self.functions.iter().find(|f| f.func_id == func_id)
+    /// The entry address of function `func_id` as `@fn` / `FN_REF` gave it
+    /// (a library's tagged with its unit, `unit << 12 | id`), tagged with its
+    /// unit for `enqueue_callback` / `call_now`.
+    pub fn func_addr(&self, func_id: u16) -> Option<CodeAddr> {
+        let unit = (func_id >> 12) as u8;
+        let id = func_id & 0x0FFF;
+        let f = self.funcs_of(unit)?.iter().find(|f| f.func_id == id)?;
+        Some(f.offset as CodeAddr | (unit as CodeAddr) << 24)
     }
 
     // === Callback queue ===
@@ -1252,7 +1321,7 @@ impl Vm {
                 f.state = VmState::Running;
             }
             None => {
-                self.pc = offset;
+                self.goto(offset);
                 self.state = VmState::Running;
             }
         }
@@ -1273,10 +1342,11 @@ impl Vm {
         {
             return;
         }
-        let offset = match self.find_by_kind(FunctionKind::OnPaint) {
-            Some(e) => e.offset as CodeAddr,
-            None => return,
-        };
+        let mut offsets = [0; MAX_LIBS + 1];
+        let units = self.handlers(FunctionKind::OnPaint, &mut offsets);
+        if units == 0 {
+            return;
+        }
         let mut ids = [0i32; render::PAINT_MAX];
         let mut n = 0;
         for &id in paint.ids() {
@@ -1292,7 +1362,7 @@ impl Vm {
         // (`render::draw_paint`): handed to the render side with a render
         // context (`render::run_job`), else kept here.
         let direct = !render::records(ctx);
-        self.record_paint(ctx, offset, &ids[..n], direct);
+        self.record_paint(ctx, &offsets[..units], &ids[..n], direct);
     }
 
     /// Run the `on_paint` dispatcher once per widget with the drawing
@@ -1301,7 +1371,7 @@ impl Vm {
     /// queue it for the render side (`view::Draw::Paint`). The render draws
     /// it with the widget (`render::draw_paint`), so `on_paint` runs before
     /// the render that shows it.
-    fn record_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, offset: CodeAddr, ids: &[i32], direct: bool) {
+    fn record_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, offsets: &[CodeAddr], ids: &[i32], direct: bool) {
         if !direct {
             // Direct drawing before it stays before it.
             ctx.objs.close_screen_rec();
@@ -1317,7 +1387,10 @@ impl Vm {
             let recording = state.paint_rec.begin(&ctx.lcd);
             state.painting.set(recording);
             self.in_paint = true;
-            self.call_now(offset, &[arr_id as i32], ctx);
+            // Each unit's dispatcher (a library paints its own widgets).
+            for &offset in offsets {
+                self.call_now(offset, &[arr_id as i32], ctx);
+            }
             self.in_paint = false;
             ctx.objs.arr_free(arr_id);
             let state = &ctx.objs.render;
@@ -1472,8 +1545,8 @@ impl Vm {
         }
 
         // Resolve builder function id → entry offset.
-        let builder_offset = match self.find_func(builder_fn) {
-            Some(f) => f.offset as CodeAddr,
+        let builder_offset = match self.func_addr(builder_fn) {
+            Some(a) => a,
             None => {
                 // Bad fn id; emulate Cancel rather than VM error so the user
                 // program keeps running.
@@ -1491,14 +1564,14 @@ impl Vm {
         // jump to builder. The builder runs as a normal function call; its
         // OP_RET will eventually pop this frame back into the post-showModal pc.
         self.call_stack[self.call_sp as usize] = CallFrame {
-            ret_addr: self.pc,
+            ret_addr: self.pc | self.utag,
             frame_base: self.frame_base as u16,
             frame_size: self.frame_size,
         };
         self.call_sp += 1;
         self.frame_base += self.frame_size as u32;
         self.frame_size = 0;
-        self.pc = builder_offset;
+        self.goto(builder_offset);
 
         self.modal_stack.push(ModalFrame {
             overlay_id: WidgetId::NONE,
@@ -1608,7 +1681,7 @@ impl Vm {
             return false;
         }
         self.cb_frames.push(CbFrame {
-            pc: self.pc,
+            pc: self.pc | self.utag,
             sp: self.sp,
             sp_floor: self.sp_floor,
             call_sp: self.call_sp,
@@ -1621,7 +1694,7 @@ impl Vm {
             gesture: self.gesture_cur,
         });
         self.sp_floor = self.sp;
-        self.pc = offset;
+        self.goto(offset);
         self.target = WidgetId::NONE;
         self.state = VmState::Running;
         self.critical = false;
@@ -1634,7 +1707,7 @@ impl Vm {
         // Clamp to at least global_count so the very first callback (setup)
         // doesn't collide with the globals when frame_base is still 0.
         let above = self.frame_base + self.frame_size as u32;
-        self.frame_base = above.max(self.global_count as u32);
+        self.frame_base = above.max(self.global_count);
         self.frame_size = 0;
         true
     }
@@ -1644,7 +1717,7 @@ impl Vm {
     /// interrupted, in the state it was in.
     fn leave_callback(&mut self) {
         if let Some(f) = self.cb_frames.pop() {
-            self.pc = f.pc;
+            self.goto(f.pc);
             self.sp = f.sp;
             self.sp_floor = f.sp_floor;
             self.call_sp = f.call_sp;
@@ -1711,9 +1784,16 @@ impl Vm {
     fn fail(&mut self, code: u8) {
         if self.state != VmState::Error {
             self.fault = code;
-            self.fault_pc = self.op_pc;
+            self.fault_pc = self.op_pc | self.utag;
         }
         self.state = VmState::Error;
+    }
+
+    /// Fault the VM now (not at an instruction: a program that could not
+    /// be linked).
+    pub fn fault_now(&mut self, code: u8) {
+        self.op_pc = 0;
+        self.fail(code);
     }
 
     pub fn is_critical(&self) -> bool {
@@ -1745,6 +1825,8 @@ impl Vm {
         self.fault = fault::NONE;
         self.vars.fill(0);
         self.wait_until = 0;
+        self.clear_units();
+        self.lib_tables = None;
         self.code = VmCode::default();
         self.functions.clear();
         self.cb_frames.clear();
@@ -1993,7 +2075,7 @@ impl Vm {
                 } else if self.call_sp > 0 {
                     self.call_sp -= 1;
                     let frame = self.call_stack[self.call_sp as usize];
-                    self.pc = frame.ret_addr;
+                    self.goto(frame.ret_addr);
                     self.frame_base = frame.frame_base as u32;
                     self.frame_size = frame.frame_size;
 
@@ -2176,7 +2258,7 @@ impl Vm {
                 let target = self.read_addr();
                 if (self.call_sp as usize) < self.call_stack.len() {
                     self.call_stack[self.call_sp as usize] = CallFrame {
-                        ret_addr: self.pc,
+                        ret_addr: self.pc | self.utag,
                         frame_base: self.frame_base as u16,
                         frame_size: self.frame_size,
                     };
@@ -2963,6 +3045,28 @@ impl Vm {
                     }
                 }
             }
+            OP_CALL_IMP => {
+                let i = self.read_u16() as usize;
+                match self.links.get(i).copied() {
+                    Some(target) if (self.call_sp as usize) < self.call_stack.len() => {
+                        self.call_stack[self.call_sp as usize] = CallFrame {
+                            ret_addr: self.pc | self.utag,
+                            frame_base: self.frame_base as u16,
+                            frame_size: self.frame_size,
+                        };
+                        self.call_sp += 1;
+                        self.frame_base += self.frame_size as u32;
+                        self.frame_size = 0;
+                        self.goto(target);
+                    }
+                    Some(_) => self.fail(fault::CALL_OVERFLOW),
+                    None => self.fail(fault::BAD_OPERAND),
+                }
+            }
+            OP_FN_REF => {
+                let id = self.read_u16();
+                self.push(((self.unit as i32) << 12) | (id & 0x0FFF) as i32);
+            }
             OP_FRAME_A => {
                 // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
                 let [count, nargs] = self.fetch();
@@ -3709,8 +3813,7 @@ impl Vm {
                     // the widget-callback path. Scope the immutable borrow so
                     // the mutable enqueue can follow.
                     if a.on_end != 0 {
-                        let off = self.find_func(a.on_end).map(|f| f.offset as CodeAddr);
-                        if let Some(off) = off {
+                        if let Some(off) = self.func_addr(a.on_end) {
                             self.enqueue_callback(off, &[a.target.0 as i32, a.prop_id as i32]);
                         }
                     }
@@ -4085,15 +4188,26 @@ impl Vm {
 ///   flags bit 2: wide_addr (jump/call targets are u32)
 ///   flags bit 3: portrait (screen rotated 90°)
 #[allow(clippy::type_complexity)]
-fn parse_image_header(
-    data: &[u8],
-) -> Option<(Vec<FuncEntry>, usize, u8, Option<(u8, u8)>, bool, bool, Option<u16>)> {
+/// A parsed image header (`parse_image_header`).
+struct ImageHeader {
+    functions: Vec<FuncEntry>,
+    opcode_start: usize,
+    global_count: u8,
+    tree_hint: Option<(u8, u8)>,
+    wide: bool,
+    portrait: bool,
+    var_slots: Option<u16>,
+    /// v6: the library tables.
+    libs: Option<Box<LibTables>>,
+}
+
+fn parse_image_header(data: &[u8]) -> Option<ImageHeader> {
     if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
 
     let version = data[0];
-    if version < 1 || version > 5 {
+    if version < 1 || version > 6 {
         return None;
     }
 
@@ -4107,6 +4221,7 @@ fn parse_image_header(
 
     // v3+: flags field after global_count; v4 adds widget/ext counts.
     let header_size = match version {
+        6 => IMAGE_HEADER_SIZE_V6,
         5 => IMAGE_HEADER_SIZE_V5,
         4 => IMAGE_HEADER_SIZE_V4,
         3 => IMAGE_HEADER_SIZE_V3,
@@ -4126,15 +4241,21 @@ fn parse_image_header(
     let var_slots = if version >= 5 { Some(u16::from_le_bytes([data[9], data[10]])) } else { None };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
-    let opcode_start = header_size + table_size;
+    let funcs_end = header_size + table_size;
 
-    if data.len() < opcode_start {
+    if data.len() < funcs_end {
         return None;
     }
+    let (libs, opcode_start) = if version >= 6 {
+        let (t, end) = units::parse_tables(data, funcs_end, flags & IMAGE_FLAG_LIBRARY != 0)?;
+        (Some(Box::new(t)), end)
+    } else {
+        (None, funcs_end)
+    };
 
     let mut functions = Vec::with_capacity(func_count);
     // Fixed-size chunks: the field reads below need no bounds checks.
-    for e in data[header_size..opcode_start].chunks_exact(FUNC_ENTRY_SIZE) {
+    for e in data[header_size..funcs_end].chunks_exact(FUNC_ENTRY_SIZE) {
         let func_id = u16::from_le_bytes([e[0], e[1]]);
         let kind_byte = e[2];
         // e[3] = pad
@@ -4151,15 +4272,7 @@ fn parse_image_header(
         });
     }
 
-    Some((
-        functions,
-        opcode_start,
-        global_count,
-        tree_hint,
-        wide,
-        portrait,
-        var_slots,
-    ))
+    Some(ImageHeader { functions, opcode_start, global_count, tree_hint, wide, portrait, var_slots, libs })
 }
 
 /// Whether this build can address an image's bytecode: every offset in
@@ -5944,7 +6057,7 @@ mod anim_tests {
         let mut vm = Vm::new();
         assert!(vm.load_ram(&img));
         assert_eq!(vm.functions.len(), FUNCS as usize);
-        assert_eq!(vm.find_func(FUNCS).map(|f| f.offset), Some(FUNCS as u32 - 1));
+        assert_eq!(vm.func_addr(FUNCS), Some(FUNCS as u32 - 1));
         assert_eq!(vm.code.len(), code.len());
     }
 

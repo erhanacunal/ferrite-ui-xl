@@ -58,6 +58,12 @@ pub mod err {
     pub const TOO_LARGE: u8 = 19;
     /// Four apps already run (`domain::MAX_APPS`).
     pub const LIMIT: u8 = 20;
+    /// A library the program calls is not installed in that major version
+    /// (also: a library package's install target, `libs.rs`).
+    pub const LIB_MISSING: u8 = 21;
+    /// An installed library lacks a function the program calls, or its
+    /// arguments / return kind differ.
+    pub const LIB_MISMATCH: u8 = 22;
 
     /// For logs and the HTTP API.
     pub fn text(code: u8) -> &'static str {
@@ -72,6 +78,8 @@ pub mod err {
             NO_ENTRY => "the entry program is not in the image",
             TOO_LARGE => "package too large",
             LIMIT => "four apps already run",
+            LIB_MISSING => "a library it calls is not installed",
+            LIB_MISMATCH => "an installed library does not match",
             _ => "app error",
         }
     }
@@ -123,7 +131,12 @@ fn text_field(b: &[u8]) -> Option<String> {
 
 /// Parses a manifest record (108 bytes, ferrite_build `build_appinfo`).
 pub fn parse_appinfo(rec: &[u8]) -> Result<AppInfo, u8> {
-    if rec.len() < APPINFO_SIZE || &rec[..2] != APPINFO_MAGIC || rec[2] != APPINFO_VERSION {
+    parse_manifest(rec, APPINFO_MAGIC)
+}
+
+/// [`parse_appinfo`] with another magic (a library's `libinfo`: "LI").
+pub(crate) fn parse_manifest(rec: &[u8], magic: &[u8; 2]) -> Result<AppInfo, u8> {
+    if rec.len() < APPINFO_SIZE || &rec[..2] != magic || rec[2] != APPINFO_VERSION {
         return Err(err::NO_APPINFO);
     }
     let n = rec[3] as usize;
@@ -292,6 +305,11 @@ pub fn remove(files: &dyn AppFiles, id: &str) -> Result<(), u8> {
         return Err(err::NOT_INSTALLED);
     }
     changed();
+    remove_tree(files, dir)
+}
+
+/// Deletes directory `dir` with everything in it, then commits.
+pub(crate) fn remove_tree(files: &dyn AppFiles, dir: String) -> Result<(), u8> {
     // Depth first without recursion: a directory is removed once a pass
     // finds it empty.
     let mut stack = alloc::vec![dir];

@@ -1,0 +1,31 @@
+// Calls the test library (util.fl); results in r, the first global.
+#include "core.fl"
+
+var r[12];
+var b;
+var own;
+var total = 1000;   // the program's own, apart from the library's
+
+fn own_clicked(w) { r[7] = r[7] + 1; }
+fn mine(k) { return k + r[0]; }
+
+fn setup() {
+    r[0] = add(1, 2);           // helper(1) + 2 = 4; library total 5 + 3 = 8
+    bump();                     // 9
+    r[1] = get_total();         // 9
+    var f = scale(2);           // 3.0 (int argument converted)
+    if (f > 2.9 && f < 3.1) { r[2] = 1; }
+    b = make_button(10, 20);
+    r[3] = b;
+    r[4] = mine(3);             // 7: the program's code and globals after library calls
+    r[5] = total;               // 1000
+    own = alloc();
+    target(own);
+    set(size, 100, 50);
+    set(clickable, 1);
+    parent(0);
+    target(own);
+    set(on_click, @own_clicked);
+}
+
+fn loop() { r[6] = get_total(); }

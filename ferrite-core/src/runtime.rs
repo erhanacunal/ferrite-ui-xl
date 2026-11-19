@@ -335,7 +335,7 @@ impl Tasks {
             return;
         }
         if let Some(click_fn) = vm.modal_overlay_click_fn(id) {
-            if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as CodeAddr) {
+            if let Some(off) = vm.func_addr(click_fn) {
                 vm.enqueue_callback(off, &[id.0 as i32]);
             }
         } else {
@@ -358,13 +358,13 @@ fn send_kind(vm: &mut Vm, kind: FunctionKind, args: &[i32]) -> bool {
     if !vm.has_code() {
         return false;
     }
-    match vm.find_by_kind(kind).map(|e| e.offset as CodeAddr) {
-        Some(off) => {
-            vm.enqueue_callback(off, args);
-            true
-        }
-        None => false,
+    // Each unit's handler: a library's dispatchers handle its own widgets.
+    let mut offs = [0; crate::vm::MAX_LIBS + 1];
+    let n = vm.handlers(kind, &mut offs);
+    for &off in &offs[..n] {
+        vm.enqueue_callback(off, args);
     }
+    n > 0
 }
 
 /// Run `f` on every task's VM, `main` first, with the pool stamping new
@@ -1054,6 +1054,21 @@ fn apply_orientation<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
 
 #[inline(never)]
 fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
+    // Its libraries (docs/apps.md "Step 3"): loaded, linked, their setups
+    // first. A failure is a VM fault (19 / 20), shown as any other.
+    if !vm.needed_libs().is_empty() {
+        if let Err(code) = link_libraries::<P>(vm) {
+            vm.fault_now(code);
+            return 0;
+        }
+        for offset in vm.lib_setups() {
+            vm.call_now(offset, &[], ctx);
+            if matches!(vm.state, VmState::Error | VmState::Exit) {
+                return 0;
+            }
+            vm.pop_result();
+        }
+    }
     if let Some(offset) = vm.find_by_kind(FunctionKind::Setup).map(|e| e.offset as CodeAddr) {
         vm.call_now(offset, &[], ctx);
         // setup() called runProgram: the main loop switches.
@@ -1077,6 +1092,23 @@ fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
         vm.start_main(offset);
     }
     0
+}
+
+/// Loads the libraries the program in `vm` calls and links it with them: a
+/// `vm::fault` code on failure.
+fn link_libraries<P: PlatformRuntime>(vm: &mut Vm) -> Result<(), u8> {
+    use crate::apps::err;
+    use crate::vm::fault;
+    let mut libs = Vec::new();
+    for (id, major) in vm.needed_libs() {
+        match crate::libs::load(P::app_files(), id, *major, P::FS_BASE, P::CAPS, P::APP_MAX_BYTES) {
+            Ok(l) => libs.push(l),
+            Err(e) => {
+                return Err(if e == err::LIB_MISSING { fault::LIB_MISSING } else { fault::LIB_MISMATCH });
+            }
+        }
+    }
+    vm.link(&libs)
 }
 
 /// Allocate the full-screen root widget into the (empty) object pool.
@@ -3235,6 +3267,73 @@ mod call_tests {
     #[test]
     fn void_calls_superops() {
         run(include_bytes!("../testdata/calls/calls_super.prg"));
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+mod lib_tests {
+    //! Libraries (docs/apps.md "Step 3"): `testdata/libs`, built by
+    //! `testdata/libs/gen.py`. app.prg calls library com.test.util 1.x.
+    use super::*;
+    use crate::mock::MockPlatform;
+    use crate::platform::Platform;
+    use crate::pool::ObjPtr;
+    use crate::vm::fault;
+
+    const APP: &[u8] = include_bytes!("../testdata/libs/app.prg");
+
+    fn install(pkg: &[u8]) {
+        crate::libs::install(crate::mock::app_files(), pkg, MockPlatform::FS_BASE, MockPlatform::CAPS).unwrap();
+    }
+
+    fn start() -> Runtime<MockPlatform> {
+        let mut rt = super::multi_tests::boot(&[(b"main", APP.to_vec())]);
+        for _ in 0..3 {
+            rt.step();
+        }
+        rt
+    }
+
+    fn r(rt: &Runtime<MockPlatform>) -> Vec<i32> {
+        rt.ctx.objs.arr(rt.tasks.main.var(0) as ObjPtr).expect("r[]").to_vec()
+    }
+
+    #[test]
+    fn libraries() {
+        assert_eq!(start().tasks.main.fault(), fault::LIB_MISSING, "not installed");
+        install(include_bytes!("../testdata/libs/util_v2.bin"));
+        assert_eq!(start().tasks.main.fault(), fault::LIB_MISSING, "another major");
+        install(include_bytes!("../testdata/libs/util_bad.bin"));
+        assert_eq!(start().tasks.main.fault(), fault::LIB_MISMATCH, "no `bump`");
+        install(include_bytes!("../testdata/libs/util.bin"));
+
+        // (The mock runs one instruction a pass.)
+        let mut rt = start();
+        for _ in 0..40 {
+            rt.step();
+        }
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let v = r(&rt);
+        assert_eq!(&v[..3], &[4, 9, 1]);
+        assert_ne!(v[3], 0, "the library's widget");
+        assert_eq!(&v[4..7], &[7, 1000, 9]);
+        assert_eq!(crate::libs::loaded().len(), 1);
+
+        // Its widget's on_click goes to the library's dispatcher, the
+        // program's widget's to the program's.
+        rt.tasks.widget_click(&rt.ctx.objs, WidgetId(v[3] as ObjPtr));
+        for _ in 0..40 {
+            rt.step();
+        }
+        assert_eq!(r(&rt)[6], 109, "the library's callback ran");
+        assert_eq!(r(&rt)[7], 0);
+        let own = WidgetId(rt.tasks.main.var(2) as ObjPtr);
+        rt.tasks.widget_click(&rt.ctx.objs, own);
+        for _ in 0..40 {
+            rt.step();
+        }
+        assert_eq!(&r(&rt)[6..8], &[109, 1], "the program's callback ran");
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
     }
 }
 

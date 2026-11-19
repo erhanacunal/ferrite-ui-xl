@@ -286,12 +286,86 @@ Phases:
 - **2d** (done 2026-11-19): notes (`docs/notes/xl.md`), CLAUDE.md keep-in-sync
   (app syscalls 0x80–0x88, `apps::err` 11–20).
 
-## Step 3 constraints (decided now, built later)
+## Step 3: libraries (design, 2026-11-19)
 
-- **Libraries** reuse the package format with a `RES_LIBINFO` manifest and
-  `ferrite/libs/{id}/lib.img`; their globals and deepest frame chain add to
-  the importer's `var_slots` (header v5). A library is a domain without
-  tasks of its own, sharing its importer's font / image maps.
+User decisions: shared code (a library is in RAM once, however many tasks
+import it); a library may hold code, its own globals, make widgets and take
+callbacks (`@fn`, `on_click`), but has no fonts or images of its own (it
+uses its importer's ids); libraries are installed on their own
+(`ferrite/libs/{id}/`) and an importer asks for an id and a major version.
+
+**Writing one.** A library is a project with `"library_id"` (and `name`,
+`app_version`) in its project.json and one program, `lib`. Its functions marked
+`export fn` are what importers call; the rest are its own. It may have
+globals (initialised by its `setup()`, which runs once per importing task,
+before the task's own `setup()`), widget callbacks and `@fn` references to
+its functions. It may not have `loop()` or the other lifecycle functions, a
+widget page, `F_READ` / `F_WRITE`, or import libraries itself. Built, it is
+a package like an app's: an FS image with the program and `RES_LIBINFO`
+(the `appinfo` layout: id, name, version), installed with
+`ferrite_cli lib install` (`/api/libs`).
+
+**Using one.** A project lists the library packages it builds against in
+`"libraries": ["../util/util.bin", ...]`; their exported functions are then
+called by name like the program's own (a name clash is a compile error).
+Only the libraries a program calls are recorded in its image: each with its
+id and major version, and every imported function by name (with its
+argument count and return kind), so a library can be rebuilt (same major)
+without rebuilding its users.
+
+**Image v6** (devices with `caps.libraries`): after `var_slots`,
+`lib_count` u8, `import_count` u16, `export_count` u16, `call_depth` u8;
+after the function table, the library table (`u8 len, id, u8 major` each),
+the import table (`u8 lib, u8 nargs, u8 ret, u8 len, name`) and the export
+table (`u16 func_id, u8 nargs, u8 ret, nargs × u8 param type, u8 len,
+name`, libraries only), then
+the code. Flags bit 4: a library. A library's `var_slots` is its globals
+plus its deepest locals along one call chain from an export or callback,
+`call_depth` its deepest call chain (frames).
+
+**Opcodes.** `CALL_IMP u16 import` calls an imported function. `FN_REF u16
+func_id` (libraries only, for `@fn`) pushes the id tagged with the running
+unit (`unit << 12 | id`; ids stay below 4096), so a library's callbacks find
+its own function. Programs keep pushing plain ids (unit 0).
+
+**VM.** A task's VM runs units: unit 0 its program, 1.. its libraries
+(`Vm::units`: code, function table, `gbase`). The code buffer is shared
+(`VmCode` holds an `Arc`); switching units swaps the current `code` /
+`functions` with the parked ones (no refcounting per call). Code addresses
+saved across a switch (call frames' return address, callback frames, queued
+callbacks) carry the unit in bits 24..31; `RET` to another unit switches
+back (the threaded `RET` leaves that to `exec_one`). Globals: a library's
+are placed after the program's (`gbase`), `resolve_slot` adds `gbase` to a
+global slot (0 for the program); locals start after all of them. Sizes:
+`var_slots` grows by each library's globals plus its locals per callback
+level, the call stack by its `call_depth` per level. Callback dispatchers
+(`on_click`, `on_tap`, `on_paint`) run in every unit that has one; the
+lifecycle functions only in the program.
+
+**Linking.** When a task starts a program with a library table
+(`runtime::start_program`), each library is taken from the registry
+(`libs.rs`: weak references to the loaded `LibImage`s, so one goes with its
+last user; an install or remove empties it) or loaded from
+`ferrite/libs/{id}/lib.img` (CRC-checked), its major checked, every import
+resolved by name (argument count and return kind must match) into a link
+table (`Vm::link`), then each library's `setup()` runs. Failures: the
+program does not start, fault 19 (`library missing`) or 20 (`library
+mismatch`), shown like any fault (`libs::load` answers `apps::err` 21 /
+22, logged as such).
+
+Phases:
+
+- **3a (done 2026-11-19):** compiler and build (ferrite-ui): `export`,
+  library projects, `"libraries"`, image v6, `CALL_IMP` / `FN_REF`;
+  disassembler; tests.
+- **3b (done 2026-11-19):** VM and linking (ferrite-core, `vm/units.rs`,
+  `libs.rs`): units, tagged addresses, the registry, faults 19 / 20;
+  `runtime::lib_tests` with compiled testdata (`testdata/libs/gen.py`).
+- **3c:** install (`apps.rs` generalised to packages of both kinds,
+  `/api/libs`, `ferrite_cli lib`, sim `--install`).
+- **3d:** an example (a library with widgets and callbacks used by two
+  apps), sim, board, `perf_baseline.py` (the VM's call path changed),
+  notes, CLAUDE.md.
 
 ## Phases (step 1)
 

@@ -40,7 +40,7 @@ impl Vm {
     /// Queue gesture handler `func` (a 1-based func id) with `(widget,
     /// event)` and the event's details. False if the VM has no such function.
     pub fn enqueue_gesture(&mut self, func: u16, widget: WidgetId, ev: u8, d: &Detail) -> bool {
-        let Some(off) = self.find_func(func).map(|f| f.offset as super::CodeAddr) else {
+        let Some(off) = self.func_addr(func) else {
             return false;
         };
         let slot = self.cb_tail as usize;

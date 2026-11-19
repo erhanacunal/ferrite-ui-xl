@@ -1,0 +1,26 @@
+// The test library (runtime::lib_tests, built by gen.py): globals of its
+// own, a private helper, exports of each kind, a widget with its own
+// on_click callback.
+#include "core.fl"
+
+var total = 5;
+var btn;
+
+fn helper(x) { return x * 2; }
+fn clicked(w) { total = total + 100; }
+
+export fn add(a, b) { total = total + a + b; return helper(a) + b; }
+export fn scale(f: float) -> float { return f * 1.5; }
+export fn bump() { total = total + 1; }
+export fn get_total() { return total; }
+export fn make_button(x, y) {
+    btn = alloc();
+    target(btn);
+    set(location, x, y);
+    set(size, 100, 50);
+    set(clickable, 1);
+    parent(0);
+    target(btn);
+    set(on_click, @clicked);
+    return btn;
+}

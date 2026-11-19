@@ -257,6 +257,18 @@ impl crate::rtc::RtcImpl<MockRtc> {
     }
 }
 
+std::thread_local! {
+    /// The mock's app storage: per test thread, empty until a test installs
+    /// something.
+    static APP_FILES: &'static crate::apps::MemAppFiles =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(crate::apps::MemAppFiles::default()));
+}
+
+/// This thread's mock app storage.
+pub fn app_files() -> &'static crate::apps::MemAppFiles {
+    APP_FILES.with(|f| *f)
+}
+
 /// Marker platform binding every associated type to a mock backend.
 pub struct MockPlatform;
 impl Platform for MockPlatform {
@@ -274,6 +286,11 @@ impl Platform for MockPlatform {
     type EepromB = MockEeprom;
     type StorageB = crate::storage::MemStorage;
     type Renderer = crate::renderer::DefaultRenderer;
+    const APP_MAX_BYTES: usize = 1 << 20;
+
+    fn app_files() -> &'static dyn crate::apps::AppFiles {
+        app_files()
+    }
 
     #[cfg(feature = "host")]
     fn render_start(

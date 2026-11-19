@@ -440,7 +440,7 @@ fn op_call(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     if depth >= vm.call_stack.len() {
         return fault(vm, unsafe { pc.sub(1) }, sp, n, fault::CALL_OVERFLOW);
     }
-    let ret_addr = off(vm, after);
+    let ret_addr = off(vm, after) | vm.utag;
     // SAFETY: depth < call_stack.len().
     unsafe {
         *vm.call_stack.get_unchecked_mut(depth) =
@@ -462,10 +462,15 @@ fn op_ret(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
     // SAFETY: 0 < depth <= call_stack.len() (op_call / exec_one check).
     let f = unsafe { *vm.call_stack.get_unchecked(depth - 1) };
+    // A return into another unit (a library's caller): `exec_one` switches.
+    let ret = f.ret_addr ^ vm.utag;
+    if ret >> 24 != 0 {
+        become slow(vm, pc, sp, n)
+    }
     vm.call_sp = (depth - 1) as u8;
     vm.frame_base = f.frame_base as u32;
     vm.frame_size = f.frame_size;
-    jump!(vm, f.ret_addr as usize, sp, n)
+    jump!(vm, ret as usize, sp, n)
 }
 
 /// SYSCALL id argc: the platform's handler on the top `argc` values (fewer

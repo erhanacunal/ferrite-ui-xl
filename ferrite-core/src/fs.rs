@@ -74,6 +74,9 @@ pub const RES_MESH: u8 = 7;
 /// `ferrite_build.build_appinfo`): an image with one is an app, installed
 /// under `ferrite/apps/{id}/`, not a system image.
 pub const RES_APPINFO: u8 = 8;
+/// Library package manifest, resource "libinfo" (docs/apps.md "Step 3";
+/// ferrite-ui `ferrite_build.build_libinfo`): the appinfo layout, magic "LI".
+pub const RES_LIBINFO: u8 = 9;
 /// `Fs::find_kind` wildcard.
 pub const RES_ANY: u8 = 0xFF;
 

@@ -949,7 +949,6 @@ impl ObjPool {
 
     // --- Tree operations ---
 
-    /// Add child to end of parent's child list (highest z-order).
     /// Moves `child` to the end of its parent's children: drawn last, hit first (an app's
     /// container when it is shown, `domain.rs`).
     pub fn raise(&mut self, child: WidgetId) {
@@ -960,33 +959,89 @@ impl ObjPool {
         if !self.is_live(parent) || self.get(child).next_sibling.is_none() {
             return;
         }
+        if !self.unlink(child) {
+            return;
+        }
+        self.link_last(parent, child);
+        self.mark_dirty(parent);
+    }
+
+    /// Makes `child` the last child of `parent` (highest z-order). A child
+    /// that already has a parent leaves it first, with its subtree: `parent()`
+    /// on an attached widget moves it, or brings it to the front of the same
+    /// parent. Its old place is repainted (`will_move`). A widget never goes
+    /// into its own subtree.
+    pub fn add_child(&mut self, parent: WidgetId, child: WidgetId) {
+        if parent == child || !self.is_live(parent) || !self.is_live(child) || self.is_ancestor(child, parent) {
+            return;
+        }
+        let old = self.get(child).parent;
+        let moved = old.is_some() && self.is_live(old);
+        if moved {
+            self.will_move(child);
+            if !self.unlink(child) {
+                return;
+            }
+            self.flex_mark(old);
+        }
+        self.link_last(parent, child);
+        if moved {
+            self.mark_dirty(child);
+        }
+    }
+
+    /// Whether `a` is `w` or one of its ancestors.
+    fn is_ancestor(&self, a: WidgetId, w: WidgetId) -> bool {
+        let max = self.count();
+        let mut at = w;
+        let mut guard = 0usize;
+        while at.is_some() {
+            if at == a {
+                return true;
+            }
+            at = self.get(at).parent;
+            guard += 1;
+            if guard > max {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Takes `child` (with its subtree) out of its parent's child list; its
+    /// `parent` field is left as it was. False if the list does not hold it.
+    fn unlink(&mut self, child: WidgetId) -> bool {
+        let parent = self.get(child).parent;
+        if !self.is_live(parent) {
+            return false;
+        }
         let next = self.get(child).next_sibling;
         if self.get(parent).first_child == child {
             self.get_mut(parent).first_child = next;
         } else {
             let mut at = self.get(parent).first_child;
+            let max = self.count();
             let mut guard = 0usize;
             while at.is_some() && self.get(at).next_sibling != child {
                 at = self.get(at).next_sibling;
                 guard += 1;
-                if guard > self.count() {
-                    return;
+                if guard > max {
+                    return false;
                 }
             }
             if at.is_none() {
-                return;
+                return false;
             }
             self.get_mut(at).next_sibling = next;
         }
         self.get_mut(child).next_sibling = WidgetId::NONE;
-        self.add_child(parent, child);
-        self.mark_dirty(parent);
+        self.dfs_valid = false;
+        self.render.shape_changed = true;
+        true
     }
 
-    pub fn add_child(&mut self, parent: WidgetId, child: WidgetId) {
-        if parent == child || !self.is_live(parent) || !self.is_live(child) {
-            return;
-        }
+    /// Appends a detached `child` to `parent`'s child list.
+    fn link_last(&mut self, parent: WidgetId, child: WidgetId) {
         self.get_mut(child).parent = parent;
         self.get_mut(child).next_sibling = WidgetId::NONE;
 
@@ -998,11 +1053,7 @@ impl ObjPool {
             let mut last = first;
             let mut guard = 0usize;
             while self.get(last).next_sibling.is_some() {
-                let next = self.get(last).next_sibling;
-                if next == child {
-                    return;
-                }
-                last = next;
+                last = self.get(last).next_sibling;
                 guard += 1;
                 if guard > max {
                     return;
@@ -1202,25 +1253,7 @@ impl ObjPool {
         // Unlink root from its parent's child list.
         let parent = self.get(root).parent;
         if parent.is_some() {
-            let next = self.get(root).next_sibling;
-            let first = self.get(parent).first_child;
-            if first == root {
-                self.get_mut(parent).first_child = next;
-            } else {
-                let mut sib = first;
-                let max = self.count();
-                let mut guard = 0usize;
-                while sib.is_some() && self.get(sib).next_sibling != root {
-                    sib = self.get(sib).next_sibling;
-                    guard += 1;
-                    if guard > max {
-                        break;
-                    }
-                }
-                if sib.is_some() && self.get(sib).next_sibling == root {
-                    self.get_mut(sib).next_sibling = next;
-                }
-            }
+            self.unlink(root);
         }
         self.flex_mark(parent);
         // Free the whole subtree.
@@ -1460,6 +1493,43 @@ mod tests {
         tree.raise(c);
         assert!(order(&tree) == [b, a, c], "already last");
         assert!(tree.get(c).parent == root);
+    }
+
+    /// Children of `p`, in order.
+    fn children(t: &ObjPool, p: WidgetId) -> Vec<WidgetId> {
+        let mut v = Vec::new();
+        let mut w = t.get(p).first_child;
+        while w.is_some() {
+            v.push(w);
+            w = t.get(w).next_sibling;
+        }
+        v
+    }
+
+    #[test]
+    fn add_child_of_an_attached_widget_moves_it() {
+        let mut tree = ObjPool::new();
+        let root = tree.alloc_widget().unwrap();
+        let [a, b, c, d] = [(); 4].map(|_| tree.alloc_widget().unwrap());
+        for w in [a, b, c] {
+            tree.add_child(root, w);
+        }
+        let leaf = tree.alloc_widget().unwrap();
+        tree.add_child(b, leaf);
+        // Same parent: to the front, the siblings after it kept.
+        tree.add_child(root, b);
+        assert!(children(&tree, root) == [a, c, b], "front");
+        assert!(children(&tree, b) == [leaf], "subtree kept");
+        // Another parent: out of the old list, into the new one.
+        tree.add_child(root, d);
+        tree.add_child(d, a);
+        assert!(children(&tree, root) == [c, b, d], "old list");
+        assert!(children(&tree, d) == [a], "new list");
+        assert!(tree.get(a).parent == d);
+        // Never into its own subtree.
+        tree.add_child(leaf, b);
+        tree.add_child(b, b);
+        assert!(children(&tree, root) == [c, b, d] && tree.get(b).parent == root, "no cycle");
     }
 
     #[test]

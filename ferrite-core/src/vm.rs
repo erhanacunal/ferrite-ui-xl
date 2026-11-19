@@ -4486,6 +4486,22 @@ mod anim_tests {
     }
 
     #[test]
+    fn a_reparented_widget_repaints_its_old_place() {
+        let mut ctx = mock_ctx();
+        let (root, child) = rendered_pair(&mut ctx);
+        let panel = one_widget(&mut ctx);
+        ctx.objs.add_child(root, panel);
+        ctx.objs.get_mut(panel).location = crate::types::Offset { x: 400, y: 200 };
+        ctx.objs.get_mut(panel).size = crate::types::Size { w: 100, h: 100 };
+        crate::render::render_dirty(&mut ctx);
+        ctx.objs.add_child(panel, child);
+        assert!(ctx.objs.get(child).is_dirty());
+        ctx.objs.sync_view(&mut ctx.view);
+        assert_eq!(ctx.view.prev_rect(child), crate::types::Rect::new(100, 50, 40, 30));
+        assert_eq!(ctx.view.get(child).parent, panel);
+    }
+
+    #[test]
     fn a_reused_pointer_and_a_clear_reset_the_render_records() {
         let mut ctx = mock_ctx();
         let (root, child) = rendered_pair(&mut ctx);

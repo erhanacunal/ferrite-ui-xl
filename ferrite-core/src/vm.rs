@@ -599,10 +599,10 @@ const MAX_SYSCALL_ARGS: usize = 16;
 /// what the old fixed table held (a u8 `frame_base` + a local index).
 const LEGACY_VAR_SLOTS: u16 = 384;
 /// Slots `Vm::vars` holds past `var_slots`: an operand (a global, or a local
-/// index on top of `frame_base`, both 0..=127) never reaches past them, as
-/// `frame_base <= var_slots` (FRAME checks it). So `var_get`/`var_set` need
-/// no bounds check.
-const VAR_PAD: usize = 128;
+/// index on top of `frame_base`, both 0..=127) and FRAME_A's argument count
+/// (0..=255) never reach past them, as `frame_base <= var_slots` (FRAME
+/// checks it). So `var_get`/`var_set` need no bounds check.
+const VAR_PAD: usize = 256;
 /// Largest `var_slots` an image may ask for (`frame_base + frame_size` stays
 /// in a u16).
 const VAR_SLOTS_MAX: u16 = 0xFF00;
@@ -791,13 +791,15 @@ pub struct Vm {
     gesture_cur: crate::gesture::Detail,
     // Critical section — when true, VM runs until next YIELD without returning to main loop
     critical: bool,
-    // Stack-based locals: frame_base = first local slot for current function
-    frame_base: u16,
+    // Stack-based locals: frame_base = first local slot for current function.
+    // A u32 (the frames store a u16): a word load takes any field offset in
+    // one instruction (ldrh only 0..255) and a slot sum needs no masking.
+    frame_base: u32,
     frame_size: u8,
     global_count: u8,
     // Slots the program's globals and locals may use (image header v5, or
     // LEGACY_VAR_SLOTS): FRAME faults past it.
-    var_slots: u16,
+    var_slots: u32,
     // Jump/call operands are u32 (image header IMAGE_FLAG_WIDE_ADDR).
     wide_addr: bool,
     // Portrait screen from the image header (IMAGE_FLAG_PORTRAIT).
@@ -894,7 +896,7 @@ impl Vm {
             frame_base: 0,
             frame_size: 0,
             global_count: 0,
-            var_slots: LEGACY_VAR_SLOTS,
+            var_slots: LEGACY_VAR_SLOTS as u32,
             wide_addr: false,
             portrait: false,
             in_paint: false,
@@ -977,28 +979,28 @@ impl Vm {
 
     /// Resolve slot byte: bit 7 set = local (frame_base + index), else global.
     #[inline]
-    fn resolve_slot(&self, slot: u8) -> u16 {
+    fn resolve_slot(&self, slot: u8) -> u32 {
         if slot & 0x80 != 0 {
-            self.frame_base + (slot & 0x7F) as u16
+            self.frame_base + (slot & 0x7F) as u32
         } else {
-            slot as u16
+            slot as u32
         }
     }
 
 
 
-    // A slot is a global (< 128) or `frame_base` + a local index (< 128),
-    // and `frame_base <= var_slots` (load, FRAME): always below
-    // `var_slots + VAR_PAD` = `vars.len()` (see VAR_PAD).
+    // A slot is a global (< 128), `frame_base` + a local index (< 128) or
+    // + a FRAME_A argument (< 255), and `frame_base <= var_slots` (load,
+    // FRAME): always below `var_slots + VAR_PAD` = `vars.len()`.
     #[inline(always)]
-    fn var_get(&self, slot: u16) -> i32 {
+    fn var_get(&self, slot: u32) -> i32 {
         debug_assert!((slot as usize) < self.vars.len());
         // SAFETY: in range, see above.
         unsafe { *self.vars.get_unchecked(slot as usize) }
     }
 
     #[inline(always)]
-    fn var_set(&mut self, slot: u16, val: i32) {
+    fn var_set(&mut self, slot: u32, val: i32) {
         debug_assert!((slot as usize) < self.vars.len());
         // SAFETY: as in var_get.
         unsafe { *self.vars.get_unchecked_mut(slot as usize) = val };
@@ -1016,7 +1018,7 @@ impl Vm {
                 None => return false,
             }
         }
-        self.var_slots = slots;
+        self.var_slots = slots as u32;
         true
     }
 
@@ -1050,7 +1052,7 @@ impl Vm {
             // `var_slots`).
             self.call_sp = 0;
             self.cb_frames.clear();
-            self.frame_base = gc as u16;
+            self.frame_base = gc as u32;
             self.frame_size = 0;
             self.portrait = portrait;
             self.tree_hint = hint;
@@ -1063,7 +1065,7 @@ impl Vm {
     /// Load raw bytecode (no image header). Used for page bytecode.
     pub fn load_raw(&mut self, data: Vec<u8>) {
         // No header: the old fixed table (not a smaller one left by an image).
-        if self.var_slots < LEGACY_VAR_SLOTS && self.set_var_slots(LEGACY_VAR_SLOTS) {
+        if self.var_slots < LEGACY_VAR_SLOTS as u32 && self.set_var_slots(LEGACY_VAR_SLOTS) {
             self.call_sp = 0;
             self.cb_frames.clear();
             self.frame_size = 0;
@@ -1485,11 +1487,11 @@ impl Vm {
         // OP_RET will eventually pop this frame back into the post-showModal pc.
         self.call_stack[self.call_sp as usize] = CallFrame {
             ret_addr: self.pc,
-            frame_base: self.frame_base,
+            frame_base: self.frame_base as u16,
             frame_size: self.frame_size,
         };
         self.call_sp += 1;
-        self.frame_base += self.frame_size as u16;
+        self.frame_base += self.frame_size as u32;
         self.frame_size = 0;
         self.pc = builder_offset;
 
@@ -1609,7 +1611,7 @@ impl Vm {
             state: self.state,
             wait_until: self.wait_until,
             critical: self.critical,
-            frame_base: self.frame_base,
+            frame_base: self.frame_base as u16,
             frame_size: self.frame_size,
             gesture: self.gesture_cur,
         });
@@ -1626,8 +1628,8 @@ impl Vm {
         // the OP_CALL convention: new frame_base = frame_base + frame_size.
         // Clamp to at least global_count so the very first callback (setup)
         // doesn't collide with the globals when frame_base is still 0.
-        let above = self.frame_base + self.frame_size as u16;
-        self.frame_base = above.max(self.global_count as u16);
+        let above = self.frame_base + self.frame_size as u32;
+        self.frame_base = above.max(self.global_count as u32);
         self.frame_size = 0;
         true
     }
@@ -1645,7 +1647,7 @@ impl Vm {
             self.state = f.state;
             self.wait_until = f.wait_until;
             self.critical = f.critical;
-            self.frame_base = f.frame_base;
+            self.frame_base = f.frame_base as u32;
             self.frame_size = f.frame_size;
             self.gesture_cur = f.gesture;
         }
@@ -1987,7 +1989,7 @@ impl Vm {
                     self.call_sp -= 1;
                     let frame = self.call_stack[self.call_sp as usize];
                     self.pc = frame.ret_addr;
-                    self.frame_base = frame.frame_base;
+                    self.frame_base = frame.frame_base as u32;
                     self.frame_size = frame.frame_size;
 
                     // Modal builder return interception: if we just popped the
@@ -2054,7 +2056,7 @@ impl Vm {
             OP_FRAME => {
                 // Function prologue: set frame_size for this function
                 let count = self.read_u8();
-                if self.frame_base + count as u16 > self.var_slots {
+                if self.frame_base + count as u32 > self.var_slots {
                     self.fail(fault::VARS_FULL);
                 } else {
                     self.frame_size = count;
@@ -2170,12 +2172,12 @@ impl Vm {
                 if (self.call_sp as usize) < self.call_stack.len() {
                     self.call_stack[self.call_sp as usize] = CallFrame {
                         ret_addr: self.pc,
-                        frame_base: self.frame_base,
+                        frame_base: self.frame_base as u16,
                         frame_size: self.frame_size,
                     };
                     self.call_sp += 1;
                     // Advance frame_base past caller's locals
-                    self.frame_base += self.frame_size as u16;
+                    self.frame_base += self.frame_size as u32;
                     self.frame_size = 0; // callee's FRAME will set this
                     self.pc = target;
                 } else {
@@ -2931,14 +2933,12 @@ impl Vm {
             OP_FRAME_A => {
                 // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
                 let [count, nargs] = self.fetch();
-                if self.frame_base + count as u16 > self.var_slots {
+                if self.frame_base + count as u32 > self.var_slots {
                     self.fail(fault::VARS_FULL);
-                } else if nargs > count {
-                    self.fail(fault::BAD_OPERAND);
                 } else {
                     self.frame_size = count;
                     let base = self.frame_base;
-                    for i in (0..nargs as u16).rev() {
+                    for i in (0..nargs as u32).rev() {
                         let v = self.pop();
                         self.var_set(base + i, v);
                     }
@@ -5852,7 +5852,7 @@ mod anim_tests {
         assert_eq!(vm.fault(), fault::NONE);
         // An older header keeps the old table; var_slots never undercuts the globals.
         assert!(vm.load_ram(&image(0, &[OP_HALT])));
-        assert_eq!(vm.var_slots, LEGACY_VAR_SLOTS);
+        assert_eq!(vm.var_slots, LEGACY_VAR_SLOTS as u32);
         assert!(vm.load_ram(&image_v5(9, 4, &[OP_HALT])));
         assert_eq!(vm.var_slots, 9);
         assert!(!vm.load_ram(&image_v5(0, VAR_SLOTS_MAX + 1, &[OP_HALT])));
@@ -5869,14 +5869,16 @@ mod anim_tests {
     }
 
     #[test]
-    fn frame_a_with_more_args_than_locals_faults() {
+    fn frame_a_args_past_its_locals_stay_in_the_table() {
+        // Malformed: FRAME_A 1 2 at the top of a 1-slot table. The second
+        // argument lands in VAR_PAD (debug_assert in var_set otherwise).
         let mut vm = Vm::new();
-        // PUSH_1; PUSH_1; CALL f; HALT. f: FRAME_A 1 2.
+        // PUSH_1; PUSH_1; CALL f; HALT. f: FRAME_A 1 2; RET.
         let code = [OP_PUSH_1, OP_PUSH_1, OP_CALL, 6, 0, OP_HALT, OP_FRAME_A, 1, 2, OP_RET];
-        assert!(vm.load_ram(&image_v5(0, 8, &code)));
+        assert!(vm.load_ram(&image_v5(0, 1, &code)));
         let mut ctx = mock_ctx();
         vm.run(&mut ctx);
-        assert_eq!(vm.fault(), fault::BAD_OPERAND);
-        assert_eq!(vm.fault_pc(), 6);
+        assert_eq!(vm.fault(), fault::NONE);
+        assert_eq!((vm.var(0), vm.var(1)), (1, 1));
     }
 }

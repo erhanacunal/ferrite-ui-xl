@@ -366,7 +366,7 @@ fn op_store(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 
 fn op_frame(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let count = unsafe { *pc };
-    if vm.frame_base + count as u16 > vm.var_slots {
+    if vm.frame_base + count as u32 > vm.var_slots {
         return fault(vm, unsafe { pc.sub(1) }, sp, n, fault::VARS_FULL);
     }
     vm.frame_size = count;
@@ -376,19 +376,30 @@ fn op_frame(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 fn op_frame_a(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
     let [count, nargs] = unsafe { bytes(pc) };
-    if vm.frame_base + count as u16 > vm.var_slots {
+    if vm.frame_base + count as u32 > vm.var_slots {
         return fault(vm, unsafe { pc.sub(1) }, sp, n, fault::VARS_FULL);
-    }
-    if nargs > count {
-        return fault(vm, unsafe { pc.sub(1) }, sp, n, fault::BAD_OPERAND);
     }
     need!(vm, pc, sp, n, nargs as usize);
     vm.frame_size = count;
-    let base = vm.frame_base;
+    // SAFETY: `frame_base + nargs` stays below `vars.len()` (VAR_PAD), the
+    // `nargs` values are on the stack (need!), and the two buffers are apart.
     unsafe {
         let sp = sp.sub(nargs as usize);
-        for i in 0..nargs as usize {
-            vm.var_set(base + i as u16, *sp.add(i));
+        let dst = vm.vars.as_mut_ptr().add(vm.frame_base as usize);
+        // Most functions take few arguments: no generic copy loop for them.
+        match nargs {
+            0 => {}
+            1 => *dst = *sp,
+            2 => {
+                *dst = *sp;
+                *dst.add(1) = *sp.add(1);
+            }
+            3 => {
+                *dst = *sp;
+                *dst.add(1) = *sp.add(1);
+                *dst.add(2) = *sp.add(2);
+            }
+            _ => core::ptr::copy_nonoverlapping(sp, dst, nargs as usize),
         }
         next!(vm, pc.add(2), sp, n)
     }
@@ -433,11 +444,11 @@ fn op_call(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     // SAFETY: depth < call_stack.len().
     unsafe {
         *vm.call_stack.get_unchecked_mut(depth) =
-            CallFrame { ret_addr, frame_base: vm.frame_base, frame_size: vm.frame_size };
+            CallFrame { ret_addr, frame_base: vm.frame_base as u16, frame_size: vm.frame_size };
     }
     vm.call_sp += 1;
     // The callee's locals go past the caller's; its FRAME sets their count.
-    vm.frame_base += vm.frame_size as u16;
+    vm.frame_base += vm.frame_size as u32;
     vm.frame_size = 0;
     jump!(vm, t, sp, n)
 }
@@ -452,7 +463,7 @@ fn op_ret(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     // SAFETY: 0 < depth <= call_stack.len() (op_call / exec_one check).
     let f = unsafe { *vm.call_stack.get_unchecked(depth - 1) };
     vm.call_sp = (depth - 1) as u8;
-    vm.frame_base = f.frame_base;
+    vm.frame_base = f.frame_base as u32;
     vm.frame_size = f.frame_size;
     jump!(vm, f.ret_addr as usize, sp, n)
 }

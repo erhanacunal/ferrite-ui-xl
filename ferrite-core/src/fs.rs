@@ -16,7 +16,8 @@
 /// byte sum of the table only. See [`Fs::verify`].
 ///
 /// Resources are accessed by name (null-terminated ASCII, max 15 chars).
-/// Kind: Font=0, Image=1, Program=2, Page=3, File=4, SysCfg=5, Sound=6
+/// Kind: Font=0, Image=1, Program=2, Page=3, File=4, SysCfg=5, Sound=6,
+/// Mesh=7, AppInfo=8
 use crate::flash::{FlashBackend, FlashImpl};
 
 // --- Layout constants ---
@@ -69,6 +70,10 @@ pub const RES_SOUND: u8 = 6;
 /// (/ 32767; the model centred and scaled to radius 1). For board renderers (none
 /// draws models now: exynos4412's `model3d.rs` went with its render mode 0, 2026-11-17).
 pub const RES_MESH: u8 = 7;
+/// App package manifest, resource "appinfo" (docs/apps.md; ferrite-ui
+/// `ferrite_build.build_appinfo`): an image with one is an app, installed
+/// under `ferrite/apps/{id}/`, not a system image.
+pub const RES_APPINFO: u8 = 8;
 /// `Fs::find_kind` wildcard.
 pub const RES_ANY: u8 = 0xFF;
 

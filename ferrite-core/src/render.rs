@@ -304,6 +304,16 @@ pub fn records<P: Platform>(ctx: &Ctx<P>) -> bool {
     ctx.render_ctx.is_some() || ctx.render_away
 }
 
+/// The VM's direct drawing of an earlier pass is not yet with the render (an
+/// open `screen_rec`, or lists queued in `draws`): the runtime holds the VM
+/// meanwhile, so it stays at most a frame ahead of the screen. Without it a
+/// loop drawing every pass (bench mode 2: a full-screen fillRect) recorded
+/// far faster than the render side could play, each job longer than the
+/// last, and nothing was presented again (board, 2026-11-19).
+pub fn drawing_pending<P: Platform>(ctx: &Ctx<P>) -> bool {
+    records(ctx) && (ctx.objs.render.screen_rec.busy() || !ctx.objs.render.draws.is_empty())
+}
+
 /// Keeps `list` as `id`'s paint list, drawn with it (`draw_paint`).
 fn keep_paint<P: Platform>(r: &mut Ctx<P>, id: WidgetId, list: crate::dl::List) {
     let mut paints = r.objs.render.paints.borrow_mut();

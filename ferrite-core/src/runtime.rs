@@ -596,7 +596,9 @@ impl<P: PlatformRuntime> Runtime<P> {
         // already spins at CPU speed); faster BSPs and the sim raise
         // VM_STEPS_PER_TICK so animation runs at hardware-like speed instead
         // of one instruction per presented frame.
-        if self.error_code == 0 {
+        // Held while its direct drawing of an earlier pass waits for the render
+        // (`render::drawing_pending`).
+        if self.error_code == 0 && !render::drawing_pending(&self.ctx) {
             each_task(&mut self.ctx, &mut self.tasks, |ctx, vm| {
                 vm.try_resume_modal(ctx);
                 vm.tick(ctx, P::VM_STEPS_PER_TICK);

@@ -1,0 +1,219 @@
+profiler clock 24 MHz, window 2004.6 ms
+passes 141251 (70.46 kpasses/s, avg 14.2 us, max 455 us)
+VM 1.61 Minstr/s (3229643 instructions)
+phase                   time   share    per pass
+------------------------------------------------
+vm                   310.1 ms   15.5%      2.2 us
+usart                 41.2 ms    2.1%      0.3 us
+input                190.0 ms    9.5%      1.3 us
+animations           196.3 ms    9.8%      1.4 us
+audio                 31.0 ms    1.5%      0.2 us
+render                99.0 ms    4.9%      0.7 us
+callbacks             45.6 ms    2.3%      0.3 us
+tasks/misc           242.3 ms   12.1%      1.7 us
+frame_end            747.3 ms   37.3%      5.3 us
+  display wait         0.0 ms    0.0%      0.0 us
+  widget draws         5.2 ms    0.3%      0.0 us
+  pixel writes         5.1 ms    0.3%      0.0 us
+present copy           0.0 ms    0.0%      0.0 us
+  timer reads        321.6 ms   16.0%      2.3 us
+  G2D/GPU drawing     517.9 ms   25.8%      3.7 us
+  sprite drawing       0.0 ms    0.0%      0.0 us
+phase 17               0.5 ms    0.0%      0.0 us
+phase 18              12.3 ms    0.6%      0.1 us
+outside step          89.0 ms    4.4%
+render walk          139.4 ms              1.0 us  (render + callbacks - widget draws)
+draw setup             0.1 ms              0.0 us  (widget draws - pixel writes - display wait, approx.)
+draw_widget calls: 682 (0.0 per pass)
+pixel primitive calls: 51 (0.0 per pass)
+presents: 0 (0.0 per pass)
+present KiB: 10681 (0.1 per pass)
+timer reads: 1197212 (8.5 per pass)
+G2D draw ops: 283 (0.0 per pass)
+G2D draw kpx: 2671 (0.0 per pass)
+sprites made: 0 (0.0 per pass)
+sprite blits: 0 (0.0 per pass)
+sprite-eligible drawn by CPU (first sighting): 0 (0.0 per pass)
+CPU blended kpx: 0 (0.0 per pass)
+subtrees shifted: 0 (0.0 per pass)
+shifted kpx: 0 (0.0 per pass)
+G2D picture copies: 0 (0.0 per pass)
+G2D move copies: 0 (0.0 per pass)
+per present: G2D 517890 us / 283.0 ops / 2671 kpx, CPU blends 0 kpx, sprites 0.0 blits + 0.00 made (0 us)
+longest pass (455 us): vm 3, input 1
+
+profiler clock 24 MHz, window 2004.4 ms
+passes 141357 (70.52 kpasses/s, avg 14.2 us, max 470 us)
+VM 1.61 Minstr/s (3220729 instructions)
+phase                   time   share    per pass
+------------------------------------------------
+vm                   310.7 ms   15.5%      2.2 us
+usart                 41.3 ms    2.1%      0.3 us
+input                189.7 ms    9.5%      1.3 us
+animations           196.8 ms    9.8%      1.4 us
+audio                 31.1 ms    1.6%      0.2 us
+render                96.9 ms    4.8%      0.7 us
+callbacks             45.7 ms    2.3%      0.3 us
+tasks/misc           241.9 ms   12.1%      1.7 us
+frame_end            748.8 ms   37.4%      5.3 us
+  display wait         0.0 ms    0.0%      0.0 us
+  widget draws         5.2 ms    0.3%      0.0 us
+  pixel writes         4.5 ms    0.2%      0.0 us
+present copy           0.0 ms    0.0%      0.0 us
+  timer reads        322.4 ms   16.1%      2.3 us
+  G2D/GPU drawing     514.4 ms   25.7%      3.6 us
+  sprite drawing       0.0 ms    0.0%      0.0 us
+phase 17               0.5 ms    0.0%      0.0 us
+phase 18              12.2 ms    0.6%      0.1 us
+outside step          88.9 ms    4.4%
+render walk          137.4 ms              1.0 us  (render + callbacks - widget draws)
+draw setup             0.7 ms              0.0 us  (widget draws - pixel writes - display wait, approx.)
+draw_widget calls: 682 (0.0 per pass)
+pixel primitive calls: 43 (0.0 per pass)
+presents: 0 (0.0 per pass)
+present KiB: 9394 (0.1 per pass)
+timer reads: 1197413 (8.5 per pass)
+G2D draw ops: 275 (0.0 per pass)
+G2D draw kpx: 2348 (0.0 per pass)
+sprites made: 0 (0.0 per pass)
+sprite blits: 0 (0.0 per pass)
+sprite-eligible drawn by CPU (first sighting): 0 (0.0 per pass)
+CPU blended kpx: 0 (0.0 per pass)
+subtrees shifted: 0 (0.0 per pass)
+shifted kpx: 0 (0.0 per pass)
+G2D picture copies: 0 (0.0 per pass)
+G2D move copies: 0 (0.0 per pass)
+per present: G2D 514353 us / 275.0 ops / 2348 kpx, CPU blends 0 kpx, sprites 0.0 blits + 0.00 made (0 us)
+longest pass (470 us): render 455, phase 18 154, widget draws 69, phase 17 10, vm 2, input 1
+
+profiler clock 24 MHz, window 2007.1 ms
+passes 141470 (70.49 kpasses/s, avg 14.2 us, max 479 us)
+VM 1.61 Minstr/s (3227558 instructions)
+phase                   time   share    per pass
+------------------------------------------------
+vm                   310.8 ms   15.5%      2.2 us
+usart                 41.7 ms    2.1%      0.3 us
+input                189.9 ms    9.5%      1.3 us
+animations           196.6 ms    9.8%      1.4 us
+audio                 31.0 ms    1.5%      0.2 us
+render                97.3 ms    4.8%      0.7 us
+callbacks             46.0 ms    2.3%      0.3 us
+tasks/misc           241.8 ms   12.0%      1.7 us
+frame_end            750.2 ms   37.4%      5.3 us
+  display wait         0.0 ms    0.0%      0.0 us
+  widget draws         5.2 ms    0.3%      0.0 us
+  pixel writes         4.3 ms    0.2%      0.0 us
+present copy           0.0 ms    0.0%      0.0 us
+  timer reads        322.5 ms   16.1%      2.3 us
+  G2D/GPU drawing     513.6 ms   25.6%      3.6 us
+  sprite drawing       0.0 ms    0.0%      0.0 us
+phase 17               0.5 ms    0.0%      0.0 us
+phase 18              12.4 ms    0.6%      0.1 us
+outside step          88.8 ms    4.4%
+render walk          138.1 ms              1.0 us  (render + callbacks - widget draws)
+draw setup             0.9 ms              0.0 us  (widget draws - pixel writes - display wait, approx.)
+draw_widget calls: 688 (0.0 per pass)
+pixel primitive calls: 41 (0.0 per pass)
+presents: 0 (0.0 per pass)
+present KiB: 9070 (0.1 per pass)
+timer reads: 1199778 (8.5 per pass)
+G2D draw ops: 272 (0.0 per pass)
+G2D draw kpx: 2268 (0.0 per pass)
+sprites made: 0 (0.0 per pass)
+sprite blits: 0 (0.0 per pass)
+sprite-eligible drawn by CPU (first sighting): 0 (0.0 per pass)
+CPU blended kpx: 0 (0.0 per pass)
+subtrees shifted: 0 (0.0 per pass)
+shifted kpx: 0 (0.0 per pass)
+G2D picture copies: 0 (0.0 per pass)
+G2D move copies: 0 (0.0 per pass)
+per present: G2D 513575 us / 272.0 ops / 2268 kpx, CPU blends 0 kpx, sprites 0.0 blits + 0.00 made (0 us)
+longest pass (479 us): usart 451, input 11, vm 4, render 1
+
+profiler clock 24 MHz, window 2007.5 ms
+passes 141487 (70.48 kpasses/s, avg 14.2 us, max 458 us)
+VM 1.61 Minstr/s (3227915 instructions)
+phase                   time   share    per pass
+------------------------------------------------
+vm                   311.2 ms   15.5%      2.2 us
+usart                 41.6 ms    2.1%      0.3 us
+input                190.8 ms    9.5%      1.3 us
+animations           196.8 ms    9.8%      1.4 us
+audio                 31.1 ms    1.5%      0.2 us
+render                97.7 ms    4.9%      0.7 us
+callbacks             45.6 ms    2.3%      0.3 us
+tasks/misc           241.6 ms   12.0%      1.7 us
+frame_end            748.9 ms   37.3%      5.3 us
+  display wait         0.0 ms    0.0%      0.0 us
+  widget draws         5.2 ms    0.3%      0.0 us
+  pixel writes         5.0 ms    0.3%      0.0 us
+present copy           0.0 ms    0.0%      0.0 us
+  timer reads        322.5 ms   16.1%      2.3 us
+  G2D/GPU drawing     512.1 ms   25.5%      3.6 us
+  sprite drawing       0.0 ms    0.0%      0.0 us
+phase 17               0.5 ms    0.0%      0.0 us
+phase 18              12.2 ms    0.6%      0.1 us
+outside step          89.5 ms    4.5%
+render walk          138.1 ms              1.0 us  (render + callbacks - widget draws)
+draw setup             0.1 ms              0.0 us  (widget draws - pixel writes - display wait, approx.)
+draw_widget calls: 678 (0.0 per pass)
+pixel primitive calls: 50 (0.0 per pass)
+presents: 0 (0.0 per pass)
+present KiB: 10528 (0.1 per pass)
+timer reads: 1198950 (8.5 per pass)
+G2D draw ops: 280 (0.0 per pass)
+G2D draw kpx: 2632 (0.0 per pass)
+sprites made: 0 (0.0 per pass)
+sprite blits: 0 (0.0 per pass)
+sprite-eligible drawn by CPU (first sighting): 0 (0.0 per pass)
+CPU blended kpx: 0 (0.0 per pass)
+subtrees shifted: 0 (0.0 per pass)
+shifted kpx: 0 (0.0 per pass)
+G2D picture copies: 0 (0.0 per pass)
+G2D move copies: 0 (0.0 per pass)
+per present: G2D 512129 us / 280.0 ops / 2632 kpx, CPU blends 0 kpx, sprites 0.0 blits + 0.00 made (0 us)
+longest pass (458 us): render 443, phase 18 145, widget draws 62, phase 17 10, vm 2, input 1
+
+profiler clock 24 MHz, window 2004.7 ms
+passes 141159 (70.41 kpasses/s, avg 14.2 us, max 463 us)
+VM 1.61 Minstr/s (3221027 instructions)
+phase                   time   share    per pass
+------------------------------------------------
+vm                   310.7 ms   15.5%      2.2 us
+usart                 41.3 ms    2.1%      0.3 us
+input                189.8 ms    9.5%      1.3 us
+animations           197.4 ms    9.8%      1.4 us
+audio                 30.9 ms    1.5%      0.2 us
+render                98.7 ms    4.9%      0.7 us
+callbacks             45.7 ms    2.3%      0.3 us
+tasks/misc           241.8 ms   12.1%      1.7 us
+frame_end            747.0 ms   37.3%      5.3 us
+  display wait         0.0 ms    0.0%      0.0 us
+  widget draws         5.4 ms    0.3%      0.0 us
+  pixel writes         5.4 ms    0.3%      0.0 us
+present copy           0.0 ms    0.0%      0.0 us
+  timer reads        321.8 ms   16.1%      2.3 us
+  G2D/GPU drawing     529.2 ms   26.4%      3.7 us
+  sprite drawing       0.0 ms    0.0%      0.0 us
+phase 17               0.5 ms    0.0%      0.0 us
+phase 18              12.7 ms    0.6%      0.1 us
+outside step          88.4 ms    4.4%
+render walk          138.9 ms              1.0 us  (render + callbacks - widget draws)
+draw setup             0.0 ms              0.0 us  (widget draws - pixel writes - display wait, approx.)
+draw_widget calls: 712 (0.0 per pass)
+pixel primitive calls: 54 (0.0 per pass)
+presents: 0 (0.0 per pass)
+present KiB: 11194 (0.1 per pass)
+timer reads: 1194616 (8.5 per pass)
+G2D draw ops: 293 (0.0 per pass)
+G2D draw kpx: 2798 (0.0 per pass)
+sprites made: 0 (0.0 per pass)
+sprite blits: 0 (0.0 per pass)
+sprite-eligible drawn by CPU (first sighting): 0 (0.0 per pass)
+CPU blended kpx: 0 (0.0 per pass)
+subtrees shifted: 0 (0.0 per pass)
+shifted kpx: 0 (0.0 per pass)
+G2D picture copies: 0 (0.0 per pass)
+G2D move copies: 0 (0.0 per pass)
+per present: G2D 529205 us / 293.0 ops / 2798 kpx, CPU blends 0 kpx, sprites 0.0 blits + 0.00 made (0 us)
+longest pass (463 us): render 438, vm 2, input 1, callbacks 1

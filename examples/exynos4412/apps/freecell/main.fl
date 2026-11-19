@@ -1,0 +1,800 @@
+// main.fl — FreeCell, an app package (ferrite-ui-xl docs/apps.md): build it
+// with ferrite_build, install it with `ferrite_cli app install freecell.bin`
+// and start it from the tablet's app drawer.
+//
+// Rules: eight columns, four free cells, four foundations (ace up, by
+// suit). Only the top card of a column or a free cell can be moved: drag it
+// onto a column (one rank lower, other colour), a free cell or a
+// foundation, or tap it to send it to a foundation (else a free cell, else
+// a column it fits on). Cards that nothing else can need any more go to the
+// foundations by themselves. Deals are numbered (1..32000, the classic
+// linear-congruential deal), so a game can be restarted.
+//
+// Widgets belong to places, not to cards: every column has SLOTS image
+// widgets (top to bottom, later ones drawn over earlier ones), every cell
+// and foundation one; a move only changes which card image a slot shows.
+// One more image widget above all of them is the card in flight (dragged,
+// flying back, or flying to its place).
+
+#include "core.fl"
+#include "anim.fl"
+#include "apps.fl"
+
+// --- Layout (1280 x 800) ---
+const CARD_W   = 128;   // make_assets.py CARD_W / CARD_H / CARD_R
+const CARD_H   = 176;
+const CARD_R   = 10;
+const PITCH    = 152;   // card + gap
+const LEFT     = 44;    // (1280 - 8 * 128 - 7 * 24) / 2
+const BAR_H    = 64;
+const TOP_Y    = 80;    // free cells and foundations
+const COL_Y    = 276;   // columns
+const COL_MAX_H = 500;  // tallest column, its top card included
+const FAN      = 40;    // column offset while the column fits
+const SLOTS    = 20;    // slots per column (a column holds 19 at most)
+const NSLOT    = 168;   // 8 * SLOTS + 8
+const SNAP     = 16;    // drop tolerance around a pile, px
+const TAP_SLOP = 10;    // a press moving less than this is a tap
+
+// Fonts (make_assets.py FONTS)
+const F22 = 1;
+const F40 = 2;
+
+// Palette (RGB565)
+const C_WHITE    = 0xFFFF;
+const FELT       = 0x12E6;  // 21,92,52
+const FELT_DARK  = 0x0A24;  // 14,70,38
+const FELT_LINE  = 0x3C0A;  // 60,130,85
+const BAR_BG     = 0x0983;  // 12,48,28
+const BTN_BG     = 0x2307;  // 34,96,60
+const BTN_HI     = 0x3C6B;  // 60,140,90
+const C_DIM      = 0xAE56;  // 170,200,180
+const C_GOLD     = 0xFE8B;  // 250,210,90
+
+// --- Game state ---
+// Piles: 0..7 columns, 8..11 free cells, 12..15 foundations.
+// A card is suit * 13 + rank - 1 (suits: 0 clubs, 1 diamonds, 2 hearts,
+// 3 spades); its image id is card + 1.
+var tab[160];        // column c, position k (0 = bottom): tab[c * SLOTS + k]
+var tab_n[8];
+var cellc[4];        // -1 = empty
+var fnd[4];          // top card, -1 = empty
+var deck[52];
+var rng_state = 0;
+var game_no = 0;
+var moves = 0;
+var won = 0;
+// Undo history: from * 64 + to * 2 + auto (auto = moved by itself).
+const HIST_MAX = 1000;
+var hist[1000];
+var hist_n = 0;
+
+// Statistics (EEPROM: 'F', played lo/hi, won lo/hi).
+var ee[5];
+var ee_ok = 0;
+var games_played = 0;
+var games_won = 0;
+
+// --- Widgets ---
+var slot_w[168];     // NSLOT: columns first, then piles 8..15 at 152 + pile
+var shown_img[168];  // what each slot shows now (only changes are written)
+var shown_y[168];
+var shown_on[168];
+var drag_w;
+var status_lbl;
+var btn_new; var btn_restart; var btn_undo; var btn_exit;
+var win_panel; var win_sub; var btn_again;
+
+// --- Touch / flight ---
+var dragging = 0;
+var drag_from = -1;
+var drag_card = -1;
+var grab_dx = 0;
+var grab_dy = 0;
+var press_x = 0;
+var press_y = 0;
+var drag_moved = 0;
+var drag_x0 = 0;     // where the dragged card came from
+var drag_y0 = 0;
+var drag_cx = 0;     // where it is now
+var drag_cy = 0;
+var busy = 0;        // a card is flying
+var fly_to = -1;
+
+// ============================================================
+// Cards and piles
+// ============================================================
+
+fn card_rank(cd) { return cd % 13 + 1; }
+fn card_suit(cd) { return cd / 13; }
+fn card_red(cd) {
+    var s = cd / 13;
+    return s == 1 || s == 2;
+}
+
+fn pile_x(p) {
+    if (p < 8) {
+        return LEFT + p * PITCH;
+    }
+    return LEFT + (p - 8) * PITCH;
+}
+
+// Offset between the cards of a column of n.
+fn fan(n) {
+    if (n < 2) {
+        return FAN;
+    }
+    var f = (COL_MAX_H - CARD_H) / (n - 1);
+    return f < FAN ? f : FAN;
+}
+
+// y of the top card of pile p (where the next one goes when `next`).
+fn top_y(p, next) {
+    if (p >= 8) {
+        return TOP_Y;
+    }
+    var n = tab_n[p] + next;
+    if (n < 1) {
+        n = 1;
+    }
+    return COL_Y + (n - 1) * fan(n);
+}
+
+fn top_card(p) {
+    if (p < 8) {
+        var n = tab_n[p];
+        return n > 0 ? tab[p * SLOTS + n - 1] : -1;
+    }
+    if (p < 12) {
+        return cellc[p - 8];
+    }
+    return fnd[p - 12];
+}
+
+fn top_slot(p) {
+    if (p < 8) {
+        return p * SLOTS + tab_n[p] - 1;
+    }
+    return 152 + p;
+}
+
+fn can_put(cd, p) {
+    if (p < 8) {
+        var n = tab_n[p];
+        if (n == 0) {
+            return 1;
+        }
+        if (n >= SLOTS) {
+            return 0;
+        }
+        var t = tab[p * SLOTS + n - 1];
+        return card_rank(t) == card_rank(cd) + 1 && card_red(t) != card_red(cd);
+    }
+    if (p < 12) {
+        return cellc[p - 8] < 0;
+    }
+    var f = fnd[p - 12];
+    if (f < 0) {
+        return card_rank(cd) == 1;
+    }
+    return card_suit(f) == card_suit(cd) && card_rank(cd) == card_rank(f) + 1;
+}
+
+// Takes the top card off pile p (no checks).
+fn take(p) {
+    var cd = top_card(p);
+    if (p < 8) {
+        tab_n[p] = tab_n[p] - 1;
+    } else if (p < 12) {
+        cellc[p - 8] = -1;
+    } else {
+        fnd[p - 12] = card_rank(cd) == 1 ? -1 : cd - 1;
+    }
+    return cd;
+}
+
+fn put(cd, p) {
+    if (p < 8) {
+        tab[p * SLOTS + tab_n[p]] = cd;
+        tab_n[p] = tab_n[p] + 1;
+    } else if (p < 12) {
+        cellc[p - 8] = cd;
+    } else {
+        fnd[p - 12] = cd;
+    }
+}
+
+fn move_card(from, to, auto) {
+    put(take(from), to);
+    if (hist_n < HIST_MAX) {
+        hist[hist_n] = from * 64 + to * 2 + auto;
+        hist_n = hist_n + 1;
+    }
+    moves = moves + 1;
+}
+
+// The foundation card `cd` can go on, or -1.
+fn foundation_for(cd) {
+    for (var f = 12; f < 16; f++) {
+        if (can_put(cd, f)) {
+            return f;
+        }
+    }
+    return -1;
+}
+
+// Rank on the foundation of suit s (0 = none yet).
+fn suit_height(s) {
+    for (var f = 0; f < 4; f++) {
+        if (fnd[f] >= 0 && card_suit(fnd[f]) == s) {
+            return card_rank(fnd[f]);
+        }
+    }
+    return 0;
+}
+
+// A card no other card can need any more: aces and twos, or both
+// foundations of the other colour at least one rank below it.
+fn safe_home(cd) {
+    var r = card_rank(cd);
+    if (r <= 2) {
+        return 1;
+    }
+    var a = card_red(cd) ? suit_height(0) : suit_height(1);
+    var b = card_red(cd) ? suit_height(3) : suit_height(2);
+    return a >= r - 1 && b >= r - 1;
+}
+
+// ============================================================
+// Deal (the classic numbered deal: LCG 214013 / 2531011)
+// ============================================================
+
+fn deal_rand() {
+    rng_state = (rng_state * 214013 + 2531011) & 0x7FFFFFFF;
+    return rng_state >> 16;
+}
+
+fn deal(num) {
+    game_no = num;
+    rng_state = num;
+    for (var i = 0; i < 52; i++) {
+        deck[i] = i;
+    }
+    for (var c = 0; c < 8; c++) {
+        tab_n[c] = 0;
+    }
+    for (var k = 0; k < 4; k++) {
+        cellc[k] = -1;
+        fnd[k] = -1;
+    }
+    var left = 52;
+    for (var pos = 0; pos < 52; pos++) {
+        var r = deal_rand() % left;
+        var m = deck[r];          // rank * 4 + suit
+        deck[r] = deck[left - 1];
+        left = left - 1;
+        put((m % 4) * 13 + m / 4, pos % 8);
+    }
+    hist_n = 0;
+    moves = 0;
+    won = 0;
+    dragging = 0;
+    busy = 0;
+    target(drag_w);
+    set(visible, OFF);
+    target(win_panel);
+    set(visible, OFF);
+    for (var p = 0; p < 16; p++) {
+        render_pile(p);
+    }
+    show_status();
+}
+
+fn new_game() {
+    var num = (millis() + games_played * 7919) % 32000 + 1;
+    if (num == game_no) {
+        num = num % 32000 + 1;
+    }
+    games_played = games_played + 1;
+    save_stats();
+    deal(num);
+}
+
+// ============================================================
+// Showing
+// ============================================================
+
+fn slot_x(i) {
+    if (i < 160) {
+        return pile_x(i / SLOTS);
+    }
+    return pile_x(i - 152);
+}
+
+fn show_slot(i, img, y, on) {
+    target(slot_w[i]);
+    if (on) {
+        if (img != shown_img[i]) {
+            set(image_id, img);
+            shown_img[i] = img;
+        }
+        if (y != shown_y[i]) {
+            set(location, slot_x(i), y);
+            shown_y[i] = y;
+        }
+    }
+    if (on != shown_on[i]) {
+        set(visible, on);
+        shown_on[i] = on;
+    }
+}
+
+fn render_pile(p) {
+    if (p < 8) {
+        var n = tab_n[p];
+        var f = fan(n);
+        for (var k = 0; k < SLOTS; k++) {
+            var i = p * SLOTS + k;
+            if (k < n) {
+                show_slot(i, tab[i] + 1, COL_Y + k * f, 1);
+            } else {
+                show_slot(i, 0, 0, 0);
+            }
+        }
+    } else {
+        var cd = top_card(p);
+        show_slot(152 + p, cd + 1, TOP_Y, cd >= 0);
+    }
+}
+
+fn hide_top(p) {
+    var i = top_slot(p);
+    target(slot_w[i]);
+    set(visible, OFF);
+    shown_on[i] = 0;
+}
+
+fn show_status() {
+    target(status_lbl);
+    set(text, sprintf("Game %d   Moves %d   Won %d/%d", game_no, moves, games_won, games_played));
+    target(btn_undo);
+    set(text_color, hist_n > 0 ? C_WHITE : FELT_LINE);
+}
+
+// ============================================================
+// Statistics
+// ============================================================
+
+fn load_stats() {
+    if (eepromSize() < 5) {
+        return 0;
+    }
+    ee_ok = 1;
+    eepromReadArr(0, ee, 5);
+    if (ee[0] != 70) {
+        return 0;
+    }
+    games_played = ee[1] + ee[2] * 256;
+    games_won = ee[3] + ee[4] * 256;
+}
+
+fn save_stats() {
+    if (!ee_ok) {
+        return 0;
+    }
+    ee[0] = 70;
+    ee[1] = games_played % 256;
+    ee[2] = games_played / 256 % 256;
+    ee[3] = games_won % 256;
+    ee[4] = games_won / 256 % 256;
+    eepromWriteArr(0, ee, 5);
+}
+
+// ============================================================
+// Moving
+// ============================================================
+
+// Moves the top card of `from` to `to` and flies it there from (x, y).
+fn fly(from, to, auto, x, y, ms) {
+    var cd = top_card(from);
+    move_card(from, to, auto);
+    render_pile(from);
+    busy = 1;
+    fly_to = to;
+    target(drag_w);
+    set(image_id, cd + 1);
+    set(location, x, y);
+    set(visible, ON);
+    animate(drag_w, PROP_LOC_X, pile_x(to), ms, EASE_OUT, @on_fly_end);
+    animate(drag_w, PROP_LOC_Y, top_y(to, 0), ms, EASE_OUT);
+}
+
+fn on_fly_end(w, prop) {
+    target(drag_w);
+    set(visible, OFF);
+    render_pile(fly_to);
+    busy = 0;
+    show_status();
+    auto_step();
+}
+
+// One card that is safe to put home flies there; else check for a win.
+fn auto_step() {
+    for (var p = 0; p < 12; p++) {
+        var cd = top_card(p);
+        if (cd >= 0 && safe_home(cd)) {
+            var f = foundation_for(cd);
+            if (f >= 0) {
+                fly(p, f, 1, pile_x(p), top_y(p, 0), 170);
+                return 0;
+            }
+        }
+    }
+    check_win();
+}
+
+fn check_win() {
+    for (var f = 0; f < 4; f++) {
+        if (fnd[f] < 0 || card_rank(fnd[f]) != 13) {
+            return 0;
+        }
+    }
+    if (won) {
+        return 0;
+    }
+    won = 1;
+    games_won = games_won + 1;
+    save_stats();
+    show_status();
+    target(win_sub);
+    set(text, sprintf("Game %d in %d moves.  Won %d of %d.", game_no, moves, games_won, games_played));
+    target(win_panel);
+    set(visible, ON);
+}
+
+fn undo() {
+    if (busy || dragging || hist_n == 0) {
+        return 0;
+    }
+    // The cards that went home by themselves, then the move before them.
+    var user = 0;
+    while (hist_n > 0 && !user) {
+        var e = hist[hist_n - 1];
+        hist_n = hist_n - 1;
+        var from = e / 64;
+        var to = e / 2 % 32;
+        user = !(e & 1);
+        put(take(to), from);
+        moves = moves - 1;
+        render_pile(from);
+        render_pile(to);
+    }
+    won = 0;
+    target(win_panel);
+    set(visible, OFF);
+    show_status();
+}
+
+// Where a card dropped with its centre at (x, y) lands, or -1.
+fn drop_pile(x, y) {
+    if (y >= COL_Y - SNAP) {
+        for (var c = 0; c < 8; c++) {
+            if (x >= pile_x(c) - SNAP && x < pile_x(c) + CARD_W + SNAP) {
+                return c;
+            }
+        }
+        return -1;
+    }
+    if (y >= TOP_Y - SNAP * 2 && y < TOP_Y + CARD_H + SNAP) {
+        for (var p = 8; p < 16; p++) {
+            if (x >= pile_x(p) - SNAP && x < pile_x(p) + CARD_W + SNAP) {
+                return p;
+            }
+        }
+    }
+    return -1;
+}
+
+fn free_cell() {
+    for (var p = 8; p < 12; p++) {
+        if (cellc[p - 8] < 0) {
+            return p;
+        }
+    }
+    return -1;
+}
+
+// The pile a card dropped on pile p goes to: a free cell or a foundation
+// counts as the whole row of them.
+fn resolve_drop(cd, p) {
+    if (p < 0 || p == drag_from) {
+        return -1;
+    }
+    if (p >= 12) {
+        return foundation_for(cd);
+    }
+    if (p >= 8) {
+        return can_put(cd, p) ? p : free_cell();
+    }
+    return can_put(cd, p) ? p : -1;
+}
+
+// A tapped card: home, else a free cell (from a column), else a column it
+// fits on, else an empty column.
+fn tap_target(cd, from) {
+    var f = foundation_for(cd);
+    if (f >= 0) {
+        return f;
+    }
+    if (from < 8) {
+        f = free_cell();
+        if (f >= 0) {
+            return f;
+        }
+    }
+    for (var c = 0; c < 8; c++) {
+        if (c != from && tab_n[c] > 0 && can_put(cd, c)) {
+            return c;
+        }
+    }
+    if (from >= 8) {
+        for (var c2 = 0; c2 < 8; c2++) {
+            if (tab_n[c2] == 0) {
+                return c2;
+            }
+        }
+    }
+    return -1;
+}
+
+fn on_back_end(w, prop) {
+    target(drag_w);
+    set(visible, OFF);
+    render_pile(drag_from);
+    busy = 0;
+}
+
+// ============================================================
+// Touch
+// ============================================================
+
+fn on_touch_down(x, y) {
+    if (busy || dragging || won || y < BAR_H) {
+        return 0;
+    }
+    var p = -1;
+    for (var c = 0; c < 8; c++) {
+        var n = tab_n[c];
+        var ty = top_y(c, 0);
+        if (n > 0 && x >= pile_x(c) && x < pile_x(c) + CARD_W && y >= ty && y < ty + CARD_H) {
+            p = c;
+        }
+    }
+    for (var q = 8; q < 12; q++) {
+        if (cellc[q - 8] >= 0 && x >= pile_x(q) && x < pile_x(q) + CARD_W && y >= TOP_Y && y < TOP_Y + CARD_H) {
+            p = q;
+        }
+    }
+    if (p < 0) {
+        return 0;
+    }
+    dragging = 1;
+    drag_from = p;
+    drag_card = top_card(p);
+    drag_x0 = pile_x(p);
+    drag_y0 = top_y(p, 0);
+    grab_dx = x - drag_x0;
+    grab_dy = y - drag_y0;
+    press_x = x;
+    press_y = y;
+    drag_moved = 0;
+    target(drag_w);
+    set(image_id, drag_card + 1);
+    set(location, drag_x0, drag_y0);
+    set(visible, ON);
+    drag_cx = drag_x0;
+    drag_cy = drag_y0;
+    hide_top(p);
+}
+
+fn on_touch_move(x, y) {
+    if (!dragging) {
+        return 0;
+    }
+    var dx = x - press_x;
+    var dy = y - press_y;
+    if (dx > TAP_SLOP || dx < -TAP_SLOP || dy > TAP_SLOP || dy < -TAP_SLOP) {
+        drag_moved = 1;
+    }
+    if (drag_moved) {
+        drag_cx = x - grab_dx;
+        drag_cy = y - grab_dy;
+        target(drag_w);
+        set(location, drag_cx, drag_cy);
+    }
+}
+
+fn on_touch_up() {
+    if (!dragging) {
+        return 0;
+    }
+    dragging = 0;
+    var to = -1;
+    if (drag_moved) {
+        to = resolve_drop(drag_card, drop_pile(drag_cx + CARD_W / 2, drag_cy + CARD_H / 2));
+    } else {
+        to = tap_target(drag_card, drag_from);
+    }
+    if (to >= 0) {
+        fly(drag_from, to, 0, drag_cx, drag_cy, drag_moved ? 90 : 160);
+        return 0;
+    }
+    // Back where it came from.
+    busy = 1;
+    animate(drag_w, PROP_LOC_X, drag_x0, 160, EASE_OUT, @on_back_end);
+    animate(drag_w, PROP_LOC_Y, drag_y0, 160, EASE_OUT);
+}
+
+// ============================================================
+// Building
+// ============================================================
+
+fn text_button(b: widget, par: widget, x, y, w, h, caption: string) {
+    target(b);
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(bg_color, BTN_BG);
+    set(press_color, BTN_HI);
+    set(border_radius, h / 2);
+    set(font_id, F22);
+    set(text_color, C_WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, caption);
+    set(clickable, ON);
+    parent(par);
+}
+
+fn place_box(x, y, mark: string) {
+    var b = alloc();
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, CARD_W, CARD_H);
+    set(bg_color, FELT_DARK);
+    set(border_radius, CARD_R);
+    set(border_color, FELT_LINE);
+    set(border, 2, 2, 2, 2);
+    set(font_id, F40);
+    set(text_color, FELT_LINE);
+    set(text_align, ALIGN_CENTER);
+    set(text, mark);
+    parent(0);
+}
+
+fn on_button(w) {
+    if (busy || dragging) {
+        return 0;
+    }
+    if (w == btn_new || w == btn_again) {
+        new_game();
+    }
+    if (w == btn_restart) {
+        deal(game_no);
+    }
+    if (w == btn_undo) {
+        undo();
+    }
+    if (w == btn_exit) {
+        exitApp();
+    }
+}
+
+fn setup() {
+    var bg = alloc();
+    set(location, 0, 0);
+    set(size, 1280, 800);
+    set(bg_color, FELT);
+    parent(0);
+
+    var bar = alloc();
+    set(location, 0, 0);
+    set(size, 1280, BAR_H);
+    set(bg_color, BAR_BG);
+    parent(0);
+    var title = alloc();
+    set(kind, KIND_LABEL);
+    set(location, LEFT, 8);
+    set(size, 200, 48);
+    set(font_id, F40);
+    set(text_color, C_WHITE);
+    set(text_align, ALIGN_LEFT);
+    set(text, "FreeCell");
+    parent(0);
+    status_lbl = alloc();
+    set(kind, KIND_LABEL);
+    set(location, 270, 18);
+    set(size, 480, 30);
+    set(font_id, F22);
+    set(text_color, C_DIM);
+    set(text_align, ALIGN_LEFT);
+    parent(0);
+
+    btn_undo = alloc();
+    text_button(btn_undo, 0, 1280 - LEFT - 4 * 110 - 3 * 12, 10, 110, 44, "Undo");
+    set(on_click, @on_button);
+    btn_restart = alloc();
+    text_button(btn_restart, 0, 1280 - LEFT - 3 * 110 - 2 * 12, 10, 110, 44, "Restart");
+    set(on_click, @on_button);
+    btn_new = alloc();
+    text_button(btn_new, 0, 1280 - LEFT - 2 * 110 - 12, 10, 110, 44, "New");
+    set(on_click, @on_button);
+    btn_exit = alloc();
+    text_button(btn_exit, 0, 1280 - LEFT - 110, 10, 110, 44, "Exit");
+    set(on_click, @on_button);
+
+    // Empty places.
+    for (var p = 8; p < 16; p++) {
+        place_box(pile_x(p), TOP_Y, p >= 12 ? "A" : "");
+    }
+    for (var c = 0; c < 8; c++) {
+        place_box(pile_x(c), COL_Y, "");
+    }
+
+    // Card slots, columns first (bottom card first: drawn under the next).
+    for (var i = 0; i < NSLOT; i++) {
+        var s = alloc();
+        set(kind, KIND_IMAGE);
+        set(size, CARD_W, CARD_H);
+        set(location, slot_x(i), 0);
+        set(visible, OFF);
+        parent(0);
+        slot_w[i] = s;
+        shown_img[i] = -1;
+        shown_y[i] = 0;
+        shown_on[i] = 0;
+    }
+
+    drag_w = alloc();
+    set(kind, KIND_IMAGE);
+    set(size, CARD_W, CARD_H);
+    set(visible, OFF);
+    parent(0);
+
+    win_panel = alloc();
+    set(location, 340, 280);
+    set(size, 600, 240);
+    set(bg_color, BAR_BG);
+    set(border_radius, 24);
+    set(border_color, C_GOLD);
+    set(border, 3, 3, 3, 3);
+    set(visible, OFF);
+    parent(0);
+    var wt = alloc();
+    set(kind, KIND_LABEL);
+    set(location, 0, 28);
+    set(size, 600, 50);
+    set(font_id, F40);
+    set(text_color, C_GOLD);
+    set(text_align, ALIGN_CENTER);
+    set(text, "You won!");
+    parent(win_panel);
+    win_sub = alloc();
+    set(kind, KIND_LABEL);
+    set(location, 0, 90);
+    set(size, 600, 30);
+    set(font_id, F22);
+    set(text_color, C_WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(win_panel);
+    btn_again = alloc();
+    text_button(btn_again, win_panel, 190, 150, 220, 56, "New game");
+    set(on_click, @on_button);
+
+    load_stats();
+    new_game();
+    return 0;
+}
+
+fn loop() {
+    delay(50);
+}

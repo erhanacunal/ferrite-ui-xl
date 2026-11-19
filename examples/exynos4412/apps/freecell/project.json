@@ -1,0 +1,295 @@
+{
+  "version": 2,
+  "device": "exynos4412-xl",
+  "screen": [
+    1280,
+    800
+  ],
+  "render_mode": "dirty",
+  "include_dirs": [
+    "../../../../../ferrite-ui/lib"
+  ],
+  "fonts": [
+    {
+      "name": "f22",
+      "font_id": 1,
+      "file": "assets/f22.font"
+    },
+    {
+      "name": "f40",
+      "font_id": 2,
+      "file": "assets/f40.font"
+    }
+  ],
+  "images": [
+    {
+      "name": "card_001",
+      "image_id": 1,
+      "source": "assets/card_001.png"
+    },
+    {
+      "name": "card_002",
+      "image_id": 2,
+      "source": "assets/card_002.png"
+    },
+    {
+      "name": "card_003",
+      "image_id": 3,
+      "source": "assets/card_003.png"
+    },
+    {
+      "name": "card_004",
+      "image_id": 4,
+      "source": "assets/card_004.png"
+    },
+    {
+      "name": "card_005",
+      "image_id": 5,
+      "source": "assets/card_005.png"
+    },
+    {
+      "name": "card_006",
+      "image_id": 6,
+      "source": "assets/card_006.png"
+    },
+    {
+      "name": "card_007",
+      "image_id": 7,
+      "source": "assets/card_007.png"
+    },
+    {
+      "name": "card_008",
+      "image_id": 8,
+      "source": "assets/card_008.png"
+    },
+    {
+      "name": "card_009",
+      "image_id": 9,
+      "source": "assets/card_009.png"
+    },
+    {
+      "name": "card_010",
+      "image_id": 10,
+      "source": "assets/card_010.png"
+    },
+    {
+      "name": "card_011",
+      "image_id": 11,
+      "source": "assets/card_011.png"
+    },
+    {
+      "name": "card_012",
+      "image_id": 12,
+      "source": "assets/card_012.png"
+    },
+    {
+      "name": "card_013",
+      "image_id": 13,
+      "source": "assets/card_013.png"
+    },
+    {
+      "name": "card_101",
+      "image_id": 14,
+      "source": "assets/card_101.png"
+    },
+    {
+      "name": "card_102",
+      "image_id": 15,
+      "source": "assets/card_102.png"
+    },
+    {
+      "name": "card_103",
+      "image_id": 16,
+      "source": "assets/card_103.png"
+    },
+    {
+      "name": "card_104",
+      "image_id": 17,
+      "source": "assets/card_104.png"
+    },
+    {
+      "name": "card_105",
+      "image_id": 18,
+      "source": "assets/card_105.png"
+    },
+    {
+      "name": "card_106",
+      "image_id": 19,
+      "source": "assets/card_106.png"
+    },
+    {
+      "name": "card_107",
+      "image_id": 20,
+      "source": "assets/card_107.png"
+    },
+    {
+      "name": "card_108",
+      "image_id": 21,
+      "source": "assets/card_108.png"
+    },
+    {
+      "name": "card_109",
+      "image_id": 22,
+      "source": "assets/card_109.png"
+    },
+    {
+      "name": "card_110",
+      "image_id": 23,
+      "source": "assets/card_110.png"
+    },
+    {
+      "name": "card_111",
+      "image_id": 24,
+      "source": "assets/card_111.png"
+    },
+    {
+      "name": "card_112",
+      "image_id": 25,
+      "source": "assets/card_112.png"
+    },
+    {
+      "name": "card_113",
+      "image_id": 26,
+      "source": "assets/card_113.png"
+    },
+    {
+      "name": "card_201",
+      "image_id": 27,
+      "source": "assets/card_201.png"
+    },
+    {
+      "name": "card_202",
+      "image_id": 28,
+      "source": "assets/card_202.png"
+    },
+    {
+      "name": "card_203",
+      "image_id": 29,
+      "source": "assets/card_203.png"
+    },
+    {
+      "name": "card_204",
+      "image_id": 30,
+      "source": "assets/card_204.png"
+    },
+    {
+      "name": "card_205",
+      "image_id": 31,
+      "source": "assets/card_205.png"
+    },
+    {
+      "name": "card_206",
+      "image_id": 32,
+      "source": "assets/card_206.png"
+    },
+    {
+      "name": "card_207",
+      "image_id": 33,
+      "source": "assets/card_207.png"
+    },
+    {
+      "name": "card_208",
+      "image_id": 34,
+      "source": "assets/card_208.png"
+    },
+    {
+      "name": "card_209",
+      "image_id": 35,
+      "source": "assets/card_209.png"
+    },
+    {
+      "name": "card_210",
+      "image_id": 36,
+      "source": "assets/card_210.png"
+    },
+    {
+      "name": "card_211",
+      "image_id": 37,
+      "source": "assets/card_211.png"
+    },
+    {
+      "name": "card_212",
+      "image_id": 38,
+      "source": "assets/card_212.png"
+    },
+    {
+      "name": "card_213",
+      "image_id": 39,
+      "source": "assets/card_213.png"
+    },
+    {
+      "name": "card_301",
+      "image_id": 40,
+      "source": "assets/card_301.png"
+    },
+    {
+      "name": "card_302",
+      "image_id": 41,
+      "source": "assets/card_302.png"
+    },
+    {
+      "name": "card_303",
+      "image_id": 42,
+      "source": "assets/card_303.png"
+    },
+    {
+      "name": "card_304",
+      "image_id": 43,
+      "source": "assets/card_304.png"
+    },
+    {
+      "name": "card_305",
+      "image_id": 44,
+      "source": "assets/card_305.png"
+    },
+    {
+      "name": "card_306",
+      "image_id": 45,
+      "source": "assets/card_306.png"
+    },
+    {
+      "name": "card_307",
+      "image_id": 46,
+      "source": "assets/card_307.png"
+    },
+    {
+      "name": "card_308",
+      "image_id": 47,
+      "source": "assets/card_308.png"
+    },
+    {
+      "name": "card_309",
+      "image_id": 48,
+      "source": "assets/card_309.png"
+    },
+    {
+      "name": "card_310",
+      "image_id": 49,
+      "source": "assets/card_310.png"
+    },
+    {
+      "name": "card_311",
+      "image_id": 50,
+      "source": "assets/card_311.png"
+    },
+    {
+      "name": "card_312",
+      "image_id": 51,
+      "source": "assets/card_312.png"
+    },
+    {
+      "name": "card_313",
+      "image_id": 52,
+      "source": "assets/card_313.png"
+    }
+  ],
+  "programs": [
+    {
+      "name": "main",
+      "source": "main.fl"
+    }
+  ],
+  "application_id": "com.example.freecell",
+  "name": "FreeCell",
+  "app_version": "1.0.0"
+}

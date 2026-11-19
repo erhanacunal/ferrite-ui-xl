@@ -183,7 +183,9 @@ Sim (`bsp/sim/src/apps.rs`): with `--storage DIR` apps live in
 `--install PKG` (repeatable) installs at start, `--app ID` boots one. The
 system image's flash part and EEPROM are kept aside while an app runs.
 Example: `examples/exynos4412/apps` (a launcher system image, one app source
-built as two apps).
+built as two apps). A complete game as a package: `examples/exynos4412/apps/freecell`
+(`make_assets.py` draws the cards and fonts first; started from the tablet's
+app drawer).
 
 ## Step 2: several apps at once (design, 2026-11-19)
 

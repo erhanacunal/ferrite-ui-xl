@@ -283,7 +283,8 @@ Phases:
   pixel-identical with `FERRITE_SIM_DL_VERIFY` / `SCENE_VERIFY` / `AREAS`.
   Board: the same, and four apps at once (heap 94 MB); a system writefs
   ends them.
-- **2d:** notes, CLAUDE.md.
+- **2d** (done 2026-11-19): notes (`docs/notes/xl.md`), CLAUDE.md keep-in-sync
+  (app syscalls 0x80–0x88, `apps::err` 11–20).
 
 ## Step 3 constraints (decided now, built later)
 

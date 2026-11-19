@@ -10,6 +10,7 @@
 //! ntp=pool.ntp.org    # NTP server; "off" = no sync; none = DEFAULT_NTP
 //! brightness=40       # the backlight a program last set, applied at start
 //! volume=70           # the volume a program last set, applied at start
+//! app=com.acme.clock   # the installed app to start at boot (docs/apps.md); none = the system image
 //! ```
 //!
 //! The RTC keeps UTC; [`crate::rtc::RtcImpl`] shows programs (and the protocol's set-time)
@@ -73,6 +74,8 @@ pub struct DeviceSettings {
     pub ntp: String,
     pub brightness: Option<u8>,
     pub volume: Option<u8>,
+    /// The app started at boot (an `application_id`); empty = the system image.
+    pub app: String,
 }
 
 /// `+3`, `+03:00`, `-3:30`, `+0545`, `UTC+3` → minutes; `None` if malformed or out of range.
@@ -133,6 +136,7 @@ impl DeviceSettings {
                 "ntp" => s.ntp = String::from(value),
                 "brightness" => s.brightness = parse_percent(value),
                 "volume" => s.volume = parse_percent(value),
+                "app" if value.is_empty() || crate::apps::valid_id(value) => s.app = String::from(value),
                 _ => {}
             }
         }
@@ -160,6 +164,11 @@ impl DeviceSettings {
         }
         if let Some(v) = self.volume {
             out.push_str(&format!("volume={}\n", v));
+        }
+        if !self.app.is_empty() {
+            out.push_str("app=");
+            out.push_str(&self.app);
+            out.push('\n');
         }
         out.into_bytes()
     }
@@ -203,6 +212,12 @@ fn change(cell: &AtomicI32, value: i32, now_ms: u32) {
     }
 }
 
+/// Something the board keeps outside these cells changed (the boot app): save like any change.
+pub fn mark_changed(now_ms: u32) {
+    CHANGED_AT.store(now_ms, Ordering::Relaxed);
+    CHANGED.store(true, Ordering::Release);
+}
+
 /// Sets the UTC offset; false if out of range.
 pub fn set_utc_offset(min: i32, now_ms: u32) -> bool {
     if !(OFFSET_MIN..=OFFSET_MAX).contains(&min) {
@@ -243,6 +258,7 @@ pub fn current(base: &DeviceSettings) -> DeviceSettings {
         ntp: base.ntp.clone(),
         brightness: pct(&BRIGHTNESS),
         volume: pct(&VOLUME),
+        app: base.app.clone(),
     }
 }
 
@@ -315,7 +331,13 @@ mod tests {
 
     #[test]
     fn settings_survive_a_save_and_a_read() {
-        let s = DeviceSettings { utc_offset: 345, ntp: "time.google.com".into(), brightness: Some(40), volume: Some(0) };
+        let s = DeviceSettings {
+            utc_offset: 345,
+            ntp: "time.google.com".into(),
+            brightness: Some(40),
+            volume: Some(0),
+            app: "com.acme.clock".into(),
+        };
         assert_eq!(DeviceSettings::parse(&s.format()), s);
         let d = DeviceSettings::default();
         assert_eq!(DeviceSettings::parse(&d.format()), d);
@@ -323,5 +345,6 @@ mod tests {
         let off = DeviceSettings::parse(b"ntp=off # no sync\nvolume=101\nbrightness=x\n");
         assert_eq!(off.ntp_server(), None);
         assert_eq!((off.volume, off.brightness), (None, None));
+        assert_eq!(DeviceSettings::parse(b"app=Bad Id\n").app, "");
     }
 }

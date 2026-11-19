@@ -30,6 +30,24 @@ unsafe impl Sync for Mem {}
 static MEM: Mem = Mem(UnsafeCell::new([0xFF; SIZE as usize]));
 static mut DIRTY: bool = false;
 static mut LAST_WRITE_MS: u32 = 0;
+/// A running app's directory for its EEPROM file (`ferrite/apps/{id}/data`, [`switch`]);
+/// None = [`storage::DIR`].
+static mut APP_DIR: Option<alloc::string::String> = None;
+
+fn dir() -> &'static str {
+    // SAFETY: CPU0 only.
+    unsafe { (*(&raw const APP_DIR)).as_deref().unwrap_or(storage::DIR) }
+}
+
+/// Saves the EEPROM, then takes the one in `app_dir` (an app's `data/`, None = the system
+/// image's): no app reads another's.
+pub fn switch(app_dir: Option<alloc::string::String>) {
+    save_if_dirty(true);
+    // SAFETY: CPU0 only.
+    unsafe { *(&raw mut APP_DIR) = app_dir };
+    mem().fill(0xFF);
+    load();
+}
 
 fn mem() -> &'static mut [u8; SIZE as usize] {
     // SAFETY: see `Mem`.
@@ -42,10 +60,11 @@ pub fn load() {
     if !storage::available() {
         return;
     }
-    let mut buf = alloc::vec![0u8; SIZE as usize];
-    if storage::read_exact(FILE, &mut buf) {
+    if let Some(buf) = storage::read_in(dir(), FILE, SIZE as usize)
+        && buf.len() == SIZE as usize
+    {
         mem().copy_from_slice(&buf);
-        println!("ferrite: EEPROM loaded from {}/{}", storage::DIR, FILE);
+        println!("ferrite: EEPROM loaded from {}/{}", dir(), FILE);
     }
 }
 
@@ -62,7 +81,7 @@ pub fn save_if_dirty(force: bool) {
         // Cleared first: a failed save is not retried every pass.
         DIRTY = false;
     }
-    if !storage::save_named(FILE, mem()) {
+    if !storage::save_in(dir(), FILE, mem()) {
         println!("ferrite: EEPROM save failed");
     }
 }

@@ -412,6 +412,26 @@ static mut FILES: [Option<UserFile>; MAX_OPEN] = [None; MAX_OPEN];
 static mut LAST_WRITE_MS: u32 = 0;
 /// [`USER_DIR`] made once per boot.
 static mut USER_READY: bool = false;
+/// A running app's root instead of [`USER_DIR`] (`ferrite/apps/{id}/data`, [`set_user_root`]).
+static mut USER_ROOT: Option<String> = None;
+
+/// Programs' files from now on under `root` (an app's `data/`), or [`USER_DIR`] with `None`.
+/// Every file must be closed.
+pub fn set_user_root(root: Option<String>) {
+    // SAFETY: CPU0 only.
+    unsafe {
+        *(&raw mut USER_ROOT) = root;
+        USER_READY = false;
+    }
+}
+
+fn user_root() -> String {
+    // SAFETY: CPU0 only.
+    match unsafe { (*(&raw const USER_ROOT)).as_ref() } {
+        Some(r) => lower(&format!("/{}", r)),
+        None => path(DIR, USER_DIR),
+    }
+}
 
 fn files() -> &'static mut [Option<UserFile>; MAX_OPEN] {
     // SAFETY: CPU0 only, never re-entered.
@@ -437,15 +457,20 @@ fn map_err(e: E) -> i32 {
 fn user() -> Result<&'static mut Fs, i32> {
     let fs = fs().ok_or(err::NO_STORAGE)?;
     if !unsafe { USER_READY } {
-        ensure_dir(fs, &lower(&format!("/{}", DIR))).map_err(map_err)?;
-        ensure_dir(fs, &path(DIR, USER_DIR)).map_err(map_err)?;
+        let root = user_root();
+        let mut at = String::new();
+        for c in root.split('/').filter(|c| !c.is_empty()) {
+            at.push('/');
+            at.push_str(c);
+            ensure_dir(fs, &at).map_err(map_err)?;
+        }
         unsafe { USER_READY = true };
     }
     Ok(fs)
 }
 
 fn user_path(path: &Path) -> String {
-    let mut s = format!("/{}/{}", DIR, USER_DIR);
+    let mut s = user_root();
     for c in path.components() {
         s.push('/');
         s.push_str(c);

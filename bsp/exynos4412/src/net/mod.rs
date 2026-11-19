@@ -919,8 +919,9 @@ pub enum Upload {
     /// saved without a restart.
     System([u8; 12], u8),
     /// `POST /api/apps`: an app package (ferrite-core `apps`), installed under
-    /// `ferrite/apps/{id}/` without a restart; the answer is JSON ([`app_answer`]).
-    App,
+    /// `ferrite/apps/{id}/` without a restart; the answer is JSON ([`app_answer`]). `true`
+    /// (`?run=1`): run it once installed.
+    App(bool),
 }
 
 impl Upload {
@@ -929,7 +930,7 @@ impl Upload {
             Upload::Fs => "flash",
             Upload::Firmware => "firmware",
             Upload::System(..) => "system",
-            Upload::App => "app",
+            Upload::App(_) => "app",
         }
     }
 }
@@ -1001,16 +1002,35 @@ fn app_json(info: &ferrite_core::apps::AppInfo) -> String {
     )
 }
 
+/// The running app's id ("" = the system image), for CPU3's `/api/status`.
+static RUNNING_APP: CriticalSectionMutex<RefCell<String>> = CriticalSectionMutex::new(RefCell::new(String::new()));
+
+/// CPU0 (`Platform::app_changed`): the app now running.
+pub fn set_running_app(id: &str) {
+    RUNNING_APP.lock(|r| *r.borrow_mut() = String::from(id));
+}
+
+/// The running app's id, "" for the system image.
+pub(crate) fn running_app() -> String {
+    RUNNING_APP.lock(|r| r.borrow().clone())
+}
+
 /// CPU0: installs an uploaded app package (`apps::install`); the answer goes to [`APP_ANSWER`].
-fn install_app(image: Vec<u8>) -> u8 {
+fn install_app(image: Vec<u8>, run: bool) -> u8 {
     use ferrite_core::platform::Platform;
     type P = crate::platform::Exynos4412Platform;
     let r = ferrite_core::apps::install(&crate::storage::BoardApps, &image, P::FS_BASE, P::CAPS);
+    drop(image);
     let (status, answer) = match r {
         Ok(done) => {
             println!("ferrite: app {} {} installed", done.info.id, done.info.version_text());
+            // Run it (`?run=1`), or restart the running app if this updated it.
+            let running = ferrite_core::apps::current().is_some_and(|a| a.id == done.info.id);
+            if run || running {
+                ferrite_core::apps::request_run(Some(&done.info.id));
+            }
             let body = app_json(&done.info);
-            (200, format!("{},\"replaced\":{}}}", &body[..body.len() - 1], done.replaced))
+            (200, format!("{},\"replaced\":{},\"run\":{}}}", &body[..body.len() - 1], done.replaced, run))
         }
         Err(code) => {
             println!("ferrite: app install failed: {}", ferrite_core::apps::err::text(code));
@@ -1166,6 +1186,10 @@ pub const STORAGE_CUT: u8 = 6;
 pub const STORAGE_APPS: u8 = 7;
 /// `DELETE /api/apps/{id}`: [`STORAGE_ARG`] is the id.
 pub const STORAGE_APP_REMOVE: u8 = 8;
+/// `POST /api/apps/run?id=`: [`STORAGE_ARG`] is the id ("" = the system image).
+pub const STORAGE_APP_RUN: u8 = 9;
+/// `POST /api/apps/boot?id=`: [`STORAGE_ARG`] is the id ("" = the system image).
+pub const STORAGE_APP_BOOT: u8 = 10;
 /// A request's argument (an app id), set before [`STORAGE_WANTED`].
 static STORAGE_ARG: CriticalSectionMutex<RefCell<String>> = CriticalSectionMutex::new(RefCell::new(String::new()));
 static STORAGE_TEXT: CriticalSectionMutex<RefCell<Option<(bool, String)>>> = CriticalSectionMutex::new(RefCell::new(None));
@@ -1221,13 +1245,59 @@ fn storage_service() {
             let apps = ferrite_core::apps::list(&crate::storage::BoardApps);
             let items: Vec<String> = apps.iter().map(app_json).collect();
             let available = crate::storage::BoardApps.available();
-            (true, format!("{{\"storage\":{},\"apps\":[{}]}}", available, items.join(",")))
+            let running = ferrite_core::apps::current().map(|a| a.id).unwrap_or_default();
+            let boot = crate::settings::boot_app().unwrap_or_default();
+            (
+                true,
+                format!(
+                    "{{\"storage\":{},\"running\":{},\"boot\":{},\"apps\":[{}]}}",
+                    available,
+                    json_str(&running),
+                    json_str(&boot),
+                    items.join(",")
+                ),
+            )
+        }
+        // `POST /api/apps/run?id=ID` (no id: the system image): from the next pass.
+        STORAGE_APP_RUN => {
+            let id = STORAGE_ARG.lock(|a| a.borrow().clone());
+            if id.is_empty() {
+                ferrite_core::apps::request_run(None);
+                (true, String::from("{\"run\":\"\"}"))
+            } else if ferrite_core::apps::find(&crate::storage::BoardApps, &id).is_some() {
+                ferrite_core::apps::request_run(Some(&id));
+                (true, format!("{{\"run\":{}}}", json_str(&id)))
+            } else {
+                let (status, body) = app_error(ferrite_core::apps::err::NOT_INSTALLED);
+                (false, format!("{} {}", status, body))
+            }
+        }
+        // `POST /api/apps/boot?id=ID` (no id: the system image): the app started at boot.
+        STORAGE_APP_BOOT => {
+            let id = STORAGE_ARG.lock(|a| a.borrow().clone());
+            if id.is_empty() || ferrite_core::apps::find(&crate::storage::BoardApps, &id).is_some() {
+                crate::settings::set_boot_app(&id);
+                println!("ferrite: boot app = {}", if id.is_empty() { "(system image)" } else { &id });
+                (true, format!("{{\"boot\":{}}}", json_str(&id)))
+            } else {
+                let (status, body) = app_error(ferrite_core::apps::err::NOT_INSTALLED);
+                (false, format!("{} {}", status, body))
+            }
         }
         STORAGE_APP_REMOVE => {
             let id = STORAGE_ARG.lock(|a| a.borrow().clone());
+            if ferrite_core::apps::current().is_some_and(|a| a.id == id) {
+                STORAGE_TEXT.lock(|t| {
+                    *t.borrow_mut() = Some((false, String::from("409 {\"error\":\"the app is running: run another first\"}")))
+                });
+                return;
+            }
             match ferrite_core::apps::remove(&crate::storage::BoardApps, &id) {
                 Ok(()) => {
                     println!("ferrite: app {} removed", id);
+                    if crate::settings::boot_app().as_deref() == Some(id.as_str()) {
+                        crate::settings::set_boot_app("");
+                    }
                     (true, format!("{{\"removed\":{}}}", json_str(&id)))
                 }
                 Err(code) => {
@@ -1296,7 +1366,7 @@ pub fn service(screen_ok: bool) {
         let len = image.len();
         let status = match kind {
             Upload::Fs => install(image),
-            Upload::App => install_app(image),
+            Upload::App(run) => install_app(image, run),
             Upload::Firmware => install_firmware(image, crc),
             Upload::System(name, len) => {
                 let name = core::str::from_utf8(&name[..usize::from(len)]).unwrap_or("");

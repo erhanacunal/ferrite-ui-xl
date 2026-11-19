@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "device": "exynos4412-xl",
+  "screen": [1280, 800],
+  "render_mode": "dirty",
+  "include_dirs": ["../../../../../ferrite-ui/lib"],
+  "programs": [
+    {"name": "main", "source": "../app.fl"}
+  ],
+  "application_id": "com.example.world",
+  "name": "World",
+  "app_version": "1.1.0"
+}

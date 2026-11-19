@@ -34,8 +34,27 @@ pub fn load() {
         s.volume
     );
     fs::apply(&s);
+    // SAFETY: CPU0 (see BOOT_APP).
+    unsafe { *(&raw mut BOOT_APP) = s.app.clone() };
     // SAFETY: CPU0 at boot, before CPU3 starts (see LOADED).
     unsafe { *(&raw mut LOADED) = Some(s) };
+}
+
+/// The app to start at boot (`app=`), changed by `set_boot_app`. CPU0 only.
+static mut BOOT_APP: String = String::new();
+
+/// The app to start at boot, if one is set.
+pub fn boot_app() -> Option<String> {
+    // SAFETY: CPU0 only (see BOOT_APP).
+    let app = unsafe { (*(&raw const BOOT_APP)).clone() };
+    (!app.is_empty()).then_some(app)
+}
+
+/// Sets (or with "" clears) the app to start at boot; saved like any setting change.
+pub fn set_boot_app(id: &str) {
+    // SAFETY: CPU0 only (see BOOT_APP).
+    unsafe { *(&raw mut BOOT_APP) = String::from(id) };
+    fs::mark_changed(crate::systick::millis());
 }
 
 /// The NTP server to ask (CPU3 reads it too), `None` when off.
@@ -48,7 +67,8 @@ pub fn save_if_due(force: bool) {
     if !fs::take_due(crate::systick::millis(), force) {
         return;
     }
-    let s = fs::current(loaded().unwrap_or(&DeviceSettings::default()));
+    let mut s = fs::current(loaded().unwrap_or(&DeviceSettings::default()));
+    s.app = boot_app().unwrap_or_default();
     if !storage::save_in(storage::SYSTEM_DIR, fs::SETTINGS_FILE, &s.format()) {
         println!("ferrite: saving {}/{} failed", storage::SYSTEM_DIR, fs::SETTINGS_FILE);
     }

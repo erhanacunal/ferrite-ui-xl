@@ -45,6 +45,12 @@ impl Platform for SimPlatform {
     const CAPS: u32 = CAP_AUDIO | CAP_JPEG | ferrite_core::platform::CAP_MULTI_PROGRAM | ferrite_core::platform::CAP_SUPEROPS | ferrite_core::platform::CAP_NATIVE_FLEX | ferrite_core::platform::CAP_STORAGE | ferrite_core::platform::CAP_GESTURES;
     // The tablet demo animates more widgets at once (exynos4412 has 64).
     const ANIM_SLOTS: usize = 64;
+    // App packages (`apps.rs`): put in the flash image to run.
+    const APP_MAX_BYTES: usize = crate::flash::sim::FLASH_SIZE - ferrite_core::fs::DEFAULT_FS_BASE as usize;
+
+    fn app_files() -> &'static dyn ferrite_core::apps::AppFiles {
+        crate::apps::files()
+    }
 
     const VERIFY_FS_ON_BOOT: bool = true;
 }
@@ -200,6 +206,25 @@ impl PlatformRuntime for SimPlatform {
 
     fn reset() -> ! {
         std::process::exit(0)
+    }
+
+    fn load_flash_image(ctx: &mut ferrite_core::ctx::Ctx<Self>, image: Option<&[u8]>) -> bool {
+        crate::apps::load_flash_image(&ctx.flash, Self::FS_BASE, crate::flash::sim::FLASH_SIZE, image)
+    }
+
+    fn app_changed(ctx: &mut ferrite_core::ctx::Ctx<Self>, app: Option<&ferrite_core::apps::AppInfo>) {
+        let data = app.and_then(crate::apps::data_dir);
+        ctx.storage.backend().set_root(data.clone());
+        let eeprom = data.map(|d| d.join("eeprom.bin").to_string_lossy().into_owned());
+        ctx.eeprom.backend().switch(app.is_some(), eeprom);
+        match app {
+            Some(a) => println!("app: running {} {}", a.id, a.version_text()),
+            None => println!("app: running the system image"),
+        }
+    }
+
+    fn boot_app() -> Option<String> {
+        crate::apps::boot_app()
     }
 
     fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {

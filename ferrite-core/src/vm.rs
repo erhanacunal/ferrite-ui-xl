@@ -2784,6 +2784,18 @@ impl Vm {
                 for i in (0..actual).rev() {
                     args[i] = self.pop();
                 }
+                // App syscalls (0x80..=0x84) are the core's: `runApp` ends the task.
+                if (crate::apps::SYS_APP_COUNT..=crate::apps::SYS_APP_CURRENT).contains(&syscall_id) {
+                    match crate::apps::syscall(syscall_id, &args[..actual], &mut ctx.objs, P::app_files()) {
+                        Some(crate::apps::Call::Value(v)) => self.push(v),
+                        Some(crate::apps::Call::Exit) => {
+                            self.next_program = None;
+                            self.state = VmState::Exit;
+                        }
+                        None => self.fail(fault::STR_ALLOC),
+                    }
+                    return;
+                }
                 match self.syscall_fn {
                     Some(f) => match f(syscall_id, &args[..actual], &mut ctx.objs) {
                         Some(v) => self.push(v),

@@ -52,6 +52,44 @@ pub fn init() {
     unsafe { USED = n };
 }
 
+/// An app's image is in the region (`set_app_image`): nothing is saved until the system
+/// image is back, so `FLASH.BIN` never gets the app.
+static mut APP_ACTIVE: bool = false;
+
+/// Puts an app package at `base` for as long as it runs (`Some`), or reads the saved system
+/// image back (`None`). Pending changes of the system image are saved first. False if the
+/// image does not fit or the system image cannot be read. CPU0, no render job running.
+pub fn set_app_image(base: usize, image: Option<&[u8]>) -> bool {
+    let s = shadow();
+    match image {
+        Some(img) => {
+            if base + img.len() > s.len() {
+                return false;
+            }
+            if !unsafe { APP_ACTIVE } {
+                save_if_dirty(true);
+            }
+            s[base..].fill(0xFF);
+            s[base..base + img.len()].copy_from_slice(img);
+            unsafe {
+                APP_ACTIVE = true;
+                DIRTY = false;
+            }
+        }
+        None => {
+            s.fill(0xFF);
+            let n = storage::load(s);
+            unsafe {
+                USED = n;
+                APP_ACTIVE = false;
+                DIRTY = false;
+            }
+        }
+    }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// Puts `data` at `addr` in the region for this boot only: not a change to
 /// save, so `FERRITE/FLASH.BIN` keeps what it holds (the setup screen's
 /// program, `setup::install`). A later write (a `writefs`) is saved as
@@ -95,7 +133,7 @@ fn touch(end: usize) {
 /// `storage::IDLE_SAVE_MS`. Cheap when nothing changed.
 pub fn save_if_dirty(force: bool) {
     unsafe {
-        if !DIRTY || !storage::available() {
+        if !DIRTY || !storage::available() || APP_ACTIVE {
             return;
         }
         if !force && systick::millis().wrapping_sub(LAST_WRITE_MS) < storage::IDLE_SAVE_MS {

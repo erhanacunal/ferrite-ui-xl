@@ -112,8 +112,11 @@ error codes (ferrite_cli `ERROR_DESCRIPTIONS`):
 1. **HTTP:** `POST /api/apps` (body = the package, `X-CRC32` optional) →
    install, JSON `{"id","name","version","entry","icon","caps","replaced"}`
    or `{"code","error"}`. `GET /api/apps` →
-   `{"storage":bool,"apps":[...]}`, `DELETE /api/apps/{id}`; phase 3 adds
-   `POST /api/apps/{id}/run`. The body goes to a heap buffer (up to the
+   `{"storage":bool,"running":ID,"boot":ID,"apps":[...]}` ("" = the system
+   image), `DELETE /api/apps/{id}` (409 while it runs; clears it as the boot
+   app), `POST /api/apps?run=1` (install, then run), `POST /api/apps/run?id=ID`
+   and `POST /api/apps/boot?id=ID` (no `id`: the system image; 404 for an app
+   not installed). `/api/status` has `"app"`. The body goes to a heap buffer (up to the
    region size, 64 MB), not into the region; CPU0 installs it between
    passes (`net::install_app`), the running program goes on.
 2. **writefs (protocol bridge / USART):** a new header flag
@@ -121,42 +124,69 @@ error codes (ferrite_cli `ERROR_DESCRIPTIONS`):
    buffer instead of the region, and `FsWriteComplete` calls
    `apps::install`, answers its error code or the last ACK, and starts the
    system image's `main` again (`hot_swap`: a writefs stops the running
-   program when it starts). `FS_FLAG_RUN` = 8 (phase 3) will run the app
-   instead. Without the flag writefs is today's system-image upload. Old
+   program when it starts), or, with `FS_FLAG_RUN` = 8, the new app; an
+   update of the app that was running runs it again. Without the flag writefs is today's system-image upload. Old
    firmware ignores unknown flags, so the device echoes the ones it knows
    in its FsCaps reply and `ferrite_cli` stops after the header when
    `FS_FLAG_APP` is missing (that firmware then waits for an image: restart
    it).
 3. **CLI:** `ferrite_cli app install PKG` (HTTP with `--host`, else
    writefs with `FS_FLAG_APP` over `-p`; a system image is refused before
-   sending), `app list`, `app remove ID` (`--host`). Phase 3 adds
-   `install --run`, `app run ID`, `app default ID|--none`. `ferrite_build`
+   sending; `--run` runs it), `app list` (marks `[running]`, `[boot]`),
+   `app run [ID]`, `app boot [ID]`, `app remove ID` (`--host`). `ferrite_build`
    prints whether it built an app (`App: com.acme.clock 1.2.3`) or a system
    image.
 
 ## Running an app (step 1: one at a time)
 
-`apps::run(id)`:
+A run request (`runApp`, `/api/apps/run`, an install with run) is a CPU0
+static (`apps::request_run`); the runtime's next pass takes it
+(`Runtime::switch_app`): every program is dropped, then `enter_app`:
 
-1. Read `apps/{id}/app.img` into a heap buffer, mount + verify.
-2. `render::wait_idle`, `flash::overlay(FS_BASE, image)` (this boot only;
-   `FLASH.BIN` stays as it is), then the `hot_swap` sequence: children
-   dropped, fonts/images reset (their epochs), `P::fs_replaced`, objects
-   cleared, the entry program loaded into `main` and started.
-3. `ctx.app = Some(AppInfo { id, .. })`: the storage root becomes
-   `apps/{id}/data` and the EEPROM `apps/{id}/data/eeprom.bin` (saved,
-   then swapped, like `ferrite/eeprom.bin` today); `/api/status` reports
-   it.
+1. `apps::load`: read `apps/{id}/app.img` (at most `Platform::APP_MAX_BYTES`)
+   and check it as an install does. A failure leaves everything as it was
+   (the system image starts again).
+2. `render::wait_idle`, programs' files closed, then
+   `PlatformRuntime::load_flash_image(Some(image))`: exynos4412
+   `flash::set_app_image` saves pending region writes, then puts the image
+   at `FS_BASE` for this boot only. While an app is in the region nothing
+   saves it (`flash::save_if_dirty` returns), so `FLASH.BIN` stays the
+   system image; the app's own `OP_F_WRITE`s last until it ends. `None`
+   reloads `FLASH.BIN`.
+3. `PlatformRuntime::app_changed`: the storage root becomes
+   `apps/{id}/data` (`storage::set_user_root`), the EEPROM
+   `apps/{id}/data/eeprom.bin` (`eeprom::switch`: the old one saved first),
+   and `/api/status` reports the id. `None` = back to `ferrite/user` and
+   `ferrite/eeprom.bin`.
+4. `apps::set_current`, remount, then `hot_swap` starts the app's `entry`
+   program (`main` for the system image).
 
-Boot: `settings.txt` `app=` names an installed app → `apps::run` after the
-mount; a missing / bad one logs, clears nothing, and boots the system image.
-Volume-up still opens setup. `runProgram` / `spawnProgram` inside an app
-find programs in that app's image, as today (the app is the whole FS).
+A system-image writefs while an app runs leaves the app first (`FsReady`),
+so the upload lands in the system image. Boot: `settings.txt` `app=` (set
+with `/api/apps/boot`) names the app to enter after the system image's
+syscfg sized the pools; a missing or bad one boots the system image.
+Volume-up (setup) skips it. `runProgram` / `spawnProgram` inside an app
+find programs in that app's image (the app is the whole FS).
 
-New `.fl` syscalls (`lib/device.fl`, device caps `apps`): `appCount()`,
-`appId(i)` / `appName(i)` (strings), `runApp(id)` (like `runProgram`:
-nothing of the caller runs after it), `currentApp()`. That is enough for a
-launcher written in `.fl` (step 2 makes it a task that stays alive).
+`.fl` syscalls (handled in the core VM before `syscall_fn`, ferrite-ui
+`lib/apps.fl`, keep in sync with `apps::SYS_APP_*`):
+
+| Id | Call | Result |
+| --- | --- | --- |
+| 0x80 | `appCount()` | installed apps (0 without app storage) |
+| 0x81 | `appId(i)` | string, sorted by id; "" past the end |
+| 0x82 | `appName(i)` | string |
+| 0x83 | `runApp(id)` | like `runProgram`: nothing of the caller runs after it; 0 if not installed. `""` = the system image |
+| 0x84 | `currentApp()` | string, "" for the system image |
+
+The list is cached until an install or removal (`apps::list_cached`).
+
+Sim (`bsp/sim/src/apps.rs`): with `--storage DIR` apps live in
+`DIR/ferrite/apps/`, an app's files and EEPROM in its `data/`; else in RAM.
+`--install PKG` (repeatable) installs at start, `--app ID` boots one. The
+system image's flash part and EEPROM are kept aside while an app runs.
+Example: `examples/exynos4412/apps` (a launcher system image, one app source
+built as two apps).
 
 ## Step 2 and 3 constraints (decided now, built later)
 
@@ -194,13 +224,12 @@ launcher written in `.fl` (step 2 makes it a task that stays alive).
    Tests: install / replace / remove / bad packages on `MemStorage`; board:
    upload two apps, list, power cut during an install (old or new, never
    half).
-3. **Run:** `apps::run`, boot `app=`, per-app storage root, the syscalls,
-   sim support (`--storage DIR` holds `ferrite/apps/`). Golden: unchanged
-   (examples stay system images); one new scenario that installs and runs
-   an app in the sim.
-4. Notes (`xl.md`), CLAUDE.md keep-in-sync entries (`RES_APPINFO`,
-   `appinfo` layout, `FS_FLAG_APP`/`RUN`, `APP_ERR_*`, app syscall ids,
-   `settings.txt` `app=`).
+3. **Run** (done 2026-11-19, board: install --run, `runApp` both ways from
+   `.fl`, per-app EEPROM counters, boot app across a restart, a restart
+   while an app runs, a system writefs while an app runs, the boot CRC
+   check of `FLASH.BIN` clean after each): see "Running an app". Golden
+   unchanged; sim scenario with the `apps` example.
+4. Notes (`xl.md`), CLAUDE.md keep-in-sync entries (done).
 
 ## Decisions (2026-11-19)
 

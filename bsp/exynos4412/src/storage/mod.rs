@@ -126,9 +126,12 @@ pub fn read_in(dir: &str, name: &str, max: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Reads [`DIR`]/`name` into `buf` if it exists and is exactly its size.
-pub fn read_exact(name: &str, buf: &mut [u8]) -> bool {
-    len_of(DIR, name) == Some(buf.len()) && read_into(DIR, name, buf) == Ok(Some(buf.len()))
+/// Programs' files under `root` (a running app's `data/`, on USERDATA's ext4), or back
+/// under [`USER_DIR`] with `None`. Every program file must be closed.
+pub fn set_user_root(root: Option<String>) {
+    if medium() == Medium::UserData {
+        ext4::set_user_root(root);
+    }
 }
 
 /// Writes `data` as the image file, on the card when this returns.

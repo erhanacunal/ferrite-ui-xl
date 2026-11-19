@@ -28,9 +28,21 @@ impl SimStorage {
                     return Self::Mem(MemStorage::default());
                 }
                 println!("storage: {}", root.display());
-                Self::Host(HostStorage { root, open: RefCell::new(Default::default()) })
+                Self::Host(HostStorage { base: root.clone(), root: RefCell::new(root), open: RefCell::new(Default::default()) })
             }
             None => Self::Mem(MemStorage::default()),
+        }
+    }
+
+    /// Programs' files under `dir` (a running app's `data/`), or the `--storage` directory
+    /// again with `None`. In RAM nothing changes (one tree). Every file must be closed.
+    pub fn set_root(&self, dir: Option<PathBuf>) {
+        if let Self::Host(h) = self {
+            let root = dir.unwrap_or_else(|| h.base.clone());
+            if let Err(e) = fs::create_dir_all(&root) {
+                eprintln!("storage: {}: {e}", root.display());
+            }
+            *h.root.borrow_mut() = root;
         }
     }
 
@@ -142,7 +154,10 @@ struct OpenHost {
 }
 
 pub struct HostStorage {
-    root: PathBuf,
+    /// The `--storage` directory.
+    base: PathBuf,
+    /// Where programs' paths start: `base`, or a running app's `data/`.
+    root: RefCell<PathBuf>,
     open: RefCell<[Option<OpenHost>; MAX_OPEN]>,
 }
 
@@ -160,7 +175,7 @@ fn io_err(e: std::io::Error) -> i32 {
 
 impl HostStorage {
     fn host(&self, path: &Path) -> PathBuf {
-        path.components().fold(self.root.clone(), |p, c| p.join(c))
+        path.components().fold(self.root.borrow().clone(), |p, c| p.join(c))
     }
 
     fn kind_at(&self, path: &Path) -> Option<Kind> {

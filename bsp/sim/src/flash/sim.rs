@@ -4,7 +4,7 @@ use std::vec::Vec;
 
 use super::FlashBackend;
 
-const FLASH_SIZE: usize = 32 * 1024 * 1024; // W25Q256 = 32 MiB
+pub const FLASH_SIZE: usize = 32 * 1024 * 1024; // W25Q256 = 32 MiB
 const SECTOR_SIZE: usize = 4096;
 
 // `Clone` shares the image: the render context reads the same flash (and

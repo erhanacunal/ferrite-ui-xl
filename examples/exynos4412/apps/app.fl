@@ -1,0 +1,82 @@
+// app.fl — the app of the `apps` example, built twice: hello/ and world/ give
+// it another application_id (docs/apps.md). Each build is its own app: its own
+// EEPROM (byte 0 counts its starts here) and files (START.TXT), so the two
+// counters and the launcher's never mix. "Back" returns to the system image.
+
+#include "core.fl"
+#include "color.fl"
+#include "apps.fl"
+#include "storage.fl"
+
+var back;
+
+fn on_back(wid) {
+    runApp("");
+}
+
+fn setup() {
+    var id = currentApp();
+    var starts = eepromRead(0);
+    if (starts == 255) {
+        starts = 0;
+    }
+    starts = starts + 1;
+    eepromWrite(0, starts % 255);
+    // A file in the app's own storage root.
+    var f = diskOpen("/START.TXT", DISK_WRITE);
+    if (f >= 0) {
+        fileWriteStr(f, sprintf("%d", starts));
+        fileClose(f);
+    }
+
+    var bg = alloc();
+    target(bg);
+    set(location, 0, 0);
+    set(size, 1280, 800);
+    set(bg_color, strcmp(id, "com.example.hello") == 0 ? 0x18C3 : 0x4208);
+    parent(0);
+
+    var title = alloc();
+    target(title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 200);
+    set(size, 1280, 60);
+    set(text, sprintf("App %s", id));
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    var info = alloc();
+    target(info);
+    set(kind, KIND_LABEL);
+    set(location, 0, 280);
+    set(size, 1280, 40);
+    set(text, sprintf("started %d times (its own EEPROM)", starts));
+    set(text_color, YELLOW);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    back = alloc();
+    target(back);
+    set(location, 490, 560);
+    set(size, 300, 120);
+    set(bg_color, 0x2945);
+    set(press_color, 0x2C9F);
+    set(border_radius, 16);
+    set(clickable, ON);
+    parent(0);
+    var l = alloc();
+    target(l);
+    set(kind, KIND_LABEL);
+    set(size, 300, 120);
+    set(text, "Back");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(back);
+    target(back);
+    set(on_click, @on_back);
+    return 0;
+}
+
+fn loop() {
+}

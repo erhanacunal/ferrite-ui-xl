@@ -1,0 +1,107 @@
+// main.fl — app launcher (1280x800, Exynos 4412 tablet), the system image of
+// the `apps` example (docs/apps.md).
+//
+// Shows a tile for every installed app package (appCount / appName, lib/apps.fl);
+// tapping one calls runApp(id): this image ends there and the app runs in its
+// place, with its own files and EEPROM. An app comes back with runApp("").
+// The launcher counts its own starts in its EEPROM byte 0, which no app sees.
+//
+// Install the apps first: ferrite_build hello/project.json -o hello.bin, then
+// `ferrite_cli app install hello.bin` (board), or the sim's --install hello.bin.
+
+#include "core.fl"
+#include "color.fl"
+#include "apps.fl"
+
+const TILES = 4;
+const TILE_W = 260;
+const TILE_H = 160;
+const GAP = 40;
+
+var count = 0;
+// set(on_click) wires file-scope widget variables: one per tile.
+var tile0;
+var tile1;
+var tile2;
+var tile3;
+
+fn tile(t: widget, slot) {
+    var x = (1280 - TILES * TILE_W - (TILES - 1) * GAP) / 2 + slot * (TILE_W + GAP);
+    target(t);
+    set(location, x, 320);
+    set(size, TILE_W, TILE_H);
+    set(bg_color, 0x2945);
+    set(press_color, 0x2C9F);
+    set(border_radius, 16);
+    set(clickable, ON);
+    parent(0);
+    var l = alloc();
+    target(l);
+    set(kind, KIND_LABEL);
+    set(size, TILE_W, TILE_H);
+    set(text, appName(slot));
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(t);
+}
+
+fn on_tile(wid) {
+    var slot = -1;
+    if (wid == tile0) { slot = 0; }
+    if (wid == tile1) { slot = 1; }
+    if (wid == tile2) { slot = 2; }
+    if (wid == tile3) { slot = 3; }
+    if (slot >= 0) {
+        runApp(appId(slot));
+    }
+}
+
+fn setup() {
+    var starts = eepromRead(0);
+    if (starts == 255) {
+        starts = 0;
+    }
+    eepromWrite(0, (starts + 1) % 255);
+
+    var title = alloc();
+    target(title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 80);
+    set(size, 1280, 60);
+    set(text, "Installed apps");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    count = appCount();
+    var info = alloc();
+    target(info);
+    set(kind, KIND_LABEL);
+    set(location, 0, 160);
+    set(size, 1280, 40);
+    set(text_color, GREEN);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+    set(text, sprintf("%d installed, launcher start %d", count, starts + 1));
+
+    tile0 = alloc();
+    tile1 = alloc();
+    tile2 = alloc();
+    tile3 = alloc();
+    if (count > 0) { tile(tile0, 0); }
+    if (count > 1) { tile(tile1, 1); }
+    if (count > 2) { tile(tile2, 2); }
+    if (count > 3) { tile(tile3, 3); }
+    target(tile0);
+    set(on_click, @on_tile);
+    target(tile1);
+    set(on_click, @on_tile);
+    target(tile2);
+    set(on_click, @on_tile);
+    target(tile3);
+    set(on_click, @on_tile);
+    return 0;
+}
+
+fn loop() {
+}

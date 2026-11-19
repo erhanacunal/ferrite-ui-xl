@@ -10,8 +10,11 @@
 //! | `POST /save` (or `PUT`) | a firmware `.bin`: checked, saved as `FERRITE/FERRITE.BIN` (uart_boot's file, with its `EXYNBOOT` header), then a restart, so uart_boot boots it |
 //! | `POST /restart` | restarts the board |
 //! | `POST /api/apps` (or `PUT`) | an app package (ferrite-core `apps`, docs/apps.md): checked and installed under `ferrite/apps/{id}/`, no restart; JSON `{"id","name","version","entry","icon","caps","replaced"}`, or `{"code","error"}` with 400/404/413/500/503 |
-//! | `GET /api/apps` | JSON: `{"storage":bool,"apps":[{"id","name","version",...}]}` |
-//! | `DELETE /api/apps/{id}` | removes the app and its data |
+//! | `GET /api/apps` | JSON: `{"storage":bool,"running":ID,"boot":ID,"apps":[{"id","name","version",...}]}` ("" = the system image) |
+//! | `DELETE /api/apps/{id}` | removes the app and its data (409 while it runs; clears it as the boot app) |
+//! | `POST /api/apps?run=1` | installs, then runs it (an update of the running app restarts it anyway) |
+//! | `POST /api/apps/run?id=ID` | runs installed app `ID` from the next pass (no `id`: the system image) |
+//! | `POST /api/apps/boot?id=ID` | the app started at boot (`app=` in `system/settings.txt`; no `id`: the system image) |
 //! | `GET /api/wifi` | JSON: what the last scan saw of the configured network (BSSIDs, channels, their information elements as hex), the BSSID joined, the last RSN mismatch (diagnostics) |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU player off/on (`gpu_compose`; off: the CPU replays the lists), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?merge=0\|1` pieces merged into fewer draws / a draw per run of pieces; `?round_px=N` largest `ui_round` box drawn as four quarters (0 = always nine pieces); `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`); `?direct=0\|1` GPU player frames straight into the back scan buffer / into the shadow (`lcd::DIRECT`); `?boxes=1..4` damage boxes (`lcd::region::BOXES`); `?layer_compose=0\|1` mode 3 composes layers on the GPU / draws them in the tree (`render::AREAS_COMPOSE`) |
@@ -196,6 +199,7 @@ fn status_line(code: &str) -> &'static str {
         "200" => "200 OK",
         "400" => "400 Bad Request",
         "404" => "404 Not Found",
+        "409" => "409 Conflict",
         "413" => "413 Content Too Large",
         "503" => "503 Service Unavailable",
         _ => "500 Internal Server Error",
@@ -289,7 +293,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let want = header(head, b"x-crc32").and_then(parse_hex);
             let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
             let early = &request[head_end..filled];
-            upload(socket, super::Upload::App, length, want, expect, early).await?;
+            upload(socket, super::Upload::App(query_param(query, b"run") == Some(b"1")), length, want, expect, early).await?;
         }
         (b"GET", b"/api/apps") => match super::storage_request(super::STORAGE_APPS, 10).await {
             Some((_, t)) => json(socket, "200 OK", &t).await?,
@@ -298,6 +302,18 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
         (b"DELETE", _) if path.starts_with(b"/api/apps/") => {
             let id = core::str::from_utf8(&path[b"/api/apps/".len()..]).unwrap_or("");
             match super::storage_request_with(super::STORAGE_APP_REMOVE, id, 30).await {
+                Some((true, t)) => json(socket, "200 OK", &t).await?,
+                Some((false, t)) => {
+                    let (code, body) = t.split_once(' ').unwrap_or(("500", &t));
+                    json(socket, status_line(code), body).await?
+                }
+                None => text(socket, "503 Service Unavailable", "No answer from the UI core\n").await?,
+            }
+        }
+        (b"POST", b"/api/apps/run" | b"/api/apps/boot") => {
+            let id = query_param(query, b"id").and_then(|v| core::str::from_utf8(v).ok()).unwrap_or("");
+            let what = if path == b"/api/apps/run" { super::STORAGE_APP_RUN } else { super::STORAGE_APP_BOOT };
+            match super::storage_request_with(what, id, 10).await {
                 Some((true, t)) => json(socket, "200 OK", &t).await?,
                 Some((false, t)) => {
                     let (code, body) = t.split_once(' ').unwrap_or(("500", &t));
@@ -1060,6 +1076,7 @@ fn status_json() -> String {
             _ => "free",
         }
     );
+    let _ = write!(s, ",\"app\":{}", super::json_str(&super::running_app()));
     // The device settings as they are live (system/settings.txt; -1 = none set).
     {
         use ferrite_core::settings as fs;
@@ -1381,7 +1398,7 @@ async fn upload(
         super::Upload::Fs => (16, crate::flash::SIZE),
         super::Upload::Firmware => (16, FIRMWARE_MAX),
         super::Upload::System(..) => (1, SYSTEM_MAX),
-        super::Upload::App => (16, crate::flash::SIZE),
+        super::Upload::App(_) => (16, crate::flash::SIZE),
     };
     if !(min..=max).contains(&length) {
         return text(socket, "413 Content Too Large", "16 B .. 64 MiB (SYSTEM/ files: 1 B .. 4 MiB)\n").await;
@@ -1440,7 +1457,7 @@ async fn upload(
         Timer::after(Duration::from_millis(10)).await;
     };
     let result = match status {
-        super::FLASH_KEPT | super::FLASH_APP_ERROR if kind == super::Upload::App => {
+        super::FLASH_KEPT | super::FLASH_APP_ERROR if matches!(kind, super::Upload::App(_)) => {
             let (code, body) = super::app_answer();
             json(socket, status_line(&alloc::format!("{}", code)), &body).await
         }
@@ -1449,7 +1466,7 @@ async fn upload(
             let answer = match kind {
                 super::Upload::Fs => "CRC OK, saved FERRITE/FLASH.BIN; restarting\n",
                 super::Upload::Firmware => "CRC OK, saved FERRITE/FERRITE.BIN; restarting into it\n",
-                super::Upload::System(..) | super::Upload::App => "CRC OK, saved in SYSTEM/\n",
+                super::Upload::System(..) | super::Upload::App(_) => "CRC OK, saved in SYSTEM/\n",
             };
             text(socket, "200 OK", answer).await
         }

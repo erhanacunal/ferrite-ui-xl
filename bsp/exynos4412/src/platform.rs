@@ -73,6 +73,12 @@ impl Platform for Exynos4412Platform {
     // Glyph bitmaps in RAM at font load: text drawing then needs no
     // `FlashBackend` call (bounds check + copy out of the region) per glyph.
     const CACHE_FONT_BITMAPS: bool = true;
+    /// A package is staged in RAM, then (run) put into the flash region.
+    const APP_MAX_BYTES: usize = crate::flash::SIZE - Self::FS_BASE as usize;
+
+    fn app_files() -> &'static dyn ferrite_core::apps::AppFiles {
+        &crate::storage::BoardApps
+    }
 
     // 1 GB of DRAM (512 MB heap): pools far past the pool_large defaults
     // (2 MB / 8192), and the deepest VM stacks the u8 indices allow. A
@@ -159,13 +165,6 @@ impl PlatformRuntime for Exynos4412Platform {
     // Cortex-A9 at 1.4 GHz: long bursts per main-loop pass.
     const VM_STEPS_PER_TICK: u32 = 20_000;
     type Input = FullInput;
-    /// A package is staged in RAM, then (run) put into the flash region.
-    const APP_MAX_BYTES: usize = crate::flash::SIZE - Self::FS_BASE as usize;
-
-    fn app_files() -> &'static dyn ferrite_core::apps::AppFiles {
-        &crate::storage::BoardApps
-    }
-
     fn reset() -> ! {
         // A reply to a network client (bridge.rs: the pong of a writefs or a
         // Restart) leaves before the board goes away.
@@ -263,6 +262,29 @@ impl PlatformRuntime for Exynos4412Platform {
     /// by `flash::generation`, which the write bumped; the image goes to the eMMC now.
     fn fs_replaced(_ctx: &mut Ctx<Self>) {
         crate::flash::save_if_dirty(true);
+    }
+
+    fn load_flash_image(_ctx: &mut Ctx<Self>, image: Option<&[u8]>) -> bool {
+        crate::flash::set_app_image(Self::FS_BASE as usize, image)
+    }
+
+    /// An app's files and EEPROM live in its `data/` (docs/apps.md); the system image's in
+    /// `FERRITE/USER/` and `FERRITE/EEPROM.BIN`.
+    fn app_changed(_ctx: &mut Ctx<Self>, app: Option<&ferrite_core::apps::AppInfo>) {
+        let data = app.map(|a| alloc::format!("{}/{}", a.dir(), ferrite_core::apps::DATA_DIR));
+        crate::storage::set_user_root(data.clone());
+        crate::eeprom::switch(data);
+        #[cfg(feature = "wifi")]
+        crate::net::set_running_app(app.map_or("", |a| a.id.as_str()));
+        match app {
+            Some(a) => exynos_4412_rs::println!("ferrite: running app {} {}", a.id, a.version_text()),
+            None => exynos_4412_rs::println!("ferrite: running the system image"),
+        }
+    }
+
+    /// The settings' `app=`, unless the setup screen runs this boot.
+    fn boot_app() -> Option<alloc::string::String> {
+        if crate::setup::active() { None } else { crate::settings::boot_app() }
     }
 
     fn frame_end(ctx: &mut Ctx<Self>) {

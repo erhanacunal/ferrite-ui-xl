@@ -101,16 +101,6 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         None
     }
 
-    /// Where app packages are installed (`apps.rs`, docs/apps.md). The
-    /// default: nowhere (writefs with `FS_FLAG_APP` answers "no app storage").
-    fn app_files() -> &'static dyn crate::apps::AppFiles {
-        &crate::apps::NoAppFiles
-    }
-
-    /// Largest app package taken (a writefs with `FS_FLAG_APP` stages it in
-    /// RAM; running it puts it in the flash region).
-    const APP_MAX_BYTES: usize = 0;
-
     /// `(used, free)` stack bytes reported by the `StackInfo` USART command.
     fn stack_info() -> (u32, u32) {
         (0, 0)
@@ -143,6 +133,25 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {
         let _ = (ctx, touch);
         0
+    }
+
+    /// Puts an app's image at `FS_BASE` in the flash region for this boot only (it must not
+    /// end up in the saved system image), or with `None` brings the saved system image back.
+    /// False = not possible (the default: boards without apps).
+    fn load_flash_image(ctx: &mut Ctx<Self>, image: Option<&[u8]>) -> bool {
+        let _ = (ctx, image);
+        false
+    }
+
+    /// The runtime switches to `app` (None = the system image), all files closed: point
+    /// programs' storage root and the EEPROM at the app's own (`apps/{id}/data/`).
+    fn app_changed(ctx: &mut Ctx<Self>, app: Option<&crate::apps::AppInfo>) {
+        let _ = (ctx, app);
+    }
+
+    /// The app to start at boot (the settings' `app=`), if any.
+    fn boot_app() -> Option<alloc::string::String> {
+        None
     }
 
     /// A `writefs` replaced the filesystem and the runtime swaps it in without a restart:
@@ -450,9 +459,20 @@ impl<P: PlatformRuntime> Runtime<P> {
         // every object) ---
         alloc_root(&mut ctx);
 
-        // --- Load main program ---
+        // --- The app chosen to start at boot (settings `app=`), with the system
+        // image's pool sizes (sized above); a missing or bad one leaves the system
+        // image ---
+        if error_code == 0
+            && let Some(id) = P::boot_app()
+            && enter_app(&mut ctx, Some(&id)).is_err()
+        {
+            ctx.fs = fs::Fs::mount(&ctx.flash, P::FS_BASE).ok();
+        }
+
+        // --- Load main program (an app's entry) ---
         if error_code == 0 {
-            error_code = load_program(&mut ctx, &mut vm, ProgramRef::new(b"main", 0));
+            let entry = entry_program();
+            error_code = load_program(&mut ctx, &mut vm, ProgramRef::new(entry.as_bytes(), 0));
         }
 
         // --- setup() / on_program_start() / start loop() ---
@@ -551,6 +571,12 @@ impl<P: PlatformRuntime> Runtime<P> {
                     t = self.perf.add(crate::perf::phase::$id, t, P::cycles());
                 }
             };
+        }
+
+        // `runApp` (or the board's network) asked for another app: it replaces
+        // everything, even an error screen.
+        if let Some(target) = crate::apps::take_run_request() {
+            self.switch_app(target);
         }
 
         // `runProgram` ended the main program: load the next one (every
@@ -774,6 +800,12 @@ impl<P: PlatformRuntime> Runtime<P> {
                 protocol::send_error(&self.ctx.usart, ERR_INSUFFICIENT_MEMORY);
             }
             RxEvent::FsReady => {
+                // A system image replaces the region: an app running leaves it first
+                // (its image must not be what gets saved).
+                if !self.protocol.fs_app() && crate::apps::current().is_some() {
+                    self.drop_children();
+                    let _ = enter_app(&mut self.ctx, None);
+                }
                 // Before any sector changes: the running image's pool sizes.
                 self.fs_old_cfg = match self.ctx.fs.as_ref().map(|f| SysCfg::load(f, &self.ctx.flash)) {
                     Some(Ok(cfg)) => Some(cfg),
@@ -814,13 +846,18 @@ impl<P: PlatformRuntime> Runtime<P> {
                     crate::apps::install(P::app_files(), &image, P::FS_BASE, P::CAPS)
                 };
                 drop(image);
+                // FS_FLAG_RUN: the new app; else what ran before (updated, if it was this one).
+                let target = match &r {
+                    Ok(done) if self.protocol.fs_run() => Some(done.info.id.clone()),
+                    _ => crate::apps::current().map(|a| a.id),
+                };
                 match r {
                     Ok(_) => self.ack_chunk(),
                     Err(code) => protocol::send_error(&self.ctx.usart, code),
                 }
                 self.ctx.usart.flush();
                 self.fs_old_cfg = None;
-                self.hot_swap();
+                self.switch_app(target);
             }
             RxEvent::FsWriteComplete => {
                 // Check the image before rebooting into it: on a bad
@@ -1059,6 +1096,33 @@ fn alloc_root<P: PlatformRuntime>(ctx: &mut Ctx<P>) {
     ctx.objs.root = root;
 }
 
+/// The program a fresh start runs: the running app's entry, or `main`.
+fn entry_program() -> alloc::string::String {
+    crate::apps::current().map_or_else(|| alloc::string::String::from("main"), |a| a.entry)
+}
+
+/// Puts app `target`'s image (None = the saved system image) in the flash region, points
+/// storage and EEPROM at it (`P::app_changed`), makes it current and mounts it. Every
+/// storage file is closed first. Nothing changes on an error (an `apps::err` code), but
+/// for a board that could not bring the system image back.
+fn enter_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, target: Option<&str>) -> Result<(), u8> {
+    let loaded = match target {
+        Some(id) => Some(crate::apps::load(P::app_files(), id, P::FS_BASE, P::CAPS, P::APP_MAX_BYTES)?),
+        None if crate::apps::current().is_none() => return Ok(()),
+        None => None,
+    };
+    render::wait_idle(ctx);
+    ctx.storage.close_all();
+    if !P::load_flash_image(ctx, loaded.as_ref().map(|(_, image)| image.as_slice())) {
+        return Err(crate::apps::err::NO_STORAGE);
+    }
+    let info = loaded.map(|(info, _)| info);
+    P::app_changed(ctx, info.as_ref());
+    crate::apps::set_current(info);
+    ctx.fs = fs::Fs::mount(&ctx.flash, P::FS_BASE).ok();
+    Ok(())
+}
+
 /// `runProgram(name, arg)` ended the running program: drop all of its state
 /// (widgets, strings, arrays, images, sound, input focus) and start
 /// `vm.next_program` from scratch, as at boot. Returns the new error code.
@@ -1171,7 +1235,8 @@ impl<P: PlatformRuntime> Runtime<P> {
         alloc_root(ctx);
         let mut err = if ctx.fs.is_some() { 0 } else { ERR_NO_FILESYSTEM };
         if err == 0 {
-            err = load_program(ctx, vm, ProgramRef::new(b"main", 0));
+            let entry = entry_program();
+            err = load_program(ctx, vm, ProgramRef::new(entry.as_bytes(), 0));
         }
         if err == 0 && vm.has_code() {
             err = start_program(ctx, vm);
@@ -1182,6 +1247,16 @@ impl<P: PlatformRuntime> Runtime<P> {
         } else if err == 0 && vm.state != VmState::Exit {
             P::initial_render(ctx, vm);
         }
+    }
+
+    /// Runs app `target` (None = the system image) from scratch: every task ends, the
+    /// image goes into the flash region (`enter_app`), and its entry program starts as
+    /// after a `writefs` (`hot_swap`). An app that cannot be loaded leaves the running
+    /// image, whose program restarts (the caller of `runApp` ended itself).
+    fn switch_app(&mut self, target: Option<alloc::string::String>) {
+        self.drop_children();
+        let _ = enter_app(&mut self.ctx, target.as_deref());
+        self.hot_swap();
     }
 
     /// End every child task (main program switch, reload, filesystem write).

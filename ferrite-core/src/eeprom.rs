@@ -62,6 +62,10 @@ impl<B: EepromBackend> EepromImpl<B> {
 
     /// Capacity in bytes (`eepromSize()`).
     #[inline]
+    pub fn backend(&self) -> &B {
+        &self.be
+    }
+
     pub fn size(&self) -> i32 {
         B::SIZE as i32
     }

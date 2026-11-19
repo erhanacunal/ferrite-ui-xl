@@ -138,6 +138,14 @@ pub trait Platform: Sized {
     /// the entire image, ~8 s per MB on the bit-banged Nextion SPI.
     const VERIFY_FS_ON_BOOT: bool = false;
 
+    /// Largest app package taken (staged in RAM, then put in the flash region to run).
+    const APP_MAX_BYTES: usize = 0;
+
+    /// Where app packages are installed (`apps.rs`, docs/apps.md). The default: nowhere.
+    fn app_files() -> &'static dyn crate::apps::AppFiles {
+        &crate::apps::NoAppFiles
+    }
+
     /// Run `job` on the render context `r` somewhere else (another core;
     /// plan step 3c). `Ok` = taken: [`Platform::render_poll`] hands `r` back
     /// once the job is done, and until then nothing may draw on the screen.

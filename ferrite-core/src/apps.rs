@@ -240,6 +240,7 @@ pub fn install(files: &dyn AppFiles, image: &[u8], base: u32, caps: u32) -> Resu
     }
     // The image first: appinfo.bin only lists it, app.img's own manifest is
     // what runs.
+    changed();
     if !(files.make_dirs(&data) && files.save(&dir, IMAGE_FILE, image) && files.save(&dir, INFO_FILE, &rec)) {
         return Err(err::WRITE);
     }
@@ -287,6 +288,7 @@ pub fn remove(files: &dyn AppFiles, id: &str) -> Result<(), u8> {
     if files.list(&dir).is_none() {
         return Err(err::NOT_INSTALLED);
     }
+    changed();
     // Depth first without recursion: a directory is removed once a pass
     // finds it empty.
     let mut stack = alloc::vec![dir];
@@ -338,6 +340,144 @@ impl AppFiles for NoAppFiles {
     }
     fn remove_dir(&self, _: &str) -> bool {
         false
+    }
+}
+
+// --- running apps (CPU0) -----------------------------------------------------------------------
+
+/// `()` → the number of installed apps (0 without app storage).
+pub const SYS_APP_COUNT: u8 = 0x80;
+/// `(i)` → string: app `i`'s id (sorted by id), "" past the end.
+pub const SYS_APP_ID: u8 = 0x81;
+/// `(i)` → string: app `i`'s display name, "" past the end.
+pub const SYS_APP_NAME: u8 = 0x82;
+/// `(id: string)` → ends every program and runs app `id` ("" = the system image) from the
+/// next pass, like `runProgram`: nothing of the caller runs after it. 0 if `id` is not
+/// installed (the caller goes on).
+pub const SYS_APP_RUN: u8 = 0x83;
+/// `()` → string: the running app's id, "" for the system image.
+pub const SYS_APP_CURRENT: u8 = 0x84;
+
+/// What an app syscall did.
+pub enum Call {
+    Value(i32),
+    /// `SYS_APP_RUN` took: the calling task ends now.
+    Exit,
+}
+
+/// Single-core state (CPU0: the VM, the runtime, a BSP's network service between passes).
+struct Cpu0<T>(core::cell::UnsafeCell<T>);
+// SAFETY: touched by CPU0 only (see the functions below).
+unsafe impl<T> Sync for Cpu0<T> {}
+
+impl<T> Cpu0<T> {
+    #[allow(clippy::mut_from_ref)]
+    fn get(&self) -> &mut T {
+        // SAFETY: CPU0 only, and no reference outlives a call here.
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// The running app (None = the system image).
+static CURRENT: Cpu0<Option<AppInfo>> = Cpu0(core::cell::UnsafeCell::new(None));
+/// A run asked for: Some(None) = back to the system image.
+static RUN_REQUEST: Cpu0<Option<Option<String>>> = Cpu0(core::cell::UnsafeCell::new(None));
+/// [`list`] as last read, with the [`GENERATION`] it was read at.
+static LIST_CACHE: Cpu0<Option<(u32, Vec<AppInfo>)>> = Cpu0(core::cell::UnsafeCell::new(None));
+/// Bumped by every install and remove.
+static GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn changed() {
+    GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The running app's manifest, None for the system image.
+pub fn current() -> Option<AppInfo> {
+    CURRENT.get().clone()
+}
+
+/// The runtime switched to `app`.
+pub fn set_current(app: Option<AppInfo>) {
+    *CURRENT.get() = app;
+}
+
+/// Asks the runtime to run app `id` (None = the system image) from the next pass.
+pub fn request_run(id: Option<&str>) {
+    *RUN_REQUEST.get() = Some(id.map(String::from));
+}
+
+/// The run asked for, once.
+pub fn take_run_request() -> Option<Option<String>> {
+    RUN_REQUEST.get().take()
+}
+
+/// [`list`], read again only after an install or remove.
+pub fn list_cached(files: &dyn AppFiles) -> Vec<AppInfo> {
+    let generation = GENERATION.load(core::sync::atomic::Ordering::Relaxed);
+    let cache = LIST_CACHE.get();
+    match cache {
+        Some((g, l)) if *g == generation => l.clone(),
+        _ => {
+            let l = list(files);
+            *cache = Some((generation, l.clone()));
+            l
+        }
+    }
+}
+
+/// Reads and checks installed app `id` for running: (its manifest, the image).
+pub fn load(files: &dyn AppFiles, id: &str, base: u32, caps: u32, max: usize) -> Result<(AppInfo, Vec<u8>), u8> {
+    if !valid_id(id) {
+        return Err(err::BAD_ID);
+    }
+    if !files.available() {
+        return Err(err::NO_STORAGE);
+    }
+    if files.list(&app_dir(id)).is_none() {
+        return Err(err::NOT_INSTALLED);
+    }
+    let image = files.read(&app_dir(id), IMAGE_FILE, max).ok_or(err::TOO_LARGE)?;
+    let info = check(&image, base, caps)?;
+    if info.id != id {
+        return Err(err::BAD_ID);
+    }
+    Ok((info, image))
+}
+
+/// Answers an app syscall (`SYS_APP_*`); None for any other id.
+pub fn syscall(id: u8, args: &[i32], objs: &mut crate::pool::ObjPool, files: &dyn AppFiles) -> Option<Call> {
+    let arg0 = args.first().copied().unwrap_or(0);
+    let string = |objs: &mut crate::pool::ObjPool, s: &str| {
+        objs.str_alloc(s.as_bytes()).map(|p| Call::Value(p as i32))
+    };
+    match id {
+        SYS_APP_COUNT => Some(Call::Value(list_cached(files).len() as i32)),
+        SYS_APP_ID | SYS_APP_NAME => {
+            let apps = list_cached(files);
+            let app = usize::try_from(arg0).ok().and_then(|i| apps.get(i));
+            let text = app.map_or("", |a| if id == SYS_APP_ID { a.id.as_str() } else { a.name.as_str() });
+            string(objs, text)
+        }
+        SYS_APP_RUN => {
+            let raw = objs.str_get(arg0 as crate::pool::ObjPtr);
+            let Ok(target) = core::str::from_utf8(raw).map(String::from) else {
+                return Some(Call::Value(0));
+            };
+            if target.is_empty() {
+                request_run(None);
+                return Some(Call::Exit);
+            }
+            if find(files, &target).is_none() {
+                return Some(Call::Value(0));
+            }
+            request_run(Some(&target));
+            Some(Call::Exit)
+        }
+        SYS_APP_CURRENT => {
+            let cur = current();
+            string(objs, cur.as_ref().map_or("", |a| a.id.as_str()))
+        }
+        _ => None,
     }
 }
 
@@ -532,6 +672,50 @@ mod tests {
         let files = MemAppFiles::default();
         assert_eq!(install(&files, &image(&[("main", RES_PROGRAM, vec![1])]), BASE, 1), Err(err::NO_APPINFO));
         assert!(files.list(APPS_DIR).is_none());
+    }
+
+    #[test]
+    fn syscalls_list_and_ask_for_a_run() {
+        let files = MemAppFiles::default();
+        let mut objs = crate::pool::ObjPool::new();
+        let value = |c: Option<Call>| match c {
+            Some(Call::Value(v)) => v,
+            _ => panic!("not a value"),
+        };
+        let text = |objs: &crate::pool::ObjPool, p: i32| objs.str_get(p as crate::pool::ObjPtr).to_vec();
+        assert_eq!(value(syscall(SYS_APP_COUNT, &[], &mut objs, &files)), 0);
+        install(&files, &package("b.app", 1), BASE, 1).unwrap();
+        install(&files, &package("a.app", 1), BASE, 1).unwrap();
+        // The cache follows installs.
+        assert_eq!(value(syscall(SYS_APP_COUNT, &[], &mut objs, &files)), 2);
+        let id = value(syscall(SYS_APP_ID, &[1], &mut objs, &files));
+        assert_eq!(text(&objs, id), b"b.app");
+        let name = value(syscall(SYS_APP_NAME, &[0], &mut objs, &files));
+        assert_eq!(text(&objs, name), b"Name");
+        let past = value(syscall(SYS_APP_ID, &[5], &mut objs, &files));
+        assert_eq!(text(&objs, past), b"");
+
+        let missing = objs.str_alloc(b"c.app").unwrap() as i32;
+        assert_eq!(value(syscall(SYS_APP_RUN, &[missing], &mut objs, &files)), 0);
+        assert_eq!(take_run_request(), None);
+        let a = objs.str_alloc(b"a.app").unwrap() as i32;
+        assert!(matches!(syscall(SYS_APP_RUN, &[a], &mut objs, &files), Some(Call::Exit)));
+        assert_eq!(take_run_request(), Some(Some("a.app".into())));
+        assert_eq!(take_run_request(), None);
+        let empty = objs.str_alloc(b"").unwrap() as i32;
+        assert!(matches!(syscall(SYS_APP_RUN, &[empty], &mut objs, &files), Some(Call::Exit)));
+        assert_eq!(take_run_request(), Some(None));
+
+        set_current(find(&files, "a.app"));
+        let cur = value(syscall(SYS_APP_CURRENT, &[], &mut objs, &files));
+        assert_eq!(text(&objs, cur), b"a.app");
+        set_current(None);
+        remove(&files, "a.app").unwrap();
+        assert_eq!(value(syscall(SYS_APP_COUNT, &[], &mut objs, &files)), 1);
+        let (info, image) = load(&files, "b.app", BASE, 1, usize::MAX).unwrap();
+        assert_eq!((info.id.as_str(), image), ("b.app", package("b.app", 1)));
+        assert_eq!(load(&files, "a.app", BASE, 1, usize::MAX).map(|_| ()), Err(err::NOT_INSTALLED));
+        assert_eq!(load(&files, "b.app", BASE, 0, usize::MAX).map(|_| ()), Err(err::CAPS));
     }
 
     #[test]

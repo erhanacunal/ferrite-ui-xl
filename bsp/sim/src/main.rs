@@ -19,6 +19,7 @@ use ferrite_core::image::ImageList;
 use ferrite_core::pool::ObjPool;
 
 // --- Concrete host backends (type aliases + free-fn constructors) ---
+mod apps;
 mod audio;
 mod backlight;
 mod eeprom;
@@ -184,12 +185,30 @@ fn main() {
         ferrite_core::dl::OP_STATS.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
+    {
+        use ferrite_core::platform::Platform;
+        let installs: Vec<String> = arg_values("--install");
+        apps::init(
+            arg_value("--storage").as_deref(),
+            arg_value("--app"),
+            &installs,
+            SimPlatform::FS_BASE,
+            SimPlatform::CAPS,
+        );
+    }
+
     platform::install_host(window, fb.clone(), mouse.clone(), taps, dump);
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     prof::start_from_args();
 
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
+}
+
+/// Every value after `name` on the command line (a repeatable option).
+fn arg_values(name: &str) -> Vec<String> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    args.windows(2).filter(|w| w[0] == name).map(|w| w[1].clone()).collect()
 }
 
 /// The value after `name` on the command line.

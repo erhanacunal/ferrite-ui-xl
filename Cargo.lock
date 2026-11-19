@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "ext4_rs"
 version = "2.0.0"
-source = "git+https://github.com/erhanacunal/ext4_rs?branch=main#48c5abdfa0ca542b519717cae26d3f7d79389fc9"
+source = "git+https://github.com/erhanacunal/ext4_rs?branch=main#abbac5e177b0241733fb9aeb2c4d052910f0eb23"
 
 [[package]]
 name = "exynos_4412_ext4"

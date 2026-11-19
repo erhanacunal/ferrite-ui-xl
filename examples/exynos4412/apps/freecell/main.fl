@@ -3,18 +3,23 @@
 // and start it from the tablet's app drawer.
 //
 // Rules: eight columns, four free cells, four foundations (ace up, by
-// suit). Only the top card of a column or a free cell can be moved: drag it
+// suit). The top card of a column or a free cell can be moved: drag it
 // onto a column (one rank lower, other colour), a free cell or a
 // foundation, or tap it to send it to a foundation (else a free cell, else
-// a column it fits on). Cards that nothing else can need any more go to the
-// foundations by themselves. Deals are numbered (1..32000, the classic
-// linear-congruential deal), so a game can be restarted.
+// a column it fits on). A run on top of a column (each card one rank lower
+// and of the other colour than the one under it) moves as a whole from any
+// of its cards, onto a column only, as long as it could be moved card by
+// card through the free cells and empty columns: at most
+// (1 + free cells) * 2^(empty columns) cards, the target not counted.
+// Other cards stay where they are. Cards that nothing else can need any
+// more go to the foundations by themselves. Deals are numbered (1..32000,
+// the classic linear-congruential deal), so a game can be restarted.
 //
 // Widgets belong to places, not to cards: every column has SLOTS image
 // widgets (top to bottom, later ones drawn over earlier ones), every cell
 // and foundation one; a move only changes which card image a slot shows.
-// One more image widget above all of them is the card in flight (dragged,
-// flying back, or flying to its place).
+// RUN_MAX more image widgets above all of them are the cards in flight
+// (dragged, flying back, or flying to their place).
 
 #include "core.fl"
 #include "anim.fl"
@@ -35,6 +40,7 @@ const SLOTS    = 20;    // slots per column (a column holds 19 at most)
 const NSLOT    = 168;   // 8 * SLOTS + 8
 const SNAP     = 16;    // drop tolerance around a pile, px
 const TAP_SLOP = 10;    // a press moving less than this is a tap
+const RUN_MAX  = 13;    // cards that can fly at once (a run is K..A at most)
 
 // Fonts (make_assets.py FONTS)
 const F22 = 1;
@@ -64,7 +70,8 @@ var rng_state = 0;
 var game_no = 0;
 var moves = 0;
 var won = 0;
-// Undo history: from * 64 + to * 2 + auto (auto = moved by itself).
+// Undo history: count * 1024 + from * 64 + to * 2 + auto (auto = moved by
+// itself; count = cards moved together).
 const HIST_MAX = 1000;
 var hist[1000];
 var hist_n = 0;
@@ -80,7 +87,7 @@ var slot_w[168];     // NSLOT: columns first, then piles 8..15 at 152 + pile
 var shown_img[168];  // what each slot shows now (only changes are written)
 var shown_y[168];
 var shown_on[168];
-var drag_w;
+var fly_w[13];        // RUN_MAX
 var status_lbl;
 var btn_new; var btn_restart; var btn_undo; var btn_exit;
 var win_panel; var win_sub; var btn_again;
@@ -88,17 +95,19 @@ var win_panel; var win_sub; var btn_again;
 // --- Touch / flight ---
 var dragging = 0;
 var drag_from = -1;
-var drag_card = -1;
+var drag_card = -1;  // the first (lowest) card taken
+var drag_n = 0;      // cards taken
+var drag_f = 0;      // offset between them
 var grab_dx = 0;
 var grab_dy = 0;
 var press_x = 0;
 var press_y = 0;
 var drag_moved = 0;
-var drag_x0 = 0;     // where the dragged card came from
+var drag_x0 = 0;     // where the first card came from
 var drag_y0 = 0;
 var drag_cx = 0;     // where it is now
 var drag_cy = 0;
-var busy = 0;        // a card is flying
+var busy = 0;        // cards are flying
 var fly_to = -1;
 
 // ============================================================
@@ -151,13 +160,6 @@ fn top_card(p) {
     return fnd[p - 12];
 }
 
-fn top_slot(p) {
-    if (p < 8) {
-        return p * SLOTS + tab_n[p] - 1;
-    }
-    return 152 + p;
-}
-
 fn can_put(cd, p) {
     if (p < 8) {
         var n = tab_n[p];
@@ -204,10 +206,26 @@ fn put(cd, p) {
     }
 }
 
-fn move_card(from, to, auto) {
-    put(take(from), to);
+// Moves the top `cnt` cards of `from` onto `to`, keeping their order (no
+// checks; more than one only between columns).
+fn move_run(from, to, cnt) {
+    if (cnt == 1) {
+        put(take(from), to);
+        return 0;
+    }
+    var src = from * SLOTS + tab_n[from] - cnt;
+    var dst = to * SLOTS + tab_n[to];
+    for (var i = 0; i < cnt; i++) {
+        tab[dst + i] = tab[src + i];
+    }
+    tab_n[from] = tab_n[from] - cnt;
+    tab_n[to] = tab_n[to] + cnt;
+}
+
+fn move_cards(from, to, cnt, auto) {
+    move_run(from, to, cnt);
     if (hist_n < HIST_MAX) {
-        hist[hist_n] = from * 64 + to * 2 + auto;
+        hist[hist_n] = cnt * 1024 + from * 64 + to * 2 + auto;
         hist_n = hist_n + 1;
     }
     if (!auto) {
@@ -223,6 +241,45 @@ fn foundation_for(cd) {
         }
     }
     return -1;
+}
+
+// Index of the first card of the run on top of column c (n - 1 when the top
+// card is alone).
+fn run_start(c) {
+    var n = tab_n[c];
+    var k = n - 1;
+    while (k > 0) {
+        var lo = tab[c * SLOTS + k];
+        var hi = tab[c * SLOTS + k - 1];
+        if (card_rank(hi) != card_rank(lo) + 1 || card_red(hi) == card_red(lo)) {
+            return k;
+        }
+        k = k - 1;
+    }
+    return 0;
+}
+
+// Most cards that can move together onto column `to` (-1: any non-empty
+// column): (1 + free cells) * 2^(empty columns other than `to`).
+fn max_run(to) {
+    var cells = 0;
+    for (var q = 0; q < 4; q++) {
+        if (cellc[q] < 0) {
+            cells = cells + 1;
+        }
+    }
+    var empty = 0;
+    for (var c = 0; c < 8; c++) {
+        if (tab_n[c] == 0 && c != to) {
+            empty = empty + 1;
+        }
+    }
+    return (1 + cells) << empty;
+}
+
+// Whether the `cnt` cards starting with `cd` can go onto column p.
+fn run_fits(cd, cnt, p) {
+    return p >= 0 && p < 8 && can_put(cd, p) && tab_n[p] + cnt <= SLOTS && cnt <= max_run(p);
 }
 
 // Rank on the foundation of suit s (0 = none yet).
@@ -282,8 +339,7 @@ fn deal(num) {
     won = 0;
     dragging = 0;
     busy = 0;
-    target(drag_w);
-    set(visible, OFF);
+    hide_flight();
     target(win_panel);
     set(visible, OFF);
     for (var p = 0; p < 16; p++) {
@@ -351,11 +407,30 @@ fn render_pile(p) {
     }
 }
 
-fn hide_top(p) {
-    var i = top_slot(p);
-    target(slot_w[i]);
-    set(visible, OFF);
-    shown_on[i] = 0;
+// Hides the slots of pile p from its card k up (k is 0 for a cell).
+fn hide_from(p, k) {
+    var last = p < 8 ? p * SLOTS + tab_n[p] - 1 : 152 + p;
+    var first = p < 8 ? p * SLOTS + k : last;
+    for (var i = first; i <= last; i++) {
+        target(slot_w[i]);
+        set(visible, OFF);
+        shown_on[i] = 0;
+    }
+}
+
+// The flying cards: the first `drag_n` at (x, y), drag_f apart.
+fn place_flight(x, y) {
+    for (var i = 0; i < drag_n; i++) {
+        target(fly_w[i]);
+        set(location, x, y + i * drag_f);
+    }
+}
+
+fn hide_flight() {
+    for (var i = 0; i < RUN_MAX; i++) {
+        target(fly_w[i]);
+        set(visible, OFF);
+    }
 }
 
 fn show_status() {
@@ -398,24 +473,37 @@ fn save_stats() {
 // Moving
 // ============================================================
 
-// Moves the top card of `from` to `to` and flies it there from (x, y).
-fn fly(from, to, auto, x, y, ms) {
-    var cd = top_card(from);
-    move_card(from, to, auto);
+// Moves the top `cnt` cards of `from` to `to` and flies them there from
+// (x, y), `f` apart.
+fn fly(from, to, cnt, auto, x, y, f, ms) {
+    for (var i = 0; i < cnt; i++) {
+        var cd = from < 8 ? tab[from * SLOTS + tab_n[from] - cnt + i] : top_card(from);
+        target(fly_w[i]);
+        set(image_id, cd + 1);
+        set(location, x, y + i * f);
+        set(visible, ON);
+    }
+    move_cards(from, to, cnt, auto);
     render_pile(from);
     busy = 1;
     fly_to = to;
-    target(drag_w);
-    set(image_id, cd + 1);
-    set(location, x, y);
-    set(visible, ON);
-    animate(drag_w, PROP_LOC_X, pile_x(to), ms, EASE_OUT, @on_fly_end);
-    animate(drag_w, PROP_LOC_Y, top_y(to, 0), ms, EASE_OUT);
+    var tx = pile_x(to);
+    var ty = TOP_Y;
+    var tf = 0;
+    if (to < 8) {
+        tf = fan(tab_n[to]);
+        ty = COL_Y + (tab_n[to] - cnt) * tf;
+    }
+    animate(fly_w[0], PROP_LOC_X, tx, ms, EASE_OUT, @on_fly_end);
+    animate(fly_w[0], PROP_LOC_Y, ty, ms, EASE_OUT);
+    for (var k = 1; k < cnt; k++) {
+        animate(fly_w[k], PROP_LOC_X, tx, ms, EASE_OUT);
+        animate(fly_w[k], PROP_LOC_Y, ty + k * tf, ms, EASE_OUT);
+    }
 }
 
 fn on_fly_end(w, prop) {
-    target(drag_w);
-    set(visible, OFF);
+    hide_flight();
     render_pile(fly_to);
     busy = 0;
     show_status();
@@ -429,7 +517,7 @@ fn auto_step() {
         if (cd >= 0 && safe_home(cd)) {
             var f = foundation_for(cd);
             if (f >= 0) {
-                fly(p, f, 1, pile_x(p), top_y(p, 0), 170);
+                fly(p, f, 1, 1, pile_x(p), top_y(p, 0), 0, 170);
                 return 0;
             }
         }
@@ -475,10 +563,11 @@ fn undo() {
     while (hist_n > 0 && !user) {
         var e = hist[hist_n - 1];
         hist_n = hist_n - 1;
-        var from = e / 64;
+        var cnt = e / 1024;
+        var from = e % 1024 / 64;
         var to = e / 2 % 32;
         user = !(e & 1);
-        put(take(to), from);
+        move_run(to, from, cnt);
         if (user) {
             moves = moves - 1;
         }
@@ -563,9 +652,23 @@ fn tap_target(cd, from) {
     return -1;
 }
 
+// A tapped run: a column it fits on, else an empty one.
+fn tap_run_target(cd, cnt, from) {
+    for (var c = 0; c < 8; c++) {
+        if (c != from && tab_n[c] > 0 && run_fits(cd, cnt, c)) {
+            return c;
+        }
+    }
+    for (var c2 = 0; c2 < 8; c2++) {
+        if (c2 != from && tab_n[c2] == 0 && run_fits(cd, cnt, c2)) {
+            return c2;
+        }
+    }
+    return -1;
+}
+
 fn on_back_end(w, prop) {
-    target(drag_w);
-    set(visible, OFF);
+    hide_flight();
     render_pile(drag_from);
     busy = 0;
 }
@@ -579,38 +682,60 @@ fn on_touch_down(x, y) {
         return 0;
     }
     var p = -1;
+    var k = 0;
+    // A column's card: the part of it that shows (all of the top one).
     for (var c = 0; c < 8; c++) {
         var n = tab_n[c];
-        var ty = top_y(c, 0);
-        if (n > 0 && x >= pile_x(c) && x < pile_x(c) + CARD_W && y >= ty && y < ty + CARD_H) {
+        var f = fan(n);
+        if (n > 0 && x >= pile_x(c) && x < pile_x(c) + CARD_W && y >= COL_Y
+                && y < COL_Y + (n - 1) * f + CARD_H) {
+            var at = (y - COL_Y) / f;
             p = c;
+            k = at > n - 1 ? n - 1 : at;
         }
     }
     for (var q = 8; q < 12; q++) {
         if (cellc[q - 8] >= 0 && x >= pile_x(q) && x < pile_x(q) + CARD_W && y >= TOP_Y && y < TOP_Y + CARD_H) {
             p = q;
+            k = 0;
         }
     }
     if (p < 0) {
         return 0;
     }
+    drag_n = 1;
+    drag_f = 0;
+    if (p < 8) {
+        // Only a run on top moves, and only one small enough for some column.
+        if (k < run_start(p)) {
+            return 0;
+        }
+        drag_n = tab_n[p] - k;
+        if (drag_n > 1 && drag_n > max_run(-1)) {
+            return 0;
+        }
+        drag_f = fan(tab_n[p]);
+    }
     dragging = 1;
     drag_from = p;
-    drag_card = top_card(p);
+    drag_card = p < 8 ? tab[p * SLOTS + k] : top_card(p);
     drag_x0 = pile_x(p);
-    drag_y0 = top_y(p, 0);
+    drag_y0 = p < 8 ? COL_Y + k * drag_f : TOP_Y;
     grab_dx = x - drag_x0;
     grab_dy = y - drag_y0;
     press_x = x;
     press_y = y;
     drag_moved = 0;
-    target(drag_w);
-    set(image_id, drag_card + 1);
-    set(location, drag_x0, drag_y0);
-    set(visible, ON);
+    for (var i = 0; i < drag_n; i++) {
+        var cd = p < 8 ? tab[p * SLOTS + k + i] : drag_card;
+        target(fly_w[i]);
+        set(image_id, cd + 1);
+        set(visible, ON);
+    }
+    place_flight(drag_x0, drag_y0);
     drag_cx = drag_x0;
     drag_cy = drag_y0;
-    hide_top(p);
+    hide_from(p, k);
 }
 
 fn on_touch_move(x, y) {
@@ -625,8 +750,7 @@ fn on_touch_move(x, y) {
     if (drag_moved) {
         drag_cx = x - grab_dx;
         drag_cy = y - grab_dy;
-        target(drag_w);
-        set(location, drag_cx, drag_cy);
+        place_flight(drag_cx, drag_cy);
     }
 }
 
@@ -636,19 +760,30 @@ fn on_touch_up() {
     }
     dragging = 0;
     var to = -1;
-    if (drag_moved) {
+    if (drag_n > 1) {
+        if (drag_moved) {
+            var p = drop_pile(drag_cx + CARD_W / 2, drag_cy + CARD_H / 2);
+            to = p != drag_from && run_fits(drag_card, drag_n, p) ? p : -1;
+        } else {
+            to = tap_run_target(drag_card, drag_n, drag_from);
+        }
+    } else if (drag_moved) {
         to = resolve_drop(drag_card, drop_pile(drag_cx + CARD_W / 2, drag_cy + CARD_H / 2));
     } else {
         to = tap_target(drag_card, drag_from);
     }
     if (to >= 0) {
-        fly(drag_from, to, 0, drag_cx, drag_cy, drag_moved ? 90 : 160);
+        fly(drag_from, to, drag_n, 0, drag_cx, drag_cy, drag_f, drag_moved ? 90 : 160);
         return 0;
     }
-    // Back where it came from.
+    // Back where they came from.
     busy = 1;
-    animate(drag_w, PROP_LOC_X, drag_x0, 160, EASE_OUT, @on_back_end);
-    animate(drag_w, PROP_LOC_Y, drag_y0, 160, EASE_OUT);
+    animate(fly_w[0], PROP_LOC_X, drag_x0, 160, EASE_OUT, @on_back_end);
+    animate(fly_w[0], PROP_LOC_Y, drag_y0, 160, EASE_OUT);
+    for (var i = 1; i < drag_n; i++) {
+        animate(fly_w[i], PROP_LOC_X, drag_x0, 160, EASE_OUT);
+        animate(fly_w[i], PROP_LOC_Y, drag_y0 + i * drag_f, 160, EASE_OUT);
+    }
 }
 
 // ============================================================
@@ -770,11 +905,15 @@ fn setup() {
         shown_on[i] = 0;
     }
 
-    drag_w = alloc();
-    set(kind, KIND_IMAGE);
-    set(size, CARD_W, CARD_H);
-    set(visible, OFF);
-    parent(0);
+    // The cards in flight, the first one lowest.
+    for (var f = 0; f < RUN_MAX; f++) {
+        var fw = alloc();
+        set(kind, KIND_IMAGE);
+        set(size, CARD_W, CARD_H);
+        set(visible, OFF);
+        parent(0);
+        fly_w[f] = fw;
+    }
 
     win_panel = alloc();
     set(location, 340, 280);

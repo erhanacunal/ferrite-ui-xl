@@ -950,6 +950,39 @@ impl ObjPool {
     // --- Tree operations ---
 
     /// Add child to end of parent's child list (highest z-order).
+    /// Moves `child` to the end of its parent's children: drawn last, hit first (an app's
+    /// container when it is shown, `domain.rs`).
+    pub fn raise(&mut self, child: WidgetId) {
+        if !self.is_live(child) {
+            return;
+        }
+        let parent = self.get(child).parent;
+        if !self.is_live(parent) || self.get(child).next_sibling.is_none() {
+            return;
+        }
+        let next = self.get(child).next_sibling;
+        if self.get(parent).first_child == child {
+            self.get_mut(parent).first_child = next;
+        } else {
+            let mut at = self.get(parent).first_child;
+            let mut guard = 0usize;
+            while at.is_some() && self.get(at).next_sibling != child {
+                at = self.get(at).next_sibling;
+                guard += 1;
+                if guard > self.count() {
+                    return;
+                }
+            }
+            if at.is_none() {
+                return;
+            }
+            self.get_mut(at).next_sibling = next;
+        }
+        self.get_mut(child).next_sibling = WidgetId::NONE;
+        self.add_child(parent, child);
+        self.mark_dirty(parent);
+    }
+
     pub fn add_child(&mut self, parent: WidgetId, child: WidgetId) {
         if parent == child || !self.is_live(parent) || !self.is_live(child) {
             return;
@@ -1401,6 +1434,32 @@ mod tests {
         tree.get_mut(id).kind = kind;
         assert!(tree.update_ext(id, |e| e.group_id = group));
         id
+    }
+
+    #[test]
+    fn raise_moves_a_child_last() {
+        let mut tree = ObjPool::new();
+        let root = tree.alloc_widget().unwrap();
+        let [a, b, c] = [(); 3].map(|_| tree.alloc_widget().unwrap());
+        for w in [a, b, c] {
+            tree.add_child(root, w);
+        }
+        let order = |t: &ObjPool| {
+            let mut v = Vec::new();
+            let mut w = t.get(root).first_child;
+            while w.is_some() {
+                v.push(w);
+                w = t.get(w).next_sibling;
+            }
+            v
+        };
+        tree.raise(a);
+        assert!(order(&tree) == [b, c, a], "first");
+        tree.raise(c);
+        assert!(order(&tree) == [b, a, c], "middle");
+        tree.raise(c);
+        assert!(order(&tree) == [b, a, c], "already last");
+        assert!(tree.get(c).parent == root);
     }
 
     #[test]

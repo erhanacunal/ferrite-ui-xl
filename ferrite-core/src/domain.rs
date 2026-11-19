@@ -22,11 +22,14 @@ use alloc::vec::Vec;
 
 use crate::apps::{AppFiles, AppInfo};
 use crate::fs::Fs;
+use crate::widget::WidgetId;
 
 /// Apps running at once (the system image not counted).
 pub const MAX_APPS: usize = 4;
 /// The system image's domain.
 pub const SYSTEM: u8 = 0;
+/// A task slot's domain while its `startApp` waits for the runtime to open the app.
+pub const PENDING: u8 = 0xFF;
 /// App ranges start on this boundary.
 pub const ALIGN: u32 = 64 << 10;
 /// An app's EEPROM file, in its `data/`.
@@ -87,6 +90,12 @@ pub struct AppDomain {
     pub serial: u32,
     /// Its font and image ids → global ids.
     pub ids: IdMaps,
+    /// Its first task (`startApp`'s; `TASK_MAIN` when it runs as `main`, `runApp`): it
+    /// ending ends the app.
+    pub task: u8,
+    /// Its full-screen container under the root, what its `parent(0)` / `target(0)` mean
+    /// (NONE when it runs as `main`: the root itself).
+    pub container: WidgetId,
 }
 
 impl AppDomain {
@@ -102,6 +111,14 @@ impl AppDomain {
 pub struct Domains {
     apps: [Option<AppDomain>; MAX_APPS],
     next_serial: u32,
+    /// The app on screen (0 = none: the launcher, i.e. what `main` shows).
+    pub shown: u8,
+    /// `startApp`s the runtime has yet to open: (the task slot reserved, the app id).
+    pub starts: Vec<(u8, String)>,
+    /// `showApp` / the home gesture: the domain to show (0 = the launcher).
+    pub show: Option<u8>,
+    /// `exitApp`: domains to end (bit = domain).
+    pub exits: u8,
 }
 
 impl Default for Domains {
@@ -112,13 +129,29 @@ impl Default for Domains {
 
 impl Domains {
     pub const fn new() -> Self {
-        Self { apps: [const { None }; MAX_APPS], next_serial: 1 }
+        Self { apps: [const { None }; MAX_APPS], next_serial: 1, shown: 0, starts: Vec::new(), show: None, exits: 0 }
     }
 
     /// App domain `d` (None for the system image or a closed one).
     pub fn get(&self, d: u8) -> Option<&AppDomain> {
         let i = usize::from(d).checked_sub(1)?;
         self.apps.get(i)?.as_ref()
+    }
+
+    /// App domain `d`, to change.
+    pub fn get_mut(&mut self, d: u8) -> Option<&mut AppDomain> {
+        let i = usize::from(d).checked_sub(1)?;
+        self.apps.get_mut(i)?.as_mut()
+    }
+
+    /// The domain whose first task is `task`.
+    pub fn of_task(&self, task: u8) -> Option<u8> {
+        self.ids().find(|&d| self.get(d).is_some_and(|a| a.task == task && a.container.is_some()))
+    }
+
+    /// What `parent(0)` / `target(0)` mean in domain `d`: its container, or the root.
+    pub fn root_of(&self, d: u8) -> Option<WidgetId> {
+        self.get(d).map(|a| a.container).filter(|c| c.is_some())
     }
 
     /// Domain `d`'s font id `local` as the global one (the system image's as it is).
@@ -208,13 +241,27 @@ impl Domains {
         let data = alloc::format!("{}/{}", info.dir(), crate::apps::DATA_DIR);
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1).max(1);
-        self.apps[i] = Some(AppDomain { info, base, len, fs, data, serial, ids });
+        self.apps[i] = Some(AppDomain {
+            info,
+            base,
+            len,
+            fs,
+            data,
+            serial,
+            ids,
+            task: crate::task::TASK_MAIN,
+            container: WidgetId::NONE,
+        });
         Some(i as u8 + 1)
     }
 
     /// Closes app domain `d`.
     pub fn close(&mut self, d: u8) -> Option<AppDomain> {
         let i = usize::from(d).checked_sub(1)?;
+        if self.shown == d {
+            self.shown = 0;
+        }
+        self.exits &= !(1 << d);
         self.apps.get_mut(i)?.take()
     }
 }
@@ -383,6 +430,8 @@ mod tests {
             data: String::new(),
             serial: 1,
             ids: IdMaps::default(),
+            task: 0,
+            container: WidgetId::NONE,
         };
         assert_eq!(a.flash_addr(0x1000, 0x1010, 0x10), Some(0x60_0010));
         assert_eq!(a.flash_addr(0x1000, 0x10f8, 0x10), None);

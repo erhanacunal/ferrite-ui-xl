@@ -1246,13 +1246,15 @@ fn storage_service() {
             let items: Vec<String> = apps.iter().map(app_json).collect();
             let available = crate::storage::BoardApps.available();
             let running = ferrite_core::apps::current().map(|a| a.id).unwrap_or_default();
+            let started: Vec<String> = ferrite_core::apps::started().iter().map(|s| json_str(s)).collect();
             let boot = crate::settings::boot_app().unwrap_or_default();
             (
                 true,
                 format!(
-                    "{{\"storage\":{},\"running\":{},\"boot\":{},\"apps\":[{}]}}",
+                    "{{\"storage\":{},\"running\":{},\"started\":[{}],\"boot\":{},\"apps\":[{}]}}",
                     available,
                     json_str(&running),
+                    started.join(","),
                     json_str(&boot),
                     items.join(",")
                 ),
@@ -1286,7 +1288,7 @@ fn storage_service() {
         }
         STORAGE_APP_REMOVE => {
             let id = STORAGE_ARG.lock(|a| a.borrow().clone());
-            if ferrite_core::apps::current().is_some_and(|a| a.id == id) {
+            if ferrite_core::apps::is_running(&id) {
                 STORAGE_TEXT.lock(|t| {
                     *t.borrow_mut() = Some((false, String::from("409 {\"error\":\"the app is running: run another first\"}")))
                 });

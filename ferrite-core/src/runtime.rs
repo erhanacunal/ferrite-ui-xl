@@ -1158,6 +1158,17 @@ fn close_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, d: u8) {
     }
 }
 
+/// Publishes the started apps (`apps::started`, `/api/apps`).
+fn report_started<P: Platform>(ctx: &Ctx<P>) {
+    let ids = ctx
+        .domains
+        .ids()
+        .filter(|&d| ctx.domains.root_of(d).is_some())
+        .filter_map(|d| ctx.domains.get(d).map(|a| a.info.id.clone()))
+        .collect();
+    crate::apps::set_started(ids);
+}
+
 /// Closes every app domain (their tasks ended before).
 fn close_apps<P: PlatformRuntime>(ctx: &mut Ctx<P>) {
     let open: Vec<u8> = ctx.domains.ids().collect();
@@ -1337,6 +1348,15 @@ impl<P: PlatformRuntime> Runtime<P> {
             self.ctx.tasks.reset();
             self.fault_dialog = WidgetId::NONE;
         }
+        // Started apps (`startApp`) end with their tasks; one running as `main` stays.
+        let started: Vec<u8> = self.ctx.domains.ids().filter(|&d| self.ctx.domains.root_of(d).is_some()).collect();
+        for d in started {
+            close_app(&mut self.ctx, d);
+        }
+        self.ctx.domains.starts.clear();
+        self.ctx.domains.show = None;
+        self.ctx.domains.shown = 0;
+        report_started(&self.ctx);
     }
 }
 
@@ -1367,16 +1387,102 @@ impl<P: PlatformRuntime> Runtime<P> {
                 self.end_task(id, 0, None);
             }
         }
+        self.service_apps();
         for id in 1..MAX_TASKS as u8 {
             if self.ctx.tasks.slots[id as usize].state == SlotState::Starting {
                 self.start_task(id);
             }
+        }
+        if let Some(d) = self.ctx.domains.show.take() {
+            self.show_app(d);
         }
         while let Some(m) = self.ctx.tasks.mail.pop_front() {
             if let Some(vm) = self.tasks.get(m.to) {
                 send_kind(vm, FunctionKind::OnTaskMessage, &[m.from as i32, m.a, m.b]);
             }
         }
+    }
+
+    /// `exitApp`s and `startApp`s of this pass (docs/apps.md "Step 2"): an exiting app's
+    /// first task ends (and with it the app, `end_task`); a starting one's domain opens,
+    /// its container is made and its slot set to run the entry program (a failure ends
+    /// the slot: `on_task_exit(task, -1)`).
+    fn service_apps(&mut self) {
+        let exits = core::mem::take(&mut self.ctx.domains.exits);
+        for d in 1..=crate::domain::MAX_APPS as u8 {
+            if exits & (1 << d) != 0
+                && let Some(task) = self.ctx.domains.get(d).map(|a| a.task)
+                && self.ctx.tasks.alive(i32::from(task))
+            {
+                self.end_task(task, 0, None);
+            }
+        }
+        for (slot, id) in core::mem::take(&mut self.ctx.domains.starts) {
+            if self.ctx.tasks.slots[slot as usize].state != crate::task::SlotState::Starting {
+                continue; // killed before it opened
+            }
+            match open_app(&mut self.ctx, &id) {
+                Ok(d) => {
+                    let entry = entry_program(&self.ctx, d);
+                    let s = &mut self.ctx.tasks.slots[slot as usize];
+                    s.domain = d;
+                    s.program = ProgramRef::new(entry.as_bytes(), 0);
+                    if let Some(app) = self.ctx.domains.get_mut(d) {
+                        app.task = slot;
+                    }
+                    self.make_container(d);
+                    self.ctx.domains.show = Some(d);
+                    report_started(&self.ctx);
+                }
+                Err(_) => {
+                    self.ctx.tasks.slots[slot as usize].domain = crate::domain::SYSTEM;
+                    self.end_task(slot, -1, None);
+                }
+            }
+        }
+    }
+
+    /// App domain `d`'s full-screen container under the root (owned by its first task),
+    /// hidden until shown.
+    fn make_container(&mut self, d: u8) {
+        let Some(task) = self.ctx.domains.get(d).map(|a| a.task) else { return };
+        let (w, h) = (self.ctx.lcd.width(), self.ctx.lcd.height());
+        self.ctx.objs.cur_task = task;
+        let c = self.ctx.objs.alloc_widget();
+        self.ctx.objs.cur_task = crate::task::TASK_MAIN;
+        let Some(c) = c else { return };
+        let wd = self.ctx.objs.get_mut(c);
+        wd.size = Size { w, h };
+        wd.background_color = P::BG_COLOR;
+        // Clickable: touches on it stay in the app, not the launcher below.
+        wd.flags = (wd.flags | widget::FLAG_CLICKABLE) & !widget::FLAG_VISIBLE;
+        let root = self.ctx.objs.root;
+        self.ctx.objs.add_child(root, c);
+        if let Some(app) = self.ctx.domains.get_mut(d) {
+            app.container = c;
+        }
+    }
+
+    /// Shows app domain `d` (0 = the launcher: `main`'s widgets): its container visible
+    /// and on top, the others hidden; its first task gets the foreground.
+    fn show_app(&mut self, d: u8) {
+        use crate::task::TASK_MAIN;
+        let d = if self.ctx.domains.root_of(d).is_some() { d } else { 0 };
+        let open: Vec<u8> = self.ctx.domains.ids().collect();
+        for o in open {
+            let Some(c) = self.ctx.domains.root_of(o) else { continue };
+            Vm::set_scalar_prop_on(&mut self.ctx, c, crate::proto::PROP_VISIBLE, i32::from(o == d));
+            if o == d {
+                self.ctx.objs.raise(c);
+            }
+        }
+        self.ctx.domains.shown = d;
+        let fg = self.ctx.domains.get(d).map_or(TASK_MAIN, |a| a.task);
+        if !self.ctx.tasks.set_fg(i32::from(fg)) {
+            self.ctx.tasks.fg = TASK_MAIN;
+        }
+        let root = self.ctx.objs.root;
+        self.ctx.objs.mark_dirty(root);
     }
 
     /// Start the program a `spawnProgram` reserved slot `id` for: a VM sized
@@ -1435,12 +1541,38 @@ impl<P: PlatformRuntime> Runtime<P> {
                 self.show_fault_dialog(info.program.name(), code as u8, pc);
             }
         }
+        // An app's first task: the app ends (its other tasks, then its domain).
+        if let Some(d) = self.ctx.domains.of_task(id) {
+            if let Some(app) = self.ctx.domains.get_mut(d) {
+                app.task = crate::domain::PENDING;
+            }
+            for t in 1..crate::task::MAX_TASKS as u8 {
+                let s = self.ctx.tasks.slots[t as usize];
+                if s.state != crate::task::SlotState::Free && s.domain == d {
+                    self.end_task(t, 0, None);
+                }
+            }
+            let was_shown = self.ctx.domains.shown == d;
+            close_app(&mut self.ctx, d);
+            report_started(&self.ctx);
+            if was_shown {
+                self.show_app(0);
+            }
+        }
     }
 
     /// `runProgram` in a child: the same slot (id, parent, foreground) starts
     /// `next` from scratch later in this pass.
     fn restart_task(&mut self, id: u8, next: ProgramRef) {
         self.clear_task(id);
+        // An app's first task: its container went with its widgets.
+        if let Some(d) = self.ctx.domains.of_task(id) {
+            let shown = self.ctx.domains.shown == d;
+            self.make_container(d);
+            if shown {
+                self.show_app(d);
+            }
+        }
         let slot = &mut self.ctx.tasks.slots[id as usize];
         slot.program = next;
         slot.state = crate::task::SlotState::Starting;
@@ -2112,7 +2244,14 @@ pub struct FullInput {
     last_pos: [(i32, i32); 32],
     /// Scroll containers coasting after a drag-to-scroll.
     flings: Vec<Fling>,
+    /// The home gesture (an app shown): where a finger went down in the bottom strip.
+    home_from: Option<(u8, i32)>,
 }
+
+/// The home gesture: a finger down in the bottom `HOME_STRIP` px moving up `HOME_RISE` px
+/// shows the launcher (docs/apps.md "Step 2").
+const HOME_STRIP: i32 = 24;
+const HOME_RISE: i32 = 80;
 
 /// A scroll container coasting: `v` px/s of content offset, decaying.
 struct Fling {
@@ -2144,6 +2283,7 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
             down: 0,
             last_pos: [(0, 0); 32],
             flings: Vec::new(),
+            home_from: None,
         }
     }
 
@@ -2230,6 +2370,9 @@ impl FullInput {
         let ptr = |kind| gesture::Ptr { kind, id, x: xi, y: yi, ms };
         match kind {
             TouchEventKind::Press => {
+                if ctx.domains.shown != 0 && yi >= i32::from(ctx.lcd.height()) - HOME_STRIP {
+                    self.home_from = Some((id, yi));
+                }
                 let is_primary = self.primary.is_none() && self.down == 0;
                 self.down |= 1 << id;
                 self.last_pos[id as usize] = (xi, yi);
@@ -2260,6 +2403,14 @@ impl FullInput {
                 }
             }
             TouchEventKind::Release => {
+                if let Some((f, y0)) = self.home_from
+                    && f == id
+                {
+                    self.home_from = None;
+                    if y0 - yi >= HOME_RISE && ctx.domains.shown != 0 {
+                        ctx.domains.show = Some(0);
+                    }
+                }
                 let was_down = self.down & (1 << id) != 0;
                 self.down &= !(1 << id);
                 if self.primary == Some(id) {

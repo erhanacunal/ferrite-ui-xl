@@ -1,17 +1,47 @@
 // app.fl — the app of the `apps` example, built twice: hello/ and world/ give
 // it another application_id (docs/apps.md). Each build is its own app: its own
 // EEPROM (byte 0 counts its starts here) and files (START.TXT), so the two
-// counters and the launcher's never mix. "Back" returns to the system image.
+// counters and the launcher's never mix. Started from the launcher (startApp)
+// it runs beside it: "Home" shows the launcher and the app keeps counting its
+// seconds in the background; "Exit" ends it (exitApp).
 
 #include "core.fl"
 #include "color.fl"
 #include "apps.fl"
 #include "storage.fl"
 
-var back;
+var home;
+var quit;
+var clock;
+var born = 0;
+var shown_s = -1;
 
-fn on_back(wid) {
-    runApp("");
+fn on_button(wid) {
+    if (wid == home) {
+        showApp(0);
+    }
+    if (wid == quit) {
+        exitApp();
+    }
+}
+
+fn button(b: widget, x, label: string) {
+    target(b);
+    set(location, x, 560);
+    set(size, 300, 120);
+    set(bg_color, 0x2945);
+    set(press_color, 0x2C9F);
+    set(border_radius, 16);
+    set(clickable, ON);
+    parent(0);
+    var l = alloc();
+    target(l);
+    set(kind, KIND_LABEL);
+    set(size, 300, 120);
+    set(text, label);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(b);
 }
 
 fn setup() {
@@ -56,27 +86,33 @@ fn setup() {
     set(text_align, ALIGN_CENTER);
     parent(0);
 
-    back = alloc();
-    target(back);
-    set(location, 490, 560);
-    set(size, 300, 120);
-    set(bg_color, 0x2945);
-    set(press_color, 0x2C9F);
-    set(border_radius, 16);
-    set(clickable, ON);
-    parent(0);
-    var l = alloc();
-    target(l);
+    clock = alloc();
+    target(clock);
     set(kind, KIND_LABEL);
-    set(size, 300, 120);
-    set(text, "Back");
-    set(text_color, WHITE);
+    set(location, 0, 360);
+    set(size, 1280, 40);
+    set(text_color, GREEN);
     set(text_align, ALIGN_CENTER);
-    parent(back);
-    target(back);
-    set(on_click, @on_back);
+    parent(0);
+    born = millis();
+
+    home = alloc();
+    quit = alloc();
+    button(home, 290, "Home");
+    button(quit, 690, "Exit");
+    // set(on_click) wires file-scope widget variables.
+    target(home);
+    set(on_click, @on_button);
+    target(quit);
+    set(on_click, @on_button);
     return 0;
 }
 
 fn loop() {
+    var sec = (millis() - born) / 1000;
+    if (sec != shown_s) {
+        shown_s = sec;
+        target(clock);
+        set(text, sprintf("running %d s", sec));
+    }
 }

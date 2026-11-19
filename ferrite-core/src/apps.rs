@@ -358,8 +358,18 @@ pub const SYS_APP_NAME: u8 = 0x82;
 /// next pass, like `runProgram`: nothing of the caller runs after it. 0 if `id` is not
 /// installed (the caller goes on).
 pub const SYS_APP_RUN: u8 = 0x83;
-/// `()` → string: the running app's id, "" for the system image.
+/// `()` → string: the calling task's app id, "" for the system image (answered by the VM).
 pub const SYS_APP_CURRENT: u8 = 0x84;
+/// `(id: string)` → the app's first task, started (from the next pass) if it does not run,
+/// and shown; -1 not installed, -2 [`crate::domain::MAX_APPS`] already run, -3 no task
+/// slot. A start that fails later ends that task (`on_task_exit(task, -1)`).
+pub const SYS_APP_START: u8 = 0x85;
+/// `(task)` → shows the app `task` belongs to (0 = the launcher): 1, or 0 if it is no app.
+pub const SYS_APP_SHOW: u8 = 0x86;
+/// `(id: string)` → the app's first task if it runs (or is starting), else -1.
+pub const SYS_APP_TASK: u8 = 0x87;
+/// `()` → ends the calling app (every task of it); in the system image 0 and nothing.
+pub const SYS_APP_EXIT: u8 = 0x88;
 
 /// What an app syscall did.
 pub enum Call {
@@ -383,6 +393,8 @@ impl<T> Cpu0<T> {
 
 /// The running app (None = the system image).
 static CURRENT: Cpu0<Option<AppInfo>> = Cpu0(core::cell::UnsafeCell::new(None));
+/// The apps `startApp` runs beside `main` (docs/apps.md "Step 2").
+static STARTED: Cpu0<Vec<String>> = Cpu0(core::cell::UnsafeCell::new(Vec::new()));
 /// A run asked for: Some(None) = back to the system image.
 static RUN_REQUEST: Cpu0<Option<Option<String>>> = Cpu0(core::cell::UnsafeCell::new(None));
 /// [`list`] as last read, with the [`GENERATION`] it was read at.
@@ -402,6 +414,21 @@ pub fn current() -> Option<AppInfo> {
 /// The runtime switched to `app`.
 pub fn set_current(app: Option<AppInfo>) {
     *CURRENT.get() = app;
+}
+
+/// The apps started beside `main` (`startApp`), in domain order.
+pub fn started() -> Vec<String> {
+    STARTED.get().clone()
+}
+
+/// The runtime's started apps changed.
+pub fn set_started(ids: Vec<String>) {
+    *STARTED.get() = ids;
+}
+
+/// App `id` runs (as `main` or started).
+pub fn is_running(id: &str) -> bool {
+    current().is_some_and(|a| a.id == id) || STARTED.get().iter().any(|s| s == id)
 }
 
 /// Asks the runtime to run app `id` (None = the system image) from the next pass.

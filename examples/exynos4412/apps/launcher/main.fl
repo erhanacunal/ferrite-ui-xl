@@ -2,8 +2,10 @@
 // the `apps` example (docs/apps.md).
 //
 // Shows a tile for every installed app package (appCount / appName, lib/apps.fl);
-// tapping one calls runApp(id): this image ends there and the app runs in its
-// place, with its own files and EEPROM. An app comes back with runApp("").
+// tapping one calls startApp(id): the app runs beside the launcher, full screen,
+// with its own files and EEPROM (at most four at once). Its Home button or a
+// swipe up from the bottom edge shows the launcher again, the app running on;
+// tapping its tile shows it again. Its Exit button ends it (on_task_exit).
 // The launcher counts its own starts in its EEPROM byte 0, which no app sees.
 //
 // Install the apps first: ferrite_build hello/project.json -o hello.bin, then
@@ -19,6 +21,7 @@ const TILE_H = 160;
 const GAP = 40;
 
 var count = 0;
+var status;
 // set(on_click) wires file-scope widget variables: one per tile.
 var tile0;
 var tile1;
@@ -52,8 +55,17 @@ fn on_tile(wid) {
     if (wid == tile2) { slot = 2; }
     if (wid == tile3) { slot = 3; }
     if (slot >= 0) {
-        runApp(appId(slot));
+        var t = startApp(appId(slot));
+        if (t < 0) {
+            target(status);
+            set(text, sprintf("startApp: %d", t));
+        }
     }
+}
+
+fn on_task_exit(task, code) {
+    target(status);
+    set(text, sprintf("app task %d ended (%d)", task, code));
 }
 
 fn setup() {
@@ -88,6 +100,15 @@ fn setup() {
     tile1 = alloc();
     tile2 = alloc();
     tile3 = alloc();
+    status = alloc();
+    target(status);
+    set(kind, KIND_LABEL);
+    set(location, 0, 600);
+    set(size, 1280, 40);
+    set(text_color, YELLOW);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
     if (count > 0) { tile(tile0, 0); }
     if (count > 1) { tile(tile1, 1); }
     if (count > 2) { tile(tile2, 2); }

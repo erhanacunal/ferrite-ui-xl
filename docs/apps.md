@@ -196,7 +196,7 @@ image, not counted).
 `FS_BASE`, as today, never moved), domains 1..=4 apps. `ctx.domains`
 (`ferrite-core/src/domain.rs`) holds per app domain: its `AppInfo`, its
 range of the RAM region, its `Fs`, its font / image id maps, its EEPROM
-buffer, its container widget and its task count. Every VM carries its
+buffer, its container widget and its first task. Every VM carries its
 `domain` (a task spawned by `spawnProgram` inherits its parent's).
 
 - **Region:** an app's image goes into a free range of the region above the
@@ -235,13 +235,19 @@ buffer, its container widget and its task count. Every VM carries its
   and hides the others; the launcher's own widgets show when none is
   visible. Hidden containers are neither drawn nor hit. The shown app's
   first task is the foreground task (`ctx.tasks.fg`, global input).
+  The container is clickable (no `on_click`), so touches on it stay in the
+  app and never reach the launcher below. `startApp` reserves a task slot
+  (domain `PENDING`) and the runtime opens the domain after the burst
+  (`Runtime::service_apps`); a failure there ends the slot with code -1.
 - **Home gesture:** a pointer that goes down in the bottom 24 px while an app
-  is shown belongs to the runtime (not routed to widgets); released after
-  moving 80 px up, it shows the launcher.
-- **End:** the domain closes when its last task ends (`exitApp()`, a
-  `killProgram` of its task, a fault): fonts / images unloaded, EEPROM
-  saved, range freed. The launcher (the starting task) gets
-  `on_task_exit(task, code)`.
+  is shown and is released 80 px higher shows the launcher (the touch also
+  reaches the app as usual; `FullInput::home_from`).
+- **End:** the app ends when its first task ends (`exitApp()`, a
+  `killTask` of it, a fault): its other tasks end, then its domain closes
+  (fonts / images unloaded, EEPROM saved, range freed). The launcher (the
+  starting task) gets `on_task_exit(task, code)`. A `runProgram` in the
+  first task keeps the app (its container is made again). `main` switching
+  program, a system writefs or `runApp` end every started app.
 
 `.fl` (`lib/apps.fl`, syscalls 0x85..):
 
@@ -269,9 +275,14 @@ Phases:
   `FontList` / `ImageList` `find_or_load_mapped`, `remove_ids`). Check: the
   tablet built as an app renders pixel-identical to the tablet as the system
   image (sim, also after opening Clock); board: it runs as an app.
-- **2c:** `startApp` / `showApp` / `appTask` / `exitApp`, containers, the
-  home gesture, the 4-app limit, `/api/apps` `running` as a list, the
-  launcher example on `startApp`, a sim scenario; board.
+- **2c** (done 2026-11-19): `startApp` / `showApp` / `appTask` / `exitApp`
+  (VM `app_call`), containers (`ObjPool::raise`), the home gesture, the
+  4-app limit, `/api/apps` `started` (beside `running`, the app run as
+  `main`), the launcher example on `startApp`. Sim: start, Home, a second
+  app, the gesture, show again (the hidden app kept counting), Exit;
+  pixel-identical with `FERRITE_SIM_DL_VERIFY` / `SCENE_VERIFY` / `AREAS`.
+  Board: the same, and four apps at once (heap 94 MB); a system writefs
+  ends them.
 - **2d:** notes, CLAUDE.md.
 
 ## Step 3 constraints (decided now, built later)

@@ -10,7 +10,7 @@
 //! | `POST /save` (or `PUT`) | a firmware `.bin`: checked, saved as `FERRITE/FERRITE.BIN` (uart_boot's file, with its `EXYNBOOT` header), then a restart, so uart_boot boots it |
 //! | `POST /restart` | restarts the board |
 //! | `POST /api/apps` (or `PUT`) | an app package (ferrite-core `apps`, docs/apps.md): checked and installed under `ferrite/apps/{id}/`, no restart; JSON `{"id","name","version","entry","icon","caps","replaced"}`, or `{"code","error"}` with 400/404/413/500/503 |
-//! | `GET /api/apps` | JSON: `{"storage":bool,"running":ID,"boot":ID,"apps":[{"id","name","version",...}]}` ("" = the system image) |
+//! | `GET /api/apps` | JSON: `{"storage":bool,"running":ID,"started":[ID,...],"boot":ID,"apps":[{"id","name","version",...}]}` ("" = the system image; `started`: the apps `startApp` runs beside it) |
 //! | `DELETE /api/apps/{id}` | removes the app and its data (409 while it runs; clears it as the boot app) |
 //! | `POST /api/apps?run=1` | installs, then runs it (an update of the running app restarts it anyway) |
 //! | `POST /api/apps/run?id=ID` | runs installed app `ID` from the next pass (no `id`: the system image) |

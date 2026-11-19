@@ -2195,11 +2195,11 @@ impl Vm {
                 // allocated widgets use W_TARGET_S, which takes a u16 id from
                 // the stack.
                 let wid = self.read_u8();
-                self.target = WidgetId(wid as ObjPtr);
+                self.target = self.widget_ref(ctx, wid as ObjPtr);
             }
             OP_W_TARGET_S => {
                 let wid = self.pop() as ObjPtr;
-                self.target = WidgetId(wid);
+                self.target = self.widget_ref(ctx, wid);
             }
             OP_W_SET => {
                 let prop_id = self.read_u8();
@@ -2802,8 +2802,11 @@ impl Vm {
                 for i in (0..actual).rev() {
                     args[i] = self.pop();
                 }
-                // App syscalls (0x80..=0x84) are the core's: `runApp` ends the task.
-                if (crate::apps::SYS_APP_COUNT..=crate::apps::SYS_APP_CURRENT).contains(&syscall_id) {
+                // App syscalls (0x80..=0x88) are the core's: `runApp` ends the task.
+                if (crate::apps::SYS_APP_CURRENT..=crate::apps::SYS_APP_EXIT).contains(&syscall_id) {
+                    return self.app_call(ctx, syscall_id, &args[..actual]);
+                }
+                if (crate::apps::SYS_APP_COUNT..crate::apps::SYS_APP_CURRENT).contains(&syscall_id) {
                     match crate::apps::syscall(syscall_id, &args[..actual], &mut ctx.objs, P::app_files()) {
                         Some(crate::apps::Call::Value(v)) => self.push(v),
                         Some(crate::apps::Call::Exit) => {
@@ -3171,8 +3174,21 @@ impl Vm {
     #[inline(never)]
     fn w_parent<P: Platform>(&mut self, ctx: &mut Ctx<P>, parent: ObjPtr) {
         if self.target.is_some() {
-            ctx.objs.add_child(WidgetId(parent), self.target);
+            let parent = self.widget_ref(ctx, parent);
+            ctx.objs.add_child(parent, self.target);
         }
+    }
+
+    /// Widget `id` as the program means it: 0 (the root) is an app's own container
+    /// (`domain.rs`).
+    #[inline]
+    fn widget_ref<P: Platform>(&self, ctx: &Ctx<P>, id: ObjPtr) -> WidgetId {
+        if id == 0
+            && let Some(c) = ctx.domains.root_of(self.domain)
+        {
+            return c;
+        }
+        WidgetId(id)
     }
 
     /// Scalar property write on the target (W_SET).
@@ -3304,7 +3320,7 @@ impl Vm {
     /// `set_scalar_prop` lifted to a target-parameterized associated function
     /// so the animation engine can drive any widget without disturbing the
     /// VM's current `self.target`. Marks the widget dirty exactly as before.
-    fn set_scalar_prop_on<P: Platform>(ctx: &mut Ctx<P>, target: WidgetId, prop_id: u8, val: i32) {
+    pub(crate) fn set_scalar_prop_on<P: Platform>(ctx: &mut Ctx<P>, target: WidgetId, prop_id: u8, val: i32) {
         // Layer props live in the pool's layer table, not in the widget.
         if matches!(prop_id, crate::proto::PROP_LAYER | crate::proto::PROP_LAYER_ALPHA) {
             if prop_id == crate::proto::PROP_LAYER {
@@ -3888,6 +3904,86 @@ impl Vm {
         ctx.flash.read(f.offset + f.pos, &mut buf[..n]);
         f.pos += n as u32;
         n
+    }
+
+    /// The app syscalls that need the calling task (`apps::SYS_APP_CURRENT..=SYS_APP_EXIT`,
+    /// docs/apps.md "Step 2"): the runtime acts on the requests after the burst.
+    fn app_call<P: Platform>(&mut self, ctx: &mut Ctx<P>, id: u8, args: &[i32]) {
+        use crate::apps as a;
+        use crate::domain::{MAX_APPS, PENDING, SYSTEM};
+        let arg0 = args.first().copied().unwrap_or(0);
+        let text = |ctx: &Ctx<P>| alloc::string::String::from(core::str::from_utf8(ctx.objs.str_get(arg0 as ObjPtr)).unwrap_or(""));
+        let pending = |ctx: &Ctx<P>, t: &str| ctx.domains.starts.iter().find(|s| s.1 == t).map(|s| s.0);
+        let r = match id {
+            a::SYS_APP_CURRENT => {
+                let cur = ctx.domains.get(self.domain).map(|d| d.info.id.clone()).unwrap_or_default();
+                match ctx.objs.str_alloc(cur.as_bytes()) {
+                    Some(p) => p as i32,
+                    None => return self.fail(fault::STR_ALLOC),
+                }
+            }
+            a::SYS_APP_START => {
+                let t = text(ctx);
+                if a::find(P::app_files(), &t).is_none() {
+                    -1
+                } else if let Some(d) = ctx.domains.find(&t) {
+                    // Running: shown (as `main` it is what the launcher shows).
+                    let app = ctx.domains.get(d).map(|x| (x.task, x.container.is_some())).unwrap_or((0, false));
+                    ctx.domains.show = Some(if app.1 { d } else { 0 });
+                    i32::from(app.0)
+                } else if let Some(slot) = pending(ctx, &t) {
+                    i32::from(slot)
+                } else if ctx.domains.ids().count() + ctx.domains.starts.len() >= MAX_APPS {
+                    -2
+                } else {
+                    let me = ctx.objs.cur_task;
+                    match ctx.tasks.spawn(ProgramRef::new(b"main", 0), me, PENDING) {
+                        Some(slot) => {
+                            ctx.domains.starts.push((slot, t));
+                            i32::from(slot)
+                        }
+                        None => -3,
+                    }
+                }
+            }
+            a::SYS_APP_SHOW => {
+                let task = u8::try_from(arg0).unwrap_or(0xFF);
+                if arg0 == 0 {
+                    ctx.domains.show = Some(0);
+                    1
+                } else if let Some(d) = ctx.domains.of_task(task) {
+                    ctx.domains.show = Some(d);
+                    1
+                } else {
+                    // A start on its way is shown when it opens.
+                    i32::from(ctx.domains.starts.iter().any(|s| s.0 == task))
+                }
+            }
+            a::SYS_APP_TASK => {
+                let t = text(ctx);
+                match ctx.domains.find(&t) {
+                    Some(d) => ctx.domains.get(d).map_or(-1, |x| i32::from(x.task)),
+                    None => pending(ctx, &t).map_or(-1, i32::from),
+                }
+            }
+            _ => {
+                // SYS_APP_EXIT
+                if self.domain == SYSTEM || self.domain == PENDING {
+                    0
+                } else {
+                    if ctx.domains.root_of(self.domain).is_some() {
+                        ctx.domains.exits |= 1 << self.domain;
+                    } else {
+                        // Running as `main` (`runApp`): back to the system image.
+                        crate::apps::request_run(None);
+                    }
+                    self.next_program = None;
+                    self.state = VmState::Exit;
+                    return;
+                }
+            }
+        };
+        self.push(r);
     }
 
     /// Loads font / image `local` (`prop_id` says which) of this domain's image, under its

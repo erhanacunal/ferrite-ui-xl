@@ -34,10 +34,10 @@ src_path = HERE / "calls.fl"
 for superops, name in ((False, "calls.prg"), (True, "calls_super.prg")):
     image = ferrite_lang.build_image(src_path.read_text(encoding="utf-8"), filename=str(src_path),
                                      include_dirs=[str(FERRITE_UI / "lib"), str(HERE)],
-                                     superops=superops)
+                                     superops=superops, var_slots=superops)
     (HERE / name).write_bytes(bytes(image))
     print(f"{name}: {len(image)} bytes")
 
-expected = {"bump", "bump_twice", "early", "rec", "Counter.init", "Counter.add", "Double.add",
+expected = {"bump", "bump_twice", "early", "countdown", "Counter.init", "Counter.add", "Double.add",
             "Counter.drop", "Solo.put", "Solo.drop"}
 assert all(v == expected for v in voids), f"void functions: {voids}, expected {expected}"

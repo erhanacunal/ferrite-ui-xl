@@ -204,6 +204,8 @@ pub struct FuncEntry {
 const IMAGE_HEADER_SIZE_V2: usize = 5;
 const IMAGE_HEADER_SIZE_V3: usize = 7;
 const IMAGE_HEADER_SIZE_V4: usize = 9;
+/// v5: + var_slots(u16): the globals + deepest locals the program needs.
+const IMAGE_HEADER_SIZE_V5: usize = 11;
 /// Each function entry: func_id(2) + kind(1) + pad(1) + offset(4) + length(4) = 12 bytes.
 const FUNC_ENTRY_SIZE: usize = 12;
 /// Image header flags bit 2: JMP/JZ/JNZ/CALL targets are u32 LE instead of u16.
@@ -512,6 +514,10 @@ pub mod fault {
     pub const EEPROM: u8 = 16;
     /// Object pool full: an array could not be allocated.
     pub const ARR_ALLOC: u8 = 17;
+    /// A function's locals don't fit the program's variable slots (FRAME past
+    /// the image header's `var_slots`: calls nested deeper than the compiler
+    /// planned for).
+    pub const VARS_FULL: u8 = 18;
 
     /// Short human-readable name for the error screen.
     pub fn name(code: u8) -> &'static [u8] {
@@ -533,6 +539,7 @@ pub mod fault {
             PAGE => b"bad widget page",
             EEPROM => b"eeprom error",
             ARR_ALLOC => b"pool full: array",
+            VARS_FULL => b"variable slots full",
             _ => b"unknown fault",
         }
     }
@@ -588,9 +595,17 @@ impl ProgramRef {
 const STACK_SIZE: usize = 32;
 const MAX_SYSCALL_ARGS: usize = 16;
 
-/// Dense variable table size (`fast_vm`): a slot is a global (0..=127) or
-/// `frame_base` (u8) + a local index (0..=127), so always below 383.
-const VAR_SLOTS: usize = 512;
+/// Variable slots of an image without a `var_slots` header field (v1..v4):
+/// what the old fixed table held (a u8 `frame_base` + a local index).
+const LEGACY_VAR_SLOTS: u16 = 384;
+/// Slots `Vm::vars` holds past `var_slots`: an operand (a global, or a local
+/// index on top of `frame_base`, both 0..=127) never reaches past them, as
+/// `frame_base <= var_slots` (FRAME checks it). So `var_get`/`var_set` need
+/// no bounds check.
+const VAR_PAD: usize = 128;
+/// Largest `var_slots` an image may ask for (`frame_base + frame_size` stays
+/// in a u16).
+const VAR_SLOTS_MAX: u16 = 0xFF00;
 /// Default call stack depth (overridable via RES_SYSCFG `call_stack`).
 const CALL_STACK_SIZE: usize = 16;
 
@@ -598,7 +613,7 @@ const CALL_STACK_SIZE: usize = 16;
 #[derive(Clone, Copy)]
 struct CallFrame {
     ret_addr: CodeAddr,
-    frame_base: u8,
+    frame_base: u16,
     frame_size: u8,
 }
 
@@ -616,7 +631,7 @@ struct CbFrame {
     state: VmState,
     wait_until: u32,
     critical: bool,
-    frame_base: u8,
+    frame_base: u16,
     frame_size: u8,
     /// The interrupted callback's gesture event details (`gestureInfo`).
     gesture: crate::gesture::Detail,
@@ -740,7 +755,8 @@ pub struct Vm {
     // `configure` (RES_SYSCFG); each is at most 255 deep (u8 indices).
     stack: Box<[i32]>,
     sp: u8,
-    /// `fast_vm`: every slot, indexed directly (2 KB).
+    /// Globals, then the locals of the running call chains (`frame_base`):
+    /// `var_slots + VAR_PAD` slots, indexed directly.
     vars: Box<[i32]>,
     call_stack: Box<[CallFrame]>,
     call_sp: u8,
@@ -776,9 +792,12 @@ pub struct Vm {
     // Critical section — when true, VM runs until next YIELD without returning to main loop
     critical: bool,
     // Stack-based locals: frame_base = first local slot for current function
-    frame_base: u8,
+    frame_base: u16,
     frame_size: u8,
     global_count: u8,
+    // Slots the program's globals and locals may use (image header v5, or
+    // LEGACY_VAR_SLOTS): FRAME faults past it.
+    var_slots: u16,
     // Jump/call operands are u32 (image header IMAGE_FLAG_WIDE_ADDR).
     wide_addr: bool,
     // Portrait screen from the image header (IMAGE_FLAG_PORTRAIT).
@@ -853,7 +872,7 @@ impl Vm {
             pc: 0,
             stack: alloc::vec![0; STACK_SIZE].into_boxed_slice(),
             sp: 0,
-            vars: alloc::vec![0; VAR_SLOTS].into_boxed_slice(),
+            vars: alloc::vec![0; LEGACY_VAR_SLOTS as usize + VAR_PAD].into_boxed_slice(),
             call_stack: alloc::vec![EMPTY_FRAME; CALL_STACK_SIZE].into_boxed_slice(),
             call_sp: 0,
             target: WidgetId::NONE,
@@ -875,6 +894,7 @@ impl Vm {
             frame_base: 0,
             frame_size: 0,
             global_count: 0,
+            var_slots: LEGACY_VAR_SLOTS,
             wide_addr: false,
             portrait: false,
             in_paint: false,
@@ -959,7 +979,7 @@ impl Vm {
     #[inline]
     fn resolve_slot(&self, slot: u8) -> u16 {
         if slot & 0x80 != 0 {
-            self.frame_base as u16 + (slot & 0x7F) as u16
+            self.frame_base + (slot & 0x7F) as u16
         } else {
             slot as u16
         }
@@ -967,18 +987,37 @@ impl Vm {
 
 
 
-    // `fast_vm`: the mask keeps the index in bounds without a branch (slots
-    // never reach VAR_SLOTS, see there); unset slots read 0 as before.
+    // A slot is a global (< 128) or `frame_base` + a local index (< 128),
+    // and `frame_base <= var_slots` (load, FRAME): always below
+    // `var_slots + VAR_PAD` = `vars.len()` (see VAR_PAD).
     #[inline(always)]
     fn var_get(&self, slot: u16) -> i32 {
-        // SAFETY: masked to VAR_SLOTS - 1, and vars.len() == VAR_SLOTS.
-        unsafe { *self.vars.get_unchecked(slot as usize & (VAR_SLOTS - 1)) }
+        debug_assert!((slot as usize) < self.vars.len());
+        // SAFETY: in range, see above.
+        unsafe { *self.vars.get_unchecked(slot as usize) }
     }
 
     #[inline(always)]
     fn var_set(&mut self, slot: u16, val: i32) {
+        debug_assert!((slot as usize) < self.vars.len());
         // SAFETY: as in var_get.
-        unsafe { *self.vars.get_unchecked_mut(slot as usize & (VAR_SLOTS - 1)) = val };
+        unsafe { *self.vars.get_unchecked_mut(slot as usize) = val };
+    }
+
+    /// Size the variable table for `slots` (cleared). False if it can't be
+    /// allocated.
+    fn set_var_slots(&mut self, slots: u16) -> bool {
+        let len = slots as usize + VAR_PAD;
+        if self.vars.len() == len {
+            self.vars.fill(0);
+        } else {
+            match try_alloc_slice(len, 0) {
+                Some(b) => self.vars = b,
+                None => return false,
+            }
+        }
+        self.var_slots = slots;
+        true
     }
 
     // === Code loading ===
@@ -993,8 +1032,12 @@ impl Vm {
     /// place, so loading needs no second copy of the program. On failure the
     /// buffer comes back unchanged.
     pub fn load_ram_owned(&mut self, mut image: Vec<u8>) -> Result<(), Vec<u8>> {
-        if let Some((funcs, opcode_start, gc, hint, wide, portrait)) = parse_image_header(&image) {
+        if let Some((funcs, opcode_start, gc, hint, wide, portrait, slots)) = parse_image_header(&image) {
             if !code_addressable(wide, image.len() - opcode_start) {
+                return Err(image);
+            }
+            let slots = slots.unwrap_or(LEGACY_VAR_SLOTS).max(gc as u16);
+            if slots > VAR_SLOTS_MAX || !self.set_var_slots(slots) {
                 return Err(image);
             }
             image.drain(..opcode_start);
@@ -1003,7 +1046,11 @@ impl Vm {
             self.code = VmCode::new(opcodes);
             self.functions = funcs;
             self.global_count = gc;
-            self.frame_base = gc;
+            // No frame of other code survives (it could sit past the new
+            // `var_slots`).
+            self.call_sp = 0;
+            self.cb_frames.clear();
+            self.frame_base = gc as u16;
             self.frame_size = 0;
             self.portrait = portrait;
             self.tree_hint = hint;
@@ -1015,6 +1062,12 @@ impl Vm {
 
     /// Load raw bytecode (no image header). Used for page bytecode.
     pub fn load_raw(&mut self, data: Vec<u8>) {
+        // No header: the old fixed table (not a smaller one left by an image).
+        if self.var_slots < LEGACY_VAR_SLOTS && self.set_var_slots(LEGACY_VAR_SLOTS) {
+            self.call_sp = 0;
+            self.cb_frames.clear();
+            self.frame_size = 0;
+        }
         self.code = VmCode::new(data);
         self.tree_hint = None;
         self.wide_addr = false;
@@ -1436,7 +1489,7 @@ impl Vm {
             frame_size: self.frame_size,
         };
         self.call_sp += 1;
-        self.frame_base = self.frame_base.wrapping_add(self.frame_size);
+        self.frame_base += self.frame_size as u16;
         self.frame_size = 0;
         self.pc = builder_offset;
 
@@ -1573,12 +1626,8 @@ impl Vm {
         // the OP_CALL convention: new frame_base = frame_base + frame_size.
         // Clamp to at least global_count so the very first callback (setup)
         // doesn't collide with the globals when frame_base is still 0.
-        let above = self.frame_base.wrapping_add(self.frame_size);
-        self.frame_base = if above > self.global_count {
-            above
-        } else {
-            self.global_count
-        };
+        let above = self.frame_base + self.frame_size as u16;
+        self.frame_base = above.max(self.global_count as u16);
         self.frame_size = 0;
         true
     }
@@ -2004,7 +2053,12 @@ impl Vm {
             }
             OP_FRAME => {
                 // Function prologue: set frame_size for this function
-                self.frame_size = self.read_u8();
+                let count = self.read_u8();
+                if self.frame_base + count as u16 > self.var_slots {
+                    self.fail(fault::VARS_FULL);
+                } else {
+                    self.frame_size = count;
+                }
             }
             OP_ARR_FREE => {
                 let arr_id = self.pop();
@@ -2020,52 +2074,52 @@ impl Vm {
             OP_PUSH_M1 => self.push(-1),
             // Short forms: LOAD/STORE local slots 0-4
             OP_LOAD_0 => {
-                let s = self.frame_base as u16;
+                let s = self.frame_base;
                 let v = self.var_get(s);
                 self.push(v);
             }
             OP_LOAD_1 => {
-                let s = self.frame_base as u16 + 1;
+                let s = self.frame_base + 1;
                 let v = self.var_get(s);
                 self.push(v);
             }
             OP_LOAD_2 => {
-                let s = self.frame_base as u16 + 2;
+                let s = self.frame_base + 2;
                 let v = self.var_get(s);
                 self.push(v);
             }
             OP_LOAD_3 => {
-                let s = self.frame_base as u16 + 3;
+                let s = self.frame_base + 3;
                 let v = self.var_get(s);
                 self.push(v);
             }
             OP_LOAD_4 => {
-                let s = self.frame_base as u16 + 4;
+                let s = self.frame_base + 4;
                 let v = self.var_get(s);
                 self.push(v);
             }
             OP_STORE_0 => {
-                let s = self.frame_base as u16;
+                let s = self.frame_base;
                 let v = self.pop();
                 self.var_set(s, v);
             }
             OP_STORE_1 => {
-                let s = self.frame_base as u16 + 1;
+                let s = self.frame_base + 1;
                 let v = self.pop();
                 self.var_set(s, v);
             }
             OP_STORE_2 => {
-                let s = self.frame_base as u16 + 2;
+                let s = self.frame_base + 2;
                 let v = self.pop();
                 self.var_set(s, v);
             }
             OP_STORE_3 => {
-                let s = self.frame_base as u16 + 3;
+                let s = self.frame_base + 3;
                 let v = self.pop();
                 self.var_set(s, v);
             }
             OP_STORE_4 => {
-                let s = self.frame_base as u16 + 4;
+                let s = self.frame_base + 4;
                 let v = self.pop();
                 self.var_set(s, v);
             }
@@ -2121,7 +2175,7 @@ impl Vm {
                     };
                     self.call_sp += 1;
                     // Advance frame_base past caller's locals
-                    self.frame_base = self.frame_base.wrapping_add(self.frame_size);
+                    self.frame_base += self.frame_size as u16;
                     self.frame_size = 0; // callee's FRAME will set this
                     self.pc = target;
                 } else {
@@ -2877,11 +2931,17 @@ impl Vm {
             OP_FRAME_A => {
                 // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
                 let [count, nargs] = self.fetch();
-                self.frame_size = count;
-                let base = self.frame_base as u16;
-                for i in (0..nargs as u16).rev() {
-                    let v = self.pop();
-                    self.var_set(base + i, v);
+                if self.frame_base + count as u16 > self.var_slots {
+                    self.fail(fault::VARS_FULL);
+                } else if nargs > count {
+                    self.fail(fault::BAD_OPERAND);
+                } else {
+                    self.frame_size = count;
+                    let base = self.frame_base;
+                    for i in (0..nargs as u16).rev() {
+                        let v = self.pop();
+                        self.var_set(base + i, v);
+                    }
                 }
             }
             OP_ARR_LOAD_V => {
@@ -3850,13 +3910,13 @@ impl Vm {
 #[allow(clippy::type_complexity)]
 fn parse_image_header(
     data: &[u8],
-) -> Option<(Vec<FuncEntry>, usize, u8, Option<(u8, u8)>, bool, bool)> {
+) -> Option<(Vec<FuncEntry>, usize, u8, Option<(u8, u8)>, bool, bool, Option<u16>)> {
     if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
 
     let version = data[0];
-    if version < 1 || version > 4 {
+    if version < 1 || version > 5 {
         return None;
     }
 
@@ -3870,6 +3930,7 @@ fn parse_image_header(
 
     // v3+: flags field after global_count; v4 adds widget/ext counts.
     let header_size = match version {
+        5 => IMAGE_HEADER_SIZE_V5,
         4 => IMAGE_HEADER_SIZE_V4,
         3 => IMAGE_HEADER_SIZE_V3,
         _ => IMAGE_HEADER_SIZE_V2,
@@ -3885,6 +3946,7 @@ fn parse_image_header(
     let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
     let portrait = flags & IMAGE_FLAG_PORTRAIT != 0;
     let tree_hint = if version >= 4 { Some((data[7], data[8])) } else { None };
+    let var_slots = if version >= 5 { Some(u16::from_le_bytes([data[9], data[10]])) } else { None };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
     let opcode_start = header_size + table_size;
@@ -3919,6 +3981,7 @@ fn parse_image_header(
         tree_hint,
         wide,
         portrait,
+        var_slots,
     ))
 }
 
@@ -5763,5 +5826,57 @@ mod anim_tests {
         vm.run(&mut ctx);
         assert_eq!(vm.fault(), fault::BAD_OPCODE);
         assert_eq!(vm.fault_pc(), 0x1_0005);
+    }
+
+    /// v5 image: `globals` globals, `var_slots` variable slots.
+    fn image_v5(globals: u8, var_slots: u16, code: &[u8]) -> Vec<u8> {
+        let [s0, s1] = var_slots.to_le_bytes();
+        let mut img = alloc::vec![5, 0, 0, globals, 0, 0, 0, 0, 0, s0, s1];
+        img.extend_from_slice(code);
+        img
+    }
+
+    /// main: CALL f; HALT. f: FRAME 3; CALL g; RET. g: FRAME 2; RET.
+    /// With 2 globals g's locals end at slot 2 + 3 + 2 = 7.
+    const NESTED_FRAMES: [u8; 13] =
+        [OP_CALL, 4, 0, OP_HALT, OP_FRAME, 3, OP_CALL, 10, 0, OP_RET, OP_FRAME, 2, OP_RET];
+
+    #[test]
+    fn v5_header_sizes_the_variable_table() {
+        let mut vm = Vm::new();
+        assert!(vm.load_ram(&image_v5(2, 7, &NESTED_FRAMES)));
+        assert_eq!(vm.var_slots, 7);
+        assert_eq!(vm.vars.len(), 7 + VAR_PAD);
+        let mut ctx = mock_ctx();
+        vm.run(&mut ctx);
+        assert_eq!(vm.fault(), fault::NONE);
+        // An older header keeps the old table; var_slots never undercuts the globals.
+        assert!(vm.load_ram(&image(0, &[OP_HALT])));
+        assert_eq!(vm.var_slots, LEGACY_VAR_SLOTS);
+        assert!(vm.load_ram(&image_v5(9, 4, &[OP_HALT])));
+        assert_eq!(vm.var_slots, 9);
+        assert!(!vm.load_ram(&image_v5(0, VAR_SLOTS_MAX + 1, &[OP_HALT])));
+    }
+
+    #[test]
+    fn frame_past_var_slots_faults() {
+        let mut vm = Vm::new();
+        assert!(vm.load_ram(&image_v5(2, 6, &NESTED_FRAMES)));
+        let mut ctx = mock_ctx();
+        vm.run(&mut ctx);
+        assert_eq!(vm.fault(), fault::VARS_FULL);
+        assert_eq!(vm.fault_pc(), 10);
+    }
+
+    #[test]
+    fn frame_a_with_more_args_than_locals_faults() {
+        let mut vm = Vm::new();
+        // PUSH_1; PUSH_1; CALL f; HALT. f: FRAME_A 1 2.
+        let code = [OP_PUSH_1, OP_PUSH_1, OP_CALL, 6, 0, OP_HALT, OP_FRAME_A, 1, 2, OP_RET];
+        assert!(vm.load_ram(&image_v5(0, 8, &code)));
+        let mut ctx = mock_ctx();
+        vm.run(&mut ctx);
+        assert_eq!(vm.fault(), fault::BAD_OPERAND);
+        assert_eq!(vm.fault_pc(), 6);
     }
 }

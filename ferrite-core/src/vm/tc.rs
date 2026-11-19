@@ -270,7 +270,7 @@ push_const!(op_push_m1, -1);
 macro_rules! load_k {
     ($name:ident, $k:expr) => {
         fn $name(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-            push!(vm, pc, sp, n, vm.var_get(vm.frame_base as u16 + $k), pc)
+            push!(vm, pc, sp, n, vm.var_get(vm.frame_base + $k), pc)
         }
     };
 }
@@ -287,7 +287,7 @@ macro_rules! store_k {
             need!(vm, pc, sp, n, 1);
             unsafe {
                 let sp = sp.sub(1);
-                vm.var_set(vm.frame_base as u16 + $k, *sp);
+                vm.var_set(vm.frame_base + $k, *sp);
                 next!(vm, pc, sp, n)
             }
         }
@@ -365,16 +365,26 @@ fn op_store(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 fn op_frame(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    vm.frame_size = unsafe { *pc };
+    let count = unsafe { *pc };
+    if vm.frame_base + count as u16 > vm.var_slots {
+        return fault(vm, unsafe { pc.sub(1) }, sp, n, fault::VARS_FULL);
+    }
+    vm.frame_size = count;
     next!(vm, unsafe { pc.add(1) }, sp, n)
 }
 
 fn op_frame_a(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
     let [count, nargs] = unsafe { bytes(pc) };
+    if vm.frame_base + count as u16 > vm.var_slots {
+        return fault(vm, unsafe { pc.sub(1) }, sp, n, fault::VARS_FULL);
+    }
+    if nargs > count {
+        return fault(vm, unsafe { pc.sub(1) }, sp, n, fault::BAD_OPERAND);
+    }
     need!(vm, pc, sp, n, nargs as usize);
     vm.frame_size = count;
-    let base = vm.frame_base as u16;
+    let base = vm.frame_base;
     unsafe {
         let sp = sp.sub(nargs as usize);
         for i in 0..nargs as usize {
@@ -427,7 +437,7 @@ fn op_call(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
     vm.call_sp += 1;
     // The callee's locals go past the caller's; its FRAME sets their count.
-    vm.frame_base = vm.frame_base.wrapping_add(vm.frame_size);
+    vm.frame_base += vm.frame_size as u16;
     vm.frame_size = 0;
     jump!(vm, t, sp, n)
 }

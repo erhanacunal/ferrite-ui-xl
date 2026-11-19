@@ -264,16 +264,11 @@ impl PlatformRuntime for Exynos4412Platform {
         crate::flash::save_if_dirty(true);
     }
 
-    fn load_flash_image(_ctx: &mut Ctx<Self>, image: Option<&[u8]>) -> bool {
-        crate::flash::set_app_image(Self::FS_BASE as usize, image)
+    fn place_image(_ctx: &mut Ctx<Self>, addr: u32, len: u32, image: Option<&[u8]>) -> bool {
+        crate::flash::place(addr as usize, len as usize, image)
     }
 
-    /// An app's files and EEPROM live in its `data/` (docs/apps.md); the system image's in
-    /// `FERRITE/USER/` and `FERRITE/EEPROM.BIN`.
     fn app_changed(_ctx: &mut Ctx<Self>, app: Option<&ferrite_core::apps::AppInfo>) {
-        let data = app.map(|a| alloc::format!("{}/{}", a.dir(), ferrite_core::apps::DATA_DIR));
-        crate::storage::set_user_root(data.clone());
-        crate::eeprom::switch(data);
         #[cfg(feature = "wifi")]
         crate::net::set_running_app(app.map_or("", |a| a.id.as_str()));
         match app {

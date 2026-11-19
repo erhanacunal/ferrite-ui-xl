@@ -814,6 +814,10 @@ pub struct Vm {
     pub program: ProgramRef,
     /// Set with `VmState::Exit` by `runProgram`; taken by the runtime.
     pub next_program: Option<ProgramRef>,
+    /// The image its programs come from (`domain.rs`: 0 = the system image, else an app's):
+    /// its `Fs`, `F_READ` / `F_WRITE` range, EEPROM and storage root. Set by the runtime,
+    /// kept across `reset`; a `sibling` starts with this one's.
+    pub domain: u8,
     // Open modal dialogs (innermost = last). Empty when no dialog is showing.
     modal_stack: Vec<ModalFrame>,
     // Active property tweens, capped at `anim_slots` (0 = P::ANIM_SLOTS) on
@@ -915,6 +919,7 @@ impl Vm {
             open_files: [None, None],
             program: ProgramRef::new(b"main", 0),
             next_program: None,
+            domain: crate::domain::SYSTEM,
             modal_stack: Vec::new(),
             anims: Vec::new(),
             anim_slots: 0,
@@ -2305,6 +2310,9 @@ impl Vm {
                     return;
                 }
                 // Read in fixed chunks: the stack depth is a runtime value.
+                let Some(addr) = self.flash_addr(ctx, addr, len as u32) else {
+                    return self.fail(fault::BAD_OPERAND);
+                };
                 let mut buf = [0u8; 16];
                 let mut done = 0;
                 while done < len {
@@ -2326,6 +2334,9 @@ impl Vm {
                     self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as CodeAddr;
                     if n > 0 {
+                        let Some(addr) = self.flash_addr(ctx, addr, n as u32) else {
+                            return self.fail(fault::BAD_OPERAND);
+                        };
                         ctx.flash.write(addr, &buf[..n]);
                     }
                 } else {
@@ -2548,14 +2559,16 @@ impl Vm {
             OP_EEPROM_SIZE => self.push(ctx.eeprom.size()),
             OP_EEPROM_READ => {
                 let addr = self.pop();
-                match ctx.eeprom.read_byte(addr) {
-                    Some(b) => self.push(b),
-                    None => self.fail(fault::EEPROM),
+                let mut b = [0u8; 1];
+                if self.eeprom_io(ctx, addr, &mut b, false) {
+                    self.push(b[0] as i32);
+                } else {
+                    self.fail(fault::EEPROM);
                 }
             }
             OP_EEPROM_WRITE => {
                 let (addr, value) = self.pop2();
-                if !ctx.eeprom.write_byte(addr, value) {
+                if !self.eeprom_io(ctx, addr, &mut [value as u8], true) {
                     self.fail(fault::EEPROM);
                 }
             }
@@ -2570,7 +2583,7 @@ impl Vm {
                 let (str_id, arg) = self.pop2();
                 let name = ctx.objs.str_get(str_id as ObjPtr);
                 let found = name.len() <= crate::fs::NAME_LEN
-                    && ctx.fs.as_ref().is_some_and(|fs| {
+                    && ctx.fs_of(self.domain).is_some_and(|fs| {
                         fs.find_kind(&ctx.flash, name, crate::fs::RES_PROGRAM).is_some()
                     });
                 if found {
@@ -2599,8 +2612,7 @@ impl Vm {
                     buf[..own.len()].copy_from_slice(own);
                     own.len()
                 } else {
-                    ctx.fs
-                        .as_ref()
+                    ctx.fs_of(self.domain)
                         .and_then(|fs| {
                             let n = index.min(u16::MAX as i32) as u16;
                             fs.nth_name_by_kind(&ctx.flash, crate::fs::RES_PROGRAM, n, &mut buf)
@@ -2617,8 +2629,8 @@ impl Vm {
             OP_SOUND_PLAY => {
                 let (str_id, looping) = self.pop2();
                 let name = ctx.objs.str_get(str_id as ObjPtr);
-                let ok = match ctx.fs.as_ref() {
-                    Some(fs) => ctx.audio.play(fs, &ctx.flash, name, looping != 0),
+                let ok = match ctx.fs_of(self.domain).cloned() {
+                    Some(fs) => ctx.audio.play(&fs, &ctx.flash, name, looping != 0),
                     None => false,
                 };
                 self.push(ok as i32);
@@ -3011,10 +3023,10 @@ impl Vm {
                 let name = ctx.objs.str_get(str_id as ObjPtr);
                 let found = !name.is_empty()
                     && name.len() <= crate::fs::NAME_LEN
-                    && ctx.fs.as_ref().is_some_and(|fs| {
+                    && ctx.fs_of(self.domain).is_some_and(|fs| {
                         fs.find_kind(&ctx.flash, name, crate::fs::RES_PROGRAM).is_some()
                     });
-                let id = if found { ctx.tasks.spawn(ProgramRef::new(name, arg), me) } else { None };
+                let id = if found { ctx.tasks.spawn(ProgramRef::new(name, arg), me, self.domain) } else { None };
                 self.push(id.map_or(-1, |i| i as i32));
             }
             OP_TASK_KILL => {
@@ -3058,6 +3070,7 @@ impl Vm {
             return None;
         }
         vm.syscall_fn = self.syscall_fn;
+        vm.domain = self.domain;
         Some(vm)
     }
 
@@ -3165,16 +3178,16 @@ impl Vm {
         self.set_scalar_prop(ctx, prop_id, val);
         ctx.objs.flex_note(self.target, prop_id);
         if prop_id == PROP_FONT_ID {
-            if let Some(fs) = ctx.fs.as_ref() {
-                ctx.fonts.find_or_load(val as u8, fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
+            if let Some(fs) = ctx.fs_of(self.domain).cloned() {
+                ctx.fonts.find_or_load(val as u8, &fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
             }
         }
         if prop_id == PROP_IMAGE_ID {
-            if let Some(fs) = ctx.fs.as_ref() {
+            if let Some(fs) = ctx.fs_of(self.domain).cloned() {
                 #[cfg(feature = "jpeg")]
-                ctx.images.find_or_load(val as u8, fs, &ctx.flash, &ctx.jpeg);
+                ctx.images.find_or_load(val as u8, &fs, &ctx.flash, &ctx.jpeg);
                 #[cfg(not(feature = "jpeg"))]
-                ctx.images.find_or_load(val as u8, fs, &ctx.flash);
+                ctx.images.find_or_load(val as u8, &fs, &ctx.flash);
             }
         }
         // An active layer root's position/visibility only places its surface.
@@ -3778,14 +3791,15 @@ impl Vm {
         while done < count {
             let n = (count - done).min(buf.len());
             let at = addr + done as i32;
-            let data = &mut ctx.objs.arr_mut(arr_id as ObjPtr).unwrap()[done..done + n];
             let ok = if write {
+                let data = &ctx.objs.arr_mut(arr_id as ObjPtr).unwrap()[done..done + n];
                 for (b, &v) in buf.iter_mut().zip(data.iter()) {
                     *b = v as u8;
                 }
-                ctx.eeprom.write(at, &buf[..n])
+                self.eeprom_io(ctx, at, &mut buf[..n], true)
             } else {
-                let ok = ctx.eeprom.read(at, &mut buf[..n]);
+                let ok = self.eeprom_io(ctx, at, &mut buf[..n], false);
+                let data = &mut ctx.objs.arr_mut(arr_id as ObjPtr).unwrap()[done..done + n];
                 for (v, &b) in data.iter_mut().zip(buf.iter()) {
                     *v = b as i32;
                 }
@@ -3873,13 +3887,38 @@ impl Vm {
         n
     }
 
+    /// `F_READ` / `F_WRITE`'s `addr..addr + len` in the flash region: as is for the system
+    /// image, moved into its range (and bounded to it) for an app.
+    fn flash_addr<P: Platform>(&self, ctx: &Ctx<P>, addr: u32, len: u32) -> Option<u32> {
+        if self.domain == crate::domain::SYSTEM {
+            return Some(addr);
+        }
+        ctx.domains.get(self.domain)?.flash_addr(P::FS_BASE, addr, len)
+    }
+
+    /// Reads (or with `write`, writes) `buf` at `addr` of this domain's EEPROM: the board's
+    /// for the system image, the app's own (`domain.rs`) for an app.
+    fn eeprom_io<P: Platform>(&self, ctx: &Ctx<P>, addr: i32, buf: &mut [u8], write: bool) -> bool {
+        if self.domain == crate::domain::SYSTEM {
+            return if write { ctx.eeprom.write(addr, buf) } else { ctx.eeprom.read(addr, buf) };
+        }
+        if ctx.eeprom.range(addr, buf.len()).is_none() {
+            return false;
+        }
+        if write {
+            crate::domain::eeprom_write(self.domain, addr, buf, ctx.systick.millis())
+        } else {
+            crate::domain::eeprom_read(self.domain, addr, buf)
+        }
+    }
+
     /// Open a file by name. Returns handle 1 or 2, or 0xFF on error:
     ///   - fs not mounted
     ///   - name not found
     ///   - resource is not a file (wrong kind)
     ///   - both slots in use
     fn file_open<P: Platform>(&mut self, ctx: &Ctx<P>, name: &[u8]) -> i32 {
-        let fs = match ctx.fs.as_ref() {
+        let fs = match ctx.fs_of(self.domain) {
             Some(f) => f,
             None => return FILE_HANDLE_ERR,
         };
@@ -4122,6 +4161,7 @@ mod anim_tests {
             storage: crate::storage::StorageImpl::with_backend(crate::storage::MemStorage::default()),
             cursor_visible: false,
             tasks: crate::task::TaskTable::new(),
+            domains: crate::domain::Domains::new(),
         }
     }
 

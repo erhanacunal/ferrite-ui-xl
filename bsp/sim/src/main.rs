@@ -148,6 +148,7 @@ fn main() {
             storage: ferrite_core::storage::StorageImpl::with_backend(storage::SimStorage::new(None)),
             cursor_visible: false,
             tasks: ferrite_core::task::TaskTable::new(),
+            domains: ferrite_core::domain::Domains::new(),
         }))
     };
     let ctx = Box::new(Ctx::<SimPlatform> {
@@ -171,6 +172,7 @@ fn main() {
         storage: ferrite_core::storage::StorageImpl::with_backend(storage::SimStorage::new(arg_value("--storage"))),
         cursor_visible: false,
         tasks: ferrite_core::task::TaskTable::new(),
+        domains: ferrite_core::domain::Domains::new(),
     });
 
     // `FERRITE_SIM_AREAS=1`: the board's mode: the render side only plays the display list of

@@ -37,6 +37,11 @@ const CHUNK: usize = 256;
 impl Vm {
     /// One of the storage opcodes.
     pub(super) fn storage_op<P: Platform>(&mut self, ctx: &mut Ctx<P>, op: u8) {
+        // Paths are this domain's: an app's own `data/` (`domain.rs`).
+        match ctx.domains.get(self.domain) {
+            Some(app) => ctx.storage.select_root(app.serial, Some(&app.data)),
+            None => ctx.storage.select_root(0, None),
+        }
         match op {
             OP_DISK_OPEN => {
                 let (str_id, mode) = self.pop2();

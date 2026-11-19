@@ -410,19 +410,16 @@ struct UserFile {
 static mut FILES: [Option<UserFile>; MAX_OPEN] = [None; MAX_OPEN];
 /// `systick::millis` of the last write to a program's file.
 static mut LAST_WRITE_MS: u32 = 0;
-/// [`USER_DIR`] made once per boot.
-static mut USER_READY: bool = false;
+/// The roots made this boot (each once).
+static mut READY_ROOTS: Vec<String> = Vec::new();
 /// A running app's root instead of [`USER_DIR`] (`ferrite/apps/{id}/data`, [`set_user_root`]).
 static mut USER_ROOT: Option<String> = None;
 
-/// Programs' files from now on under `root` (an app's `data/`), or [`USER_DIR`] with `None`.
-/// Every file must be closed.
+/// Paths from now on under `root` (an app's `data/`), or [`USER_DIR`] with `None`. Open
+/// files keep their inode, so files of several apps can be open at once.
 pub fn set_user_root(root: Option<String>) {
     // SAFETY: CPU0 only.
-    unsafe {
-        *(&raw mut USER_ROOT) = root;
-        USER_READY = false;
-    }
+    unsafe { *(&raw mut USER_ROOT) = root };
 }
 
 fn user_root() -> String {
@@ -456,15 +453,17 @@ fn map_err(e: E) -> i32 {
 /// The file system with [`USER_DIR`] in place.
 fn user() -> Result<&'static mut Fs, i32> {
     let fs = fs().ok_or(err::NO_STORAGE)?;
-    if !unsafe { USER_READY } {
-        let root = user_root();
+    let root = user_root();
+    // SAFETY: CPU0 only.
+    let ready = unsafe { &mut *(&raw mut READY_ROOTS) };
+    if !ready.contains(&root) {
         let mut at = String::new();
         for c in root.split('/').filter(|c| !c.is_empty()) {
             at.push('/');
             at.push_str(c);
             ensure_dir(fs, &at).map_err(map_err)?;
         }
-        unsafe { USER_READY = true };
+        ready.push(root);
     }
     Ok(fs)
 }

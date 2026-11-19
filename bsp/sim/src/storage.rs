@@ -34,11 +34,15 @@ impl SimStorage {
         }
     }
 
-    /// Programs' files under `dir` (a running app's `data/`), or the `--storage` directory
-    /// again with `None`. In RAM nothing changes (one tree). Every file must be closed.
-    pub fn set_root(&self, dir: Option<PathBuf>) {
+    /// Programs' paths under `dir` (a running app's `ferrite/apps/{id}/data`, from the
+    /// `--storage` directory), or that directory itself with `None`. In RAM nothing changes
+    /// (one tree). Open files stay open.
+    fn select(&self, dir: Option<&str>) {
         if let Self::Host(h) = self {
-            let root = dir.unwrap_or_else(|| h.base.clone());
+            let root = dir.map_or_else(
+                || h.base.clone(),
+                |d| d.split('/').filter(|c| !c.is_empty()).fold(h.base.clone(), |p, c| p.join(c)),
+            );
             if let Err(e) = fs::create_dir_all(&root) {
                 eprintln!("storage: {}: {e}", root.display());
             }
@@ -112,6 +116,9 @@ forward!(MemStorage);
 forward!(HostStorage);
 
 impl StorageBackend for SimStorage {
+    fn set_root(&self, root: Option<&str>) {
+        self.select(root);
+    }
     fn open(&self, slot: usize, path: &Path, mode: Mode) -> Result<(), i32> {
         self.be().open(slot, path, mode)
     }

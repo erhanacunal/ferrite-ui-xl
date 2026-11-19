@@ -56,6 +56,8 @@ pub mod err {
     /// The entry program named in `appinfo` is not in the image.
     pub const NO_ENTRY: u8 = 18;
     pub const TOO_LARGE: u8 = 19;
+    /// Four apps already run (`domain::MAX_APPS`).
+    pub const LIMIT: u8 = 20;
 
     /// For logs and the HTTP API.
     pub fn text(code: u8) -> &'static str {
@@ -69,6 +71,7 @@ pub mod err {
             NOT_INSTALLED => "no such app",
             NO_ENTRY => "the entry program is not in the image",
             TOO_LARGE => "package too large",
+            LIMIT => "four apps already run",
             _ => "app error",
         }
     }

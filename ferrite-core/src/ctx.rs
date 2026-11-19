@@ -56,9 +56,17 @@ pub struct Ctx<P: Platform> {
     pub cursor_visible: bool,
     /// Task slots and the requests the VMs queue (`multi_program`).
     pub tasks: crate::task::TaskTable,
+    /// Running apps' images (`domain.rs`; domain 0 = the system image, `fs`).
+    pub domains: crate::domain::Domains,
 }
 
 impl<P: Platform> Ctx<P> {
+    /// Domain `d`'s filesystem: `fs` for the system image (0), else the app's.
+    #[inline]
+    pub fn fs_of(&self, d: u8) -> Option<&Fs> {
+        if d == crate::domain::SYSTEM { self.fs.as_ref() } else { self.domains.get(d).map(|a| &a.fs) }
+    }
+
     /// The pool the renderer works on (`view.rs`).
     pub fn render_pool(&self) -> &ObjPool {
         match &self.render_ctx {

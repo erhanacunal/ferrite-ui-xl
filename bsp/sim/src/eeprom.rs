@@ -12,48 +12,23 @@ const SIZE: usize = 1024;
 
 pub struct SimEeprom {
     mem: RefCell<Vec<u8>>,
-    path: RefCell<Option<String>>,
-    /// `--eeprom FILE`: the system image's.
-    base: Option<String>,
-    /// The system image's contents while an app runs (kept aside: without `--eeprom` they
-    /// live in RAM only).
-    system: RefCell<Option<Vec<u8>>>,
-}
-
-fn load(path: &Option<String>) -> Vec<u8> {
-    let mut mem = vec![0xFF; SIZE];
-    if let Some(p) = path {
-        match fs::read(p) {
-            Ok(bytes) => {
-                let n = bytes.len().min(SIZE);
-                mem[..n].copy_from_slice(&bytes[..n]);
-                println!("eeprom: loaded {n} bytes from {p}");
-            }
-            Err(_) => println!("eeprom: {p} not found, starting erased"),
-        }
-    }
-    mem
+    path: Option<String>,
 }
 
 impl SimEeprom {
     pub fn new(path: Option<String>) -> Self {
-        Self { mem: RefCell::new(load(&path)), path: RefCell::new(path.clone()), base: path, system: RefCell::new(None) }
-    }
-
-    /// A running app's EEPROM file (`ferrite/apps/{id}/data/eeprom.bin`; None in RAM: it
-    /// starts erased), or with `app` false the system image's again.
-    pub fn switch(&self, app: bool, path: Option<String>) {
-        let mut system = self.system.borrow_mut();
-        if app {
-            if system.is_none() {
-                *system = Some(self.mem.borrow().clone());
+        let mut mem = vec![0xFF; SIZE];
+        if let Some(p) = &path {
+            match fs::read(p) {
+                Ok(bytes) => {
+                    let n = bytes.len().min(SIZE);
+                    mem[..n].copy_from_slice(&bytes[..n]);
+                    println!("eeprom: loaded {n} bytes from {p}");
+                }
+                Err(_) => println!("eeprom: {p} not found, starting erased"),
             }
-            *self.mem.borrow_mut() = load(&path);
-            *self.path.borrow_mut() = path;
-        } else if let Some(kept) = system.take() {
-            *self.mem.borrow_mut() = kept;
-            *self.path.borrow_mut() = self.base.clone();
         }
+        Self { mem: RefCell::new(mem), path }
     }
 }
 
@@ -70,7 +45,7 @@ impl EepromBackend for SimEeprom {
         let a = addr as usize;
         self.mem.borrow_mut()[a..a + data.len()].copy_from_slice(data);
         println!("eeprom: wrote {} byte(s) at {addr}", data.len());
-        if let Some(p) = &*self.path.borrow() {
+        if let Some(p) = &self.path {
             if let Err(e) = fs::write(p, &*self.mem.borrow()) {
                 eprintln!("eeprom: saving {p} failed: {e}");
             }

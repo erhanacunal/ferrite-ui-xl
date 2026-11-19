@@ -52,40 +52,40 @@ pub fn init() {
     unsafe { USED = n };
 }
 
-/// An app's image is in the region (`set_app_image`): nothing is saved until the system
-/// image is back, so `FLASH.BIN` never gets the app.
-static mut APP_ACTIVE: bool = false;
+/// Running apps' ranges (`place`, ferrite-core `domain.rs`): writes there are the app's
+/// for as long as it runs, never a change to save.
+static mut APP_RANGES: [(usize, usize); ferrite_core::domain::MAX_APPS] = [(0, 0); ferrite_core::domain::MAX_APPS];
 
-/// Puts an app package at `base` for as long as it runs (`Some`), or reads the saved system
-/// image back (`None`). Pending changes of the system image are saved first. False if the
-/// image does not fit or the system image cannot be read. CPU0, no render job running.
-pub fn set_app_image(base: usize, image: Option<&[u8]>) -> bool {
+fn in_app_range(start: usize, end: usize) -> bool {
+    // SAFETY: CPU0 only.
+    unsafe { (*(&raw const APP_RANGES)).iter().any(|&(a, b)| a < b && start >= a && end <= b) }
+}
+
+/// Puts a running app's image at `addr` (`len` bytes kept for it; `Some`), or frees that
+/// range again (`None`, erased). Not a change to save: `FLASH.BIN` keeps the system image.
+/// False if it does not fit. CPU0, no render job running.
+pub fn place(addr: usize, len: usize, image: Option<&[u8]>) -> bool {
     let s = shadow();
+    let end = addr.saturating_add(len);
+    if end > s.len() || image.is_some_and(|i| i.len() > len) {
+        return false;
+    }
+    s[addr..end].fill(0xFF);
+    // SAFETY: CPU0 only.
+    let ranges = unsafe { &mut *(&raw mut APP_RANGES) };
     match image {
         Some(img) => {
-            if base + img.len() > s.len() {
-                return false;
-            }
-            if !unsafe { APP_ACTIVE } {
-                save_if_dirty(true);
-            }
-            s[base..].fill(0xFF);
-            s[base..base + img.len()].copy_from_slice(img);
-            unsafe {
-                APP_ACTIVE = true;
-                DIRTY = false;
-            }
+            s[addr..addr + img.len()].copy_from_slice(img);
+            let Some(r) = ranges.iter_mut().find(|r| r.0 >= r.1) else { return false };
+            *r = (addr, end);
         }
         None => {
-            s.fill(0xFF);
-            let n = storage::load(s);
-            unsafe {
-                USED = n;
-                APP_ACTIVE = false;
-                DIRTY = false;
+            for r in ranges.iter_mut().filter(|r| r.0 == addr) {
+                *r = (0, 0);
             }
         }
     }
+    // Caches by address (decoded images) must not hand out another app's.
     GENERATION.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -133,7 +133,7 @@ fn touch(end: usize) {
 /// `storage::IDLE_SAVE_MS`. Cheap when nothing changed.
 pub fn save_if_dirty(force: bool) {
     unsafe {
-        if !DIRTY || !storage::available() || APP_ACTIVE {
+        if !DIRTY || !storage::available() {
             return;
         }
         if !force && systick::millis().wrapping_sub(LAST_WRITE_MS) < storage::IDLE_SAVE_MS {
@@ -179,6 +179,9 @@ impl FlashBackend for RamFlash {
             *d &= b; // NOR program: 1 → 0 only
         }
         let end = (start + data.len()).min(s.len());
+        if in_app_range(start, end) {
+            return;
+        }
         unsafe { WRITE_END = WRITE_END.max(end) };
         touch(end);
     }

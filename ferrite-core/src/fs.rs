@@ -381,7 +381,7 @@ impl Fs {
 
     /// Image length from `base`: the end of the table or of the furthest
     /// resource. `None` if an entry points outside the image.
-    fn image_end<F: FlashBackend>(&self, flash: &FlashImpl<F>) -> Option<u32> {
+    pub fn image_end<F: FlashBackend>(&self, flash: &FlashImpl<F>) -> Option<u32> {
         let table_end = HEADER_SIZE + self.resource_count as u32 * ENTRY_SIZE as u32;
         let mut end = table_end;
         let mut entry = [0u8; ENTRY_SIZE];

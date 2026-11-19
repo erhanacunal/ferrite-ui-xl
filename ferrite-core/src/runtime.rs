@@ -135,16 +135,17 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         0
     }
 
-    /// Puts an app's image at `FS_BASE` in the flash region for this boot only (it must not
-    /// end up in the saved system image), or with `None` brings the saved system image back.
-    /// False = not possible (the default: boards without apps).
-    fn load_flash_image(ctx: &mut Ctx<Self>, image: Option<&[u8]>) -> bool {
-        let _ = (ctx, image);
+    /// Puts a running app's image at `addr` of the flash region (above the system image,
+    /// `domain.rs`) for as long as it runs: never saved, and anything cached by address
+    /// there must go (the range may have held another app). With `None` the range
+    /// (`len` bytes) is free again. False = not possible (the default: boards without apps).
+    fn place_image(ctx: &mut Ctx<Self>, addr: u32, len: u32, image: Option<&[u8]>) -> bool {
+        let _ = (ctx, addr, len, image);
         false
     }
 
-    /// The runtime switches to `app` (None = the system image), all files closed: point
-    /// programs' storage root and the EEPROM at the app's own (`apps/{id}/data/`).
+    /// The app running as `main` changed (`runApp`, the boot app; None = the system image):
+    /// for the board's status.
     fn app_changed(ctx: &mut Ctx<Self>, app: Option<&crate::apps::AppInfo>) {
         let _ = (ctx, app);
     }
@@ -464,14 +465,14 @@ impl<P: PlatformRuntime> Runtime<P> {
         // image ---
         if error_code == 0
             && let Some(id) = P::boot_app()
-            && enter_app(&mut ctx, Some(&id)).is_err()
+            && let Ok(d) = enter_app(&mut ctx, Some(&id))
         {
-            ctx.fs = fs::Fs::mount(&ctx.flash, P::FS_BASE).ok();
+            vm.domain = d;
         }
 
         // --- Load main program (an app's entry) ---
         if error_code == 0 {
-            let entry = entry_program();
+            let entry = entry_program(&ctx, vm.domain);
             error_code = load_program(&mut ctx, &mut vm, ProgramRef::new(entry.as_bytes(), 0));
         }
 
@@ -578,6 +579,7 @@ impl<P: PlatformRuntime> Runtime<P> {
         if let Some(target) = crate::apps::take_run_request() {
             self.switch_app(target);
         }
+        crate::domain::flush_eeproms(P::app_files(), self.ctx.systick.millis(), false);
 
         // `runProgram` ended the main program: load the next one (every
         // child task ends with it).
@@ -800,11 +802,12 @@ impl<P: PlatformRuntime> Runtime<P> {
                 protocol::send_error(&self.ctx.usart, ERR_INSUFFICIENT_MEMORY);
             }
             RxEvent::FsReady => {
-                // A system image replaces the region: an app running leaves it first
-                // (its image must not be what gets saved).
-                if !self.protocol.fs_app() && crate::apps::current().is_some() {
+                // A system image may grow over the apps' ranges: they end first.
+                if !self.protocol.fs_app() && self.ctx.domains.ids().next().is_some() {
                     self.drop_children();
-                    let _ = enter_app(&mut self.ctx, None);
+                    self.tasks.main.domain = crate::domain::SYSTEM;
+                    close_apps(&mut self.ctx);
+                    set_main_app::<P>(&mut self.ctx, None);
                 }
                 // Before any sector changes: the running image's pool sizes.
                 self.fs_old_cfg = match self.ctx.fs.as_ref().map(|f| SysCfg::load(f, &self.ctx.flash)) {
@@ -851,6 +854,7 @@ impl<P: PlatformRuntime> Runtime<P> {
                     Ok(done) if self.protocol.fs_run() => Some(done.info.id.clone()),
                     _ => crate::apps::current().map(|a| a.id),
                 };
+                let target = target.filter(|t| !t.is_empty());
                 match r {
                     Ok(_) => self.ack_chunk(),
                     Err(code) => protocol::send_error(&self.ctx.usart, code),
@@ -969,11 +973,10 @@ fn load_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, program: Prog
 fn load_program_code<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, program: ProgramRef) -> u8 {
     vm.program = program;
     let name = program.name();
-    let entry = match ctx
-        .fs
-        .as_ref()
-        .and_then(|fs| fs.find_kind(&ctx.flash, name, fs::RES_PROGRAM))
-    {
+    let Some(fs) = ctx.fs_of(vm.domain).cloned() else {
+        return ERR_NO_FILESYSTEM;
+    };
+    let entry = match fs.find_kind(&ctx.flash, name, fs::RES_PROGRAM) {
         Some(e) => e,
         None => {
             return if ctx.fs.is_some() {
@@ -993,19 +996,13 @@ fn load_program_code<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, program:
         err = ERR_PROGRAM_ERROR;
     } else {
         img.resize(size, 0);
-        if let Some(fs) = ctx.fs.as_ref() {
-            fs.read_resource(&ctx.flash, &entry, 0, &mut img);
-        }
+        fs.read_resource(&ctx.flash, &entry, 0, &mut img);
         if vm.load_ram_owned(img).is_err() {
             err = ERR_PROGRAM_ERROR;
         }
     }
     // Static widget setup the compiler moved out of the bytecode (optional).
-    if let Some(page) = ctx
-        .fs
-        .as_ref()
-        .and_then(|fs| fs.find_kind(&ctx.flash, name, fs::RES_PAGE))
-    {
+    if let Some(page) = fs.find_kind(&ctx.flash, name, fs::RES_PAGE) {
         vm.set_page(page.offset, page.size);
     }
     err
@@ -1096,31 +1093,86 @@ fn alloc_root<P: PlatformRuntime>(ctx: &mut Ctx<P>) {
     ctx.objs.root = root;
 }
 
-/// The program a fresh start runs: the running app's entry, or `main`.
-fn entry_program() -> alloc::string::String {
-    crate::apps::current().map_or_else(|| alloc::string::String::from("main"), |a| a.entry)
+/// The program a fresh start of domain `d` runs: the app's entry, or `main`.
+fn entry_program<P: Platform>(ctx: &Ctx<P>, d: u8) -> alloc::string::String {
+    ctx.domains.get(d).map_or_else(|| alloc::string::String::from("main"), |a| a.info.entry.clone())
 }
 
-/// Puts app `target`'s image (None = the saved system image) in the flash region, points
-/// storage and EEPROM at it (`P::app_changed`), makes it current and mounts it. Every
-/// storage file is closed first. Nothing changes on an error (an `apps::err` code), but
-/// for a board that could not bring the system image back.
-fn enter_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, target: Option<&str>) -> Result<(), u8> {
-    let loaded = match target {
-        Some(id) => Some(crate::apps::load(P::app_files(), id, P::FS_BASE, P::CAPS, P::APP_MAX_BYTES)?),
-        None if crate::apps::current().is_none() => return Ok(()),
-        None => None,
-    };
-    render::wait_idle(ctx);
-    ctx.storage.close_all();
-    if !P::load_flash_image(ctx, loaded.as_ref().map(|(_, image)| image.as_slice())) {
-        return Err(crate::apps::err::NO_STORAGE);
+/// Opens a domain for installed app `id` (`domain.rs`): reads and checks its package, puts
+/// the image in a free range of the region above the system image, mounts it there and
+/// reads its EEPROM. An `apps::err` code on failure, nothing changed.
+fn open_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, id: &str) -> Result<u8, u8> {
+    use crate::apps::err;
+    let files = P::app_files();
+    let (info, mut image) = crate::apps::load(files, id, P::FS_BASE, P::CAPS, P::APP_MAX_BYTES)?;
+    if ctx.domains.ids().count() >= crate::domain::MAX_APPS {
+        return Err(err::LIMIT);
     }
-    let info = loaded.map(|(info, _)| info);
-    P::app_changed(ctx, info.as_ref());
-    crate::apps::set_current(info);
-    ctx.fs = fs::Fs::mount(&ctx.flash, P::FS_BASE).ok();
-    Ok(())
+    let system_end = ctx.fs.as_ref().and_then(|f| f.image_end(&ctx.flash)).unwrap_or(0);
+    let len = image.len() as u32;
+    let region_end = P::FS_BASE + P::APP_MAX_BYTES as u32;
+    let base = ctx.domains.place(P::FS_BASE + system_end, region_end, len).ok_or(err::TOO_LARGE)?;
+    if !crate::domain::rebase(&mut image, P::FS_BASE, base) {
+        return Err(err::BAD_IMAGE);
+    }
+    render::wait_idle(ctx);
+    if !P::place_image(ctx, base, len, Some(&image)) {
+        return Err(err::NO_STORAGE);
+    }
+    drop(image);
+    let Ok(fs) = fs::Fs::mount(&ctx.flash, base) else {
+        P::place_image(ctx, base, len, None);
+        return Err(err::BAD_IMAGE);
+    };
+    let data = alloc::format!("{}/{}", info.dir(), crate::apps::DATA_DIR);
+    let Some(d) = ctx.domains.open(info, base, len, fs) else {
+        P::place_image(ctx, base, len, None);
+        return Err(err::LIMIT);
+    };
+    crate::domain::open_eeprom(d, files, &data, ctx.eeprom.size().max(0) as usize);
+    Ok(d)
+}
+
+/// Closes app domain `d`: its EEPROM saved, its range freed. Its tasks ended before.
+fn close_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, d: u8) {
+    if let Some(app) = ctx.domains.close(d) {
+        crate::domain::close_eeprom(d, P::app_files());
+        render::wait_idle(ctx);
+        P::place_image(ctx, app.base, app.len, None);
+    }
+}
+
+/// Closes every app domain (their tasks ended before).
+fn close_apps<P: PlatformRuntime>(ctx: &mut Ctx<P>) {
+    let open: Vec<u8> = ctx.domains.ids().collect();
+    for d in open {
+        close_app(ctx, d);
+    }
+}
+
+/// The app now running as `main` (None = the system image): `currentApp`, the board's
+/// status.
+fn set_main_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, app: Option<crate::apps::AppInfo>) {
+    P::app_changed(ctx, app.as_ref());
+    crate::apps::set_current(app);
+}
+
+/// `runApp` / the boot app: app `target` (None = the system image) becomes the only one,
+/// running as `main` (whose tasks ended before). Returns `main`'s domain. An app that
+/// cannot be opened (an `apps::err` code) leaves what ran before.
+fn enter_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, target: Option<&str>) -> Result<u8, u8> {
+    let d = match target {
+        Some(id) => open_app(ctx, id)?,
+        None => crate::domain::SYSTEM,
+    };
+    ctx.storage.close_all();
+    let others: Vec<u8> = ctx.domains.ids().filter(|&o| o != d).collect();
+    for o in others {
+        close_app(ctx, o);
+    }
+    let info = ctx.domains.get(d).map(|a| a.info.clone());
+    set_main_app(ctx, info);
+    Ok(d)
 }
 
 /// `runProgram(name, arg)` ended the running program: drop all of its state
@@ -1235,7 +1287,7 @@ impl<P: PlatformRuntime> Runtime<P> {
         alloc_root(ctx);
         let mut err = if ctx.fs.is_some() { 0 } else { ERR_NO_FILESYSTEM };
         if err == 0 {
-            let entry = entry_program();
+            let entry = entry_program(ctx, vm.domain);
             err = load_program(ctx, vm, ProgramRef::new(entry.as_bytes(), 0));
         }
         if err == 0 && vm.has_code() {
@@ -1249,13 +1301,16 @@ impl<P: PlatformRuntime> Runtime<P> {
         }
     }
 
-    /// Runs app `target` (None = the system image) from scratch: every task ends, the
-    /// image goes into the flash region (`enter_app`), and its entry program starts as
-    /// after a `writefs` (`hot_swap`). An app that cannot be loaded leaves the running
-    /// image, whose program restarts (the caller of `runApp` ended itself).
+    /// Runs app `target` (None = the system image) from scratch: every task ends, the app
+    /// becomes the only domain besides the system image (`enter_app`), and its entry
+    /// program starts as `main`, as after a `writefs` (`hot_swap`). An app that cannot be
+    /// opened leaves the running image, whose program restarts (the caller of `runApp`
+    /// ended itself).
     fn switch_app(&mut self, target: Option<alloc::string::String>) {
         self.drop_children();
-        let _ = enter_app(&mut self.ctx, target.as_deref());
+        if let Ok(d) = enter_app(&mut self.ctx, target.as_deref()) {
+            self.tasks.main.domain = d;
+        }
         self.hot_swap();
     }
 
@@ -1318,6 +1373,7 @@ impl<P: PlatformRuntime> Runtime<P> {
             return self.end_task(id, -1, None);
         };
         let mut vm = Box::new(vm);
+        vm.domain = self.ctx.tasks.slots[id as usize].domain;
         self.ctx.tasks.slots[id as usize].state = SlotState::Running;
         self.ctx.objs.cur_task = id;
         let mut err = load_program_code(&mut self.ctx, &mut vm, program);
@@ -2879,6 +2935,7 @@ mod mem_detail_tests {
             storage: crate::storage::StorageImpl::with_backend(crate::storage::MemStorage::default()),
             cursor_visible: false,
             tasks: crate::task::TaskTable::new(),
+            domains: crate::domain::Domains::new(),
         }
     }
 

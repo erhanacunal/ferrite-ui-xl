@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use ferrite_core::apps::{AppFiles, MemAppFiles};
 use ferrite_core::flash::FlashImpl;
@@ -77,8 +77,6 @@ unsafe impl Send for SimApps {}
 
 static APPS: OnceLock<SimApps> = OnceLock::new();
 static BOOT_APP: OnceLock<Option<String>> = OnceLock::new();
-/// The system image's part of the flash while an app is in it.
-static SYSTEM: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 /// Call once at start: where apps live, the boot app, packages to install.
 pub fn init(storage: Option<&str>, boot_app: Option<String>, install: &[String], base: u32, caps: u32) {
@@ -112,40 +110,20 @@ pub fn boot_app() -> Option<String> {
     BOOT_APP.get().cloned().flatten()
 }
 
-/// `DIR/ferrite/apps/{id}/data` for a running app (with `--storage`).
-pub fn data_dir(app: &ferrite_core::apps::AppInfo) -> Option<PathBuf> {
-    let root = APPS.get()?.storage.as_ref()?;
-    Some(app.dir().split('/').fold(root.clone(), |p, c| p.join(c)).join(ferrite_core::apps::DATA_DIR))
-}
-
-/// `Platform::load_flash_image`: an app's image at `base` (the system image kept aside), or
-/// the system image back.
-pub fn load_flash_image(flash: &FlashImpl<FileFlash>, base: u32, size: usize, image: Option<&[u8]>) -> bool {
-    let mut system = SYSTEM.lock().unwrap();
-    let data: Vec<u8> = match image {
-        Some(img) => {
-            if system.is_none() {
-                let mut copy = vec![0u8; size - base as usize];
-                flash.read(base, &mut copy);
-                *system = Some(copy);
-            }
-            img.to_vec()
-        }
-        None => match system.take() {
-            Some(copy) => copy,
-            None => return true,
-        },
-    };
-    if data.len() > size - base as usize {
+/// `PlatformRuntime::place_image`: an app's image at `addr` of the flash (`len` bytes kept),
+/// or that range erased again.
+pub fn place_image(flash: &FlashImpl<FileFlash>, addr: u32, len: u32, image: Option<&[u8]>) -> bool {
+    let end = addr as usize + len as usize;
+    if end > crate::flash::sim::FLASH_SIZE || image.is_some_and(|i| i.len() > len as usize) {
         return false;
     }
-    let mut at = base as usize;
-    while at < size {
+    let mut at = addr as usize & !4095;
+    while at < end {
         flash.erase_sector(at as u32);
         at += 4096;
     }
-    for (i, chunk) in data.chunks(4096).enumerate() {
-        flash.write(base + (i * 4096) as u32, chunk);
+    for (i, chunk) in image.unwrap_or(&[]).chunks(4096).enumerate() {
+        flash.write(addr + (i * 4096) as u32, chunk);
     }
     true
 }

@@ -4614,6 +4614,7 @@ mod shift_tests {
             storage: crate::storage::StorageImpl::with_backend(crate::storage::MemStorage::default()),
             cursor_visible: false,
             tasks: crate::task::TaskTable::new(),
+            domains: crate::domain::Domains::new(),
         }
     }
 

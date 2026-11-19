@@ -224,6 +224,7 @@ fn main(_args: BootArgs) -> ! {
         jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         cursor_visible: false,
         tasks: ferrite_core::task::TaskTable::new(),
+        domains: ferrite_core::domain::Domains::new(),
     }));
     let ctx = Box::new(Ctx::<Exynos4412Platform> {
         lcd: LcdImpl::with_backend(lcd),
@@ -246,6 +247,7 @@ fn main(_args: BootArgs) -> ! {
         jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         cursor_visible: false,
         tasks: ferrite_core::task::TaskTable::new(),
+        domains: ferrite_core::domain::Domains::new(),
     });
     let touch = TouchImpl::with_backend(touch::MxtTouch);
     embassy::run(move |spawner| {

@@ -209,6 +209,10 @@ pub trait StorageBackend {
     /// (`force` false: the backend may wait for writes to settle) and before
     /// a reset (`force` true).
     fn flush(&self, _force: bool) {}
+
+    /// Paths from now on start at `root` (a running app's `ferrite/apps/{id}/data`, from the
+    /// storage's top), or the backend's own root with None. Open files stay as they are.
+    fn set_root(&self, _root: Option<&str>) {}
 }
 
 /// Boards without writable storage: every call answers [`err::NO_STORAGE`].
@@ -258,11 +262,22 @@ const FREE: u8 = 0xFE;
 pub struct StorageImpl<B: StorageBackend> {
     be: B,
     owners: RefCell<[u8; MAX_OPEN]>,
+    /// The root last set (`domain::AppDomain::serial`, 0 = the backend's own).
+    root: core::cell::Cell<u32>,
 }
 
 impl<B: StorageBackend> StorageImpl<B> {
     pub fn with_backend(be: B) -> Self {
-        Self { be, owners: RefCell::new([FREE; MAX_OPEN]) }
+        Self { be, owners: RefCell::new([FREE; MAX_OPEN]), root: core::cell::Cell::new(0) }
+    }
+
+    /// Paths from now on start at `root` (None = the backend's own), named by `serial`
+    /// (0 for None): the backend hears of it only when it changes.
+    pub fn select_root(&self, serial: u32, root: Option<&str>) {
+        if self.root.get() != serial {
+            self.root.set(serial);
+            self.be.set_root(root);
+        }
     }
 
     pub fn backend(&self) -> &B {

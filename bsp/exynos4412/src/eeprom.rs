@@ -30,23 +30,10 @@ unsafe impl Sync for Mem {}
 static MEM: Mem = Mem(UnsafeCell::new([0xFF; SIZE as usize]));
 static mut DIRTY: bool = false;
 static mut LAST_WRITE_MS: u32 = 0;
-/// A running app's directory for its EEPROM file (`ferrite/apps/{id}/data`, [`switch`]);
-/// None = [`storage::DIR`].
-static mut APP_DIR: Option<alloc::string::String> = None;
-
+/// The system image's EEPROM file's directory (apps have their own in ferrite-core
+/// `domain.rs`).
 fn dir() -> &'static str {
-    // SAFETY: CPU0 only.
-    unsafe { (*(&raw const APP_DIR)).as_deref().unwrap_or(storage::DIR) }
-}
-
-/// Saves the EEPROM, then takes the one in `app_dir` (an app's `data/`, None = the system
-/// image's): no app reads another's.
-pub fn switch(app_dir: Option<alloc::string::String>) {
-    save_if_dirty(true);
-    // SAFETY: CPU0 only.
-    unsafe { *(&raw mut APP_DIR) = app_dir };
-    mem().fill(0xFF);
-    load();
+    storage::DIR
 }
 
 fn mem() -> &'static mut [u8; SIZE as usize] {

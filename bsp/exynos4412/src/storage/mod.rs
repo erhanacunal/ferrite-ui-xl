@@ -126,8 +126,8 @@ pub fn read_in(dir: &str, name: &str, max: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Programs' files under `root` (a running app's `data/`, on USERDATA's ext4), or back
-/// under [`USER_DIR`] with `None`. Every program file must be closed.
+/// Programs' paths from now on under `root` (a running app's `data/`, on USERDATA's ext4),
+/// or back under [`USER_DIR`] with `None`.
 pub fn set_user_root(root: Option<String>) {
     if medium() == Medium::UserData {
         ext4::set_user_root(root);
@@ -163,6 +163,9 @@ pub fn sync(force: bool) {
     }
     BoardStorage.flush(force);
     crate::eeprom::save_if_dirty(force);
+    if force {
+        ferrite_core::domain::flush_eeproms(&BoardApps, crate::systick::millis(), true);
+    }
     crate::settings::save_if_due(force);
 }
 
@@ -369,6 +372,9 @@ impl StorageBackend for BoardStorage {
             Medium::Cache => fat::FatStorage.flush(force),
             Medium::None => {}
         }
+    }
+    fn set_root(&self, root: Option<&str>) {
+        set_user_root(root.map(String::from));
     }
 }
 

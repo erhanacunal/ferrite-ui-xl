@@ -208,15 +208,11 @@ impl PlatformRuntime for SimPlatform {
         std::process::exit(0)
     }
 
-    fn load_flash_image(ctx: &mut ferrite_core::ctx::Ctx<Self>, image: Option<&[u8]>) -> bool {
-        crate::apps::load_flash_image(&ctx.flash, Self::FS_BASE, crate::flash::sim::FLASH_SIZE, image)
+    fn place_image(ctx: &mut ferrite_core::ctx::Ctx<Self>, addr: u32, len: u32, image: Option<&[u8]>) -> bool {
+        crate::apps::place_image(&ctx.flash, addr, len, image)
     }
 
-    fn app_changed(ctx: &mut ferrite_core::ctx::Ctx<Self>, app: Option<&ferrite_core::apps::AppInfo>) {
-        let data = app.and_then(crate::apps::data_dir);
-        ctx.storage.backend().set_root(data.clone());
-        let eeprom = data.map(|d| d.join("eeprom.bin").to_string_lossy().into_owned());
-        ctx.eeprom.backend().switch(app.is_some(), eeprom);
+    fn app_changed(_ctx: &mut ferrite_core::ctx::Ctx<Self>, app: Option<&ferrite_core::apps::AppInfo>) {
         match app {
             Some(a) => println!("app: running {} {}", a.id, a.version_text()),
             None => println!("app: running the system image"),

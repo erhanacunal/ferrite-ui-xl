@@ -46,10 +46,12 @@ pub struct SlotInfo {
     pub program: ProgramRef,
     /// Task that spawned it: gets `on_task_exit` (main when it is gone).
     pub parent: u8,
+    /// The image its program comes from (`Vm::domain`).
+    pub domain: u8,
 }
 
 impl SlotInfo {
-    const FREE: Self = Self { state: SlotState::Free, program: ProgramRef::EMPTY, parent: TASK_MAIN };
+    const FREE: Self = Self { state: SlotState::Free, program: ProgramRef::EMPTY, parent: TASK_MAIN, domain: 0 };
 }
 
 /// A `sendMessage` on its way to `to`'s `on_task_message(from, a, b)`.
@@ -84,7 +86,7 @@ impl TaskTable {
     pub fn reset(&mut self) {
         self.slots = [SlotInfo::FREE; MAX_TASKS];
         self.slots[TASK_MAIN as usize] =
-            SlotInfo { state: SlotState::Running, program: ProgramRef::new(b"main", 0), parent: TASK_MAIN };
+            SlotInfo { state: SlotState::Running, program: ProgramRef::new(b"main", 0), parent: TASK_MAIN, domain: 0 };
         self.fg = TASK_MAIN;
         self.kills = 0;
         self.mail.clear();
@@ -101,9 +103,9 @@ impl TaskTable {
 
     /// Reserve a slot for `program`; the runtime starts it after the burst.
     /// None when every slot is taken.
-    pub fn spawn(&mut self, program: ProgramRef, parent: u8) -> Option<u8> {
+    pub fn spawn(&mut self, program: ProgramRef, parent: u8, domain: u8) -> Option<u8> {
         let i = self.slots.iter().position(|s| s.state == SlotState::Free)?;
-        self.slots[i] = SlotInfo { state: SlotState::Starting, program, parent };
+        self.slots[i] = SlotInfo { state: SlotState::Starting, program, parent, domain };
         Some(i as u8)
     }
 
@@ -253,8 +255,8 @@ mod tests {
     fn table_spawn_kill_release() {
         let mut t = TaskTable::new();
         assert!(t.alive(0) && !t.alive(1) && !t.alive(-1) && !t.alive(99));
-        let a = t.spawn(ProgramRef::new(b"clock", 7), 0).unwrap();
-        let b = t.spawn(ProgramRef::new(b"chat", 0), a).unwrap();
+        let a = t.spawn(ProgramRef::new(b"clock", 7), 0, 0).unwrap();
+        let b = t.spawn(ProgramRef::new(b"chat", 0), a, 0).unwrap();
         assert_eq!((a, b), (1, 2));
         assert_eq!(t.slots[a as usize].state, SlotState::Starting);
         assert!(!t.request_kill(0), "main can't be killed");
@@ -268,7 +270,7 @@ mod tests {
         assert!(t.mail.is_empty() && t.kills == 0 && t.fg == TASK_MAIN);
         assert!(!t.send(Msg { to: a, from: 0, a: 0, b: 0 }), "dead task");
         // Slots run out.
-        while t.spawn(ProgramRef::new(b"x", 0), 0).is_some() {}
+        while t.spawn(ProgramRef::new(b"x", 0), 0, 0).is_some() {}
         assert!(t.slots.iter().all(|s| s.state != SlotState::Free));
     }
 

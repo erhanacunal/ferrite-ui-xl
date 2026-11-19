@@ -143,23 +143,19 @@ A run request (`runApp`, `/api/apps/run`, an install with run) is a CPU0
 static (`apps::request_run`); the runtime's next pass takes it
 (`Runtime::switch_app`): every program is dropped, then `enter_app`:
 
-1. `apps::load`: read `apps/{id}/app.img` (at most `Platform::APP_MAX_BYTES`)
-   and check it as an install does. A failure leaves everything as it was
-   (the system image starts again).
-2. `render::wait_idle`, programs' files closed, then
-   `PlatformRuntime::load_flash_image(Some(image))`: exynos4412
-   `flash::set_app_image` saves pending region writes, then puts the image
-   at `FS_BASE` for this boot only. While an app is in the region nothing
-   saves it (`flash::save_if_dirty` returns), so `FLASH.BIN` stays the
-   system image; the app's own `OP_F_WRITE`s last until it ends. `None`
-   reloads `FLASH.BIN`.
-3. `PlatformRuntime::app_changed`: the storage root becomes
-   `apps/{id}/data` (`storage::set_user_root`), the EEPROM
-   `apps/{id}/data/eeprom.bin` (`eeprom::switch`: the old one saved first),
-   and `/api/status` reports the id. `None` = back to `ferrite/user` and
-   `ferrite/eeprom.bin`.
-4. `apps::set_current`, remount, then `hot_swap` starts the app's `entry`
-   program (`main` for the system image).
+1. `open_app` (since step 2a, see "Step 2"): `apps::load` reads
+   `apps/{id}/app.img` (at most `Platform::APP_MAX_BYTES`) and checks it as
+   an install does; the image goes into a free range of the region above the
+   system image (`domain::rebase` moves its table's offsets, then
+   `PlatformRuntime::place_image`), mounted there as a new domain with its
+   EEPROM read. A failure leaves everything as it was (the running image
+   starts again).
+2. Every other app domain closes (EEPROM saved, range freed), `main`'s
+   domain becomes the app's, `PlatformRuntime::app_changed` tells the board
+   (`/api/status`), `apps::set_current`.
+3. `hot_swap` starts the app's `entry` program (`main` for the system
+   image). The system image stays at `FS_BASE` all along: nothing of an app
+   is ever saved into `FLASH.BIN`.
 
 A system-image writefs while an app runs leaves the app first (`FsReady`),
 so the upload lands in the system image. Boot: `settings.txt` `app=` (set
@@ -188,25 +184,98 @@ system image's flash part and EEPROM are kept aside while an app runs.
 Example: `examples/exynos4412/apps` (a launcher system image, one app source
 built as two apps).
 
-## Step 2 and 3 constraints (decided now, built later)
+## Step 2: several apps at once (design, 2026-11-19)
 
-- **Several apps at once** (launcher task + app tasks) need one `Fs` per
-  task: `ctx.fs` becomes the running task's (`Tasks` keeps each VM's), and
-  each loaded app gets its own range of the RAM region (a range allocator
-  over it; `FlashImpl` addresses stay absolute, `Fs::mount(flash, base)`
-  already takes a base).
-- **Font and image ids** are u8 per image, so two apps both have a font 1.
-  Widgets and the renderer keep global ids; the VM translates at its
-  boundary with a per-task table (local id → global slot in
-  `FontList`/`ImageList`, slots freed when the task ends): `W_SET`/`W_GET`
-  of `PROP_FONT_ID`/`PROP_IMAGE_ID`, the draw builtins, rich text's font
-  references and V3 font variants. 17 call sites in `vm.rs` to audit.
-  Global slots stay u8 (255 fonts, `MAX_IMAGES` images across all running
-  apps).
-- **syscfg** is the system's for everything (already so in step 1).
+User decisions: one app on screen at a time, full screen; hidden apps keep
+running (`loop()`, timers, messages); back to the launcher with a system
+gesture or from code; at most 4 apps at once (the launcher, i.e. the system
+image, not counted).
+
+**Domains.** A domain is one loaded image: domain 0 the system image (at
+`FS_BASE`, as today, never moved), domains 1..=4 apps. `ctx.domains`
+(`ferrite-core/src/domain.rs`) holds per app domain: its `AppInfo`, its
+range of the RAM region, its `Fs`, its font / image id maps, its EEPROM
+buffer, its container widget and its task count. Every VM carries its
+`domain` (a task spawned by `spawnProgram` inherits its parent's).
+
+- **Region:** an app's image goes into a free range of the region above the
+  system image (first fit over 4 slots, 64 KB aligned), through
+  `PlatformRuntime::place_image(ctx, addr, image)` (exynos4412: copied into
+  the shadow, not a change to save: `FLASH.BIN` keeps `[..USED]`, the
+  system image only; sim: the flash backend). No overlay of the system
+  image any more: step 1's `flash::set_app_image` / `APP_ACTIVE` go away.
+  A system-image writefs ends every app first (it may grow over them).
+- **Fs per domain:** the VM's `ctx.fs` uses (program load, `runProgram`,
+  `programName`, `spawnProgram`, sounds, `fileOpen`) take the VM's domain.
+  `F_READ` / `F_WRITE` addresses in an app are moved by its range
+  (`addr - FS_BASE + base`), bounded to it: an app sees its image where it
+  was built for and reaches nothing else; its writes last until it ends.
+- **Font and image ids:** widgets and the renderer keep global `u8` ids.
+  Domain 0 maps ids to themselves (golden unchanged). An app domain maps its
+  ids to free global ids (from 255 down, skipping the system image's,
+  found by scanning its resources once) when it opens: `W_SET` / `W_GET`
+  of `PROP_FONT_ID` / `PROP_IMAGE_ID` (the widget page goes through
+  `w_set` too) and the draw builtins translate; a font's bold / italic
+  variant ids are translated when it loads. Closing a domain unloads its
+  fonts and images (`FontList` / `ImageList` remove; the render copy
+  follows through its epoch).
+- **EEPROM:** domain 0 is the board's EEPROM, as today. An app domain's is a
+  4 KB buffer in the core, read from `apps/{id}/data/eeprom.bin` through
+  `AppFiles` when it opens, saved once writes settle, when it closes and
+  before a restart (`apps::flush`). Step 1's `eeprom::switch` goes away.
+- **Files:** `StorageBackend::set_root(Option<&str>)` before an operation of
+  another domain than the last (exynos4412: `ext4::set_user_root`, with the
+  roots already made remembered; sim: `HostStorage`). Open files keep their
+  inode, so tasks of different domains interleave.
+- **Screen:** an app domain gets a full-screen container widget (opaque
+  background, owned by the app's first task) under the root; its `parent(0)`
+  means that container, so an app is built exactly as a system image is.
+  `showApp` makes one container visible and last among the root's children
+  and hides the others; the launcher's own widgets show when none is
+  visible. Hidden containers are neither drawn nor hit. The shown app's
+  first task is the foreground task (`ctx.tasks.fg`, global input).
+- **Home gesture:** a pointer that goes down in the bottom 24 px while an app
+  is shown belongs to the runtime (not routed to widgets); released after
+  moving 80 px up, it shows the launcher.
+- **End:** the domain closes when its last task ends (`exitApp()`, a
+  `killProgram` of its task, a fault): fonts / images unloaded, EEPROM
+  saved, range freed. The launcher (the starting task) gets
+  `on_task_exit(task, code)`.
+
+`.fl` (`lib/apps.fl`, syscalls 0x85..):
+
+| Call | Result |
+| --- | --- |
+| `startApp(id)` | the app's first task id, started if not running, and shows it; -1 not installed, -2 four apps already run, -3 no room |
+| `showApp(task)` | shows the app that task belongs to (0 = the launcher); 0 if not an app |
+| `appTask(id)` | its first task id if it runs, else -1 |
+| `exitApp()` | ends the calling app (every task of its domain) |
+
+`runApp(id)` keeps step 1's meaning (everything ends, the app runs as
+`main`, now as domain 1 with the system image left in place); the boot app
+(`app=`) too: a kiosk with no launcher behind it. `currentApp()` is the
+calling task's app.
+
+Phases:
+
+- **2a** (done 2026-11-19; board: run, Back, boot app, a restart and a
+  system writefs while an app runs, app EEPROMs carried over from step 1):
+  domains with one app at a time: `domain.rs`, `place_image`, Fs /
+  EEPROM / files per domain, `F_READ` / `F_WRITE` ranges; `runApp` and the
+  boot app rebuilt on them (step 1's overlay removed). Board: step 1's tests
+  again.
+- **2b:** font / image id maps.
+- **2c:** `startApp` / `showApp` / `appTask` / `exitApp`, containers, the
+  home gesture, the 4-app limit, `/api/apps` `running` as a list, the
+  launcher example on `startApp`, a sim scenario; board.
+- **2d:** notes, CLAUDE.md.
+
+## Step 3 constraints (decided now, built later)
+
 - **Libraries** reuse the package format with a `RES_LIBINFO` manifest and
   `ferrite/libs/{id}/lib.img`; their globals and deepest frame chain add to
-  the importer's `var_slots` (header v5).
+  the importer's `var_slots` (header v5). A library is a domain without
+  tasks of its own, sharing its importer's font / image maps.
 
 ## Phases (step 1)
 

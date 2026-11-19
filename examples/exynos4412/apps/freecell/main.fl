@@ -210,7 +210,9 @@ fn move_card(from, to, auto) {
         hist[hist_n] = from * 64 + to * 2 + auto;
         hist_n = hist_n + 1;
     }
-    moves = moves + 1;
+    if (!auto) {
+        moves = moves + 1;
+    }
 }
 
 // The foundation card `cd` can go on, or -1.
@@ -288,6 +290,8 @@ fn deal(num) {
         render_pile(p);
     }
     show_status();
+    // Cards dealt where they can go home at once (an ace on top) fly there.
+    auto_step();
 }
 
 fn new_game() {
@@ -358,7 +362,7 @@ fn show_status() {
     target(status_lbl);
     set(text, sprintf("Game %d   Moves %d   Won %d/%d", game_no, moves, games_won, games_played));
     target(btn_undo);
-    set(text_color, hist_n > 0 ? C_WHITE : FELT_LINE);
+    set(text_color, can_undo() ? C_WHITE : FELT_LINE);
 }
 
 // ============================================================
@@ -452,8 +456,18 @@ fn check_win() {
     set(visible, ON);
 }
 
+// Whether there is a move of the player's to undo (the cards that went
+// home by themselves right after the deal are not one).
+fn can_undo() {
+    var k = hist_n;
+    while (k > 0 && (hist[k - 1] & 1)) {
+        k = k - 1;
+    }
+    return k > 0;
+}
+
 fn undo() {
-    if (busy || dragging || hist_n == 0) {
+    if (busy || dragging || !can_undo()) {
         return 0;
     }
     // The cards that went home by themselves, then the move before them.
@@ -465,7 +479,9 @@ fn undo() {
         var to = e / 2 % 32;
         user = !(e & 1);
         put(take(to), from);
-        moves = moves - 1;
+        if (user) {
+            moves = moves - 1;
+        }
         render_pile(from);
         render_pile(to);
     }

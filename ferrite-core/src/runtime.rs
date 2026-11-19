@@ -840,18 +840,19 @@ impl<P: PlatformRuntime> Runtime<P> {
                 }
             }
             RxEvent::FsWriteComplete if self.protocol.fs_app() => {
-                // An app package: installed under ferrite/apps/{id}/, the
-                // system image left as it is (and started again).
+                // An app package: installed under ferrite/apps/{id}/ (a
+                // library under ferrite/libs/{id}/), the system image left as
+                // it is (and started again).
                 let image = self.protocol.take_app_image();
                 let r = if image.len() > P::APP_MAX_BYTES {
                     Err(crate::apps::err::TOO_LARGE)
                 } else {
-                    crate::apps::install(P::app_files(), &image, P::FS_BASE, P::CAPS)
+                    crate::apps::install_package(P::app_files(), &image, P::FS_BASE, P::CAPS)
                 };
                 drop(image);
                 // FS_FLAG_RUN: the new app; else what ran before (updated, if it was this one).
                 let target = match &r {
-                    Ok(done) if self.protocol.fs_run() => Some(done.info.id.clone()),
+                    Ok(crate::apps::Package::App(done)) if self.protocol.fs_run() => Some(done.info.id.clone()),
                     _ => crate::apps::current().map(|a| a.id),
                 };
                 let target = target.filter(|t| !t.is_empty());
@@ -3334,6 +3335,21 @@ mod lib_tests {
         }
         assert_eq!(&r(&rt)[6..8], &[109, 1], "the program's callback ran");
         assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+
+        // Another program replaces it (an app switch resets the VM), in the
+        // program's unit and in the library's.
+        for _ in 0..2 {
+            rt.tasks.main.reset();
+            assert!(rt.tasks.main.state == VmState::Ready && rt.tasks.main.fault() == 0);
+            assert!(rt.tasks.main.load_ram(APP));
+            assert_eq!(start_program(&mut rt.ctx, &mut rt.tasks.main), 0);
+            assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+            while rt.tasks.main.unit() == 0 {
+                rt.step();
+            }
+        }
+        rt.tasks.main.reset();
+        assert!(rt.tasks.main.fault() == 0, "VM fault {} after a reset in the library", rt.tasks.main.fault());
     }
 }
 

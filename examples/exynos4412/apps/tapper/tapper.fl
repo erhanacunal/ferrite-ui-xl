@@ -1,0 +1,51 @@
+// tapper.fl — the library of the `apps` example (docs/apps.md "Step 3"),
+// used by both apps (hello/ and world/): a button that counts its taps. Its
+// code is loaded once for every app using it; each app has its own copy of
+// its globals, so each counts on its own. Its widget's on_click is its own
+// callback: the app never sees those taps.
+
+#include "core.fl"
+#include "color.fl"
+
+var btn;
+var label;
+var taps = 0;
+
+fn show() {
+    target(label);
+    set(text, sprintf("tapped %d times (library)", taps));
+}
+
+fn tapped(w) {
+    taps = taps + 1;
+    show();
+}
+
+// A tap counter button at (x, y) on the calling app's screen.
+export fn tapButton(x, y) {
+    btn = alloc();
+    target(btn);
+    set(location, x, y);
+    set(size, 500, 90);
+    set(bg_color, 0x0391);
+    set(press_color, 0x05F5);
+    set(border_radius, 16);
+    set(clickable, ON);
+    parent(0);
+    label = alloc();
+    target(label);
+    set(kind, KIND_LABEL);
+    set(size, 500, 90);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(btn);
+    target(btn);
+    set(on_click, @tapped);
+    show();
+    return btn;
+}
+
+// How many taps so far.
+export fn tapCount() {
+    return taps;
+}

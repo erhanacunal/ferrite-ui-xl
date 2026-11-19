@@ -263,6 +263,24 @@ pub fn install(files: &dyn AppFiles, image: &[u8], base: u32, caps: u32) -> Resu
     Ok(Installed { info, replaced })
 }
 
+/// What [`install_package`] installed.
+pub enum Package {
+    App(Installed),
+    /// A library package (`libs.rs`): its manifest, whether it replaced one.
+    Library(AppInfo, bool),
+}
+
+/// Installs an app or a library package, whichever `image` is (a library
+/// has a `libinfo`): the one way in for writefs `FS_FLAG_APP`, `POST
+/// /api/apps` / `/api/libs` and the sim's `--install`.
+pub fn install_package(files: &dyn AppFiles, image: &[u8], base: u32, caps: u32) -> Result<Package, u8> {
+    if crate::libs::is_library(image, base) {
+        crate::libs::install(files, image, base, caps).map(|(info, replaced)| Package::Library(info, replaced))
+    } else {
+        install(files, image, base, caps).map(Package::App)
+    }
+}
+
 /// The installed apps, sorted by id (from each one's `appinfo.bin`; a
 /// directory without a readable one is left out).
 pub fn list(files: &dyn AppFiles) -> Vec<AppInfo> {

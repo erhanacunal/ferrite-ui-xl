@@ -8,8 +8,11 @@
 // tapping its tile shows it again. Its Exit button ends it (on_task_exit).
 // The launcher counts its own starts in its EEPROM byte 0, which no app sees.
 //
-// Install the apps first: ferrite_build hello/project.json -o hello.bin, then
-// `ferrite_cli app install hello.bin` (board), or the sim's --install hello.bin.
+// Install the apps first: they use the library in tapper/ (docs/apps.md
+// "Step 3"), so build it before them: ferrite_build tapper/project.json -o
+// tapper/tapper.bin, then hello/project.json -o hello.bin (world the same),
+// then `ferrite_cli lib install tapper.bin` and `ferrite_cli app install
+// hello.bin` (board), or the sim's --install tapper.bin --install hello.bin.
 
 #include "core.fl"
 #include "color.fl"

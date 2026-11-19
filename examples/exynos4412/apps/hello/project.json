@@ -9,5 +9,6 @@
   ],
   "application_id": "com.example.hello",
   "name": "Hello",
-  "app_version": "1.0.0"
+  "app_version": "1.0.0",
+  "libraries": ["../tapper/tapper.bin"]
 }

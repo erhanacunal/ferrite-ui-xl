@@ -89,8 +89,13 @@ pub fn init(storage: Option<&str>, boot_app: Option<String>, install: &[String],
     let _ = BOOT_APP.set(boot_app);
     for pkg in install {
         match fs::read(pkg) {
-            Ok(image) => match ferrite_core::apps::install(files(), &image, base, caps) {
-                Ok(done) => println!("app: installed {} {}", done.info.id, done.info.version_text()),
+            Ok(image) => match ferrite_core::apps::install_package(files(), &image, base, caps) {
+                Ok(ferrite_core::apps::Package::App(done)) => {
+                    println!("app: installed {} {}", done.info.id, done.info.version_text())
+                }
+                Ok(ferrite_core::apps::Package::Library(info, _)) => {
+                    println!("library: installed {} {}", info.id, info.version_text())
+                }
                 Err(code) => eprintln!("--install {pkg}: {}", ferrite_core::apps::err::text(code)),
             },
             Err(e) => eprintln!("--install {pkg}: {e}"),

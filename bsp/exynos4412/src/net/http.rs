@@ -14,6 +14,9 @@
 //! | `DELETE /api/apps/{id}` | removes the app and its data (409 while it runs; clears it as the boot app) |
 //! | `POST /api/apps?run=1` | installs, then runs it (an update of the running app restarts it anyway) |
 //! | `POST /api/apps/run?id=ID` | runs installed app `ID` from the next pass (no `id`: the system image) |
+//! | `POST /api/libs` (or `PUT`) | a library package (ferrite-core `libs`, docs/apps.md "Step 3"): checked and installed under `ferrite/libs/{id}/`; JSON `{"id","name","version","caps","library":true,"replaced"}`, or `{"code","error"}` (`/api/apps` takes one too) |
+//! | `GET /api/libs` | JSON: `{"storage":bool,"libs":[{"id","name","version","caps"}],"loaded":[{"id","major","code"}]}` (`loaded`: in RAM for running programs) |
+//! | `DELETE /api/libs/{id}` | removes the library (programs running keep their copy) |
 //! | `POST /api/apps/boot?id=ID` | the app started at boot (`app=` in `system/settings.txt`; no `id`: the system image) |
 //! | `GET /api/wifi` | JSON: what the last scan saw of the configured network (BSSIDs, channels, their information elements as hex), the BSSID joined, the last RSN mismatch (diagnostics) |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
@@ -288,7 +291,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let early = &request[head_end..filled];
             upload(socket, super::Upload::System(name, len as u8), length, want, expect, early).await?;
         }
-        (b"POST" | b"PUT", b"/api/apps") => {
+        (b"POST" | b"PUT", b"/api/apps" | b"/api/libs") => {
             let length = header(head, b"content-length").and_then(parse_decimal);
             let want = header(head, b"x-crc32").and_then(parse_hex);
             let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
@@ -299,6 +302,23 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             Some((_, t)) => json(socket, "200 OK", &t).await?,
             None => text(socket, "503 Service Unavailable", "No answer from the UI core\n").await?,
         },
+        (b"GET", b"/api/libs") => match super::storage_request(super::STORAGE_LIBS, 10).await {
+            Some((_, t)) => json(socket, "200 OK", &t).await?,
+            None => text(socket, "503 Service Unavailable", "No answer from the UI core
+").await?,
+        },
+        (b"DELETE", _) if path.starts_with(b"/api/libs/") => {
+            let id = core::str::from_utf8(&path[b"/api/libs/".len()..]).unwrap_or("");
+            match super::storage_request_with(super::STORAGE_LIB_REMOVE, id, 30).await {
+                Some((true, t)) => json(socket, "200 OK", &t).await?,
+                Some((false, t)) => {
+                    let (code, body) = t.split_once(' ').unwrap_or(("500", &t));
+                    json(socket, status_line(code), body).await?
+                }
+                None => text(socket, "503 Service Unavailable", "No answer from the UI core
+").await?,
+            }
+        }
         (b"DELETE", _) if path.starts_with(b"/api/apps/") => {
             let id = core::str::from_utf8(&path[b"/api/apps/".len()..]).unwrap_or("");
             match super::storage_request_with(super::STORAGE_APP_REMOVE, id, 30).await {

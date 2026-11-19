@@ -361,11 +361,15 @@ Phases:
 - **3b (done 2026-11-19):** VM and linking (ferrite-core, `vm/units.rs`,
   `libs.rs`): units, tagged addresses, the registry, faults 19 / 20;
   `runtime::lib_tests` with compiled testdata (`testdata/libs/gen.py`).
-- **3c:** install (`apps.rs` generalised to packages of both kinds,
-  `/api/libs`, `ferrite_cli lib`, sim `--install`).
-- **3d:** an example (a library with widgets and callbacks used by two
-  apps), sim, board, `perf_baseline.py` (the VM's call path changed),
-  notes, CLAUDE.md.
+- **3c (done 2026-11-19):** install (`apps::install_package` takes
+  packages of both kinds: writefs `FS_FLAG_APP`, `POST /api/apps` or
+  `/api/libs`, sim `--install`; `GET /api/libs` with the loaded ones,
+  `DELETE /api/libs/{id}`; `ferrite_cli lib install|list|remove`).
+- **3d (done 2026-11-19):** example `examples/exynos4412/apps/tapper` (a
+  button counting its taps with its own `on_click`, used by `hello` and
+  `world`), sim (two apps at once count apart), board, `perf_baseline.py`
+  (`perf/pre3b` vs `perf/libs`: bench VM 20.2 → 20.0 Mi/s), notes,
+  CLAUDE.md.
 
 ## Phases (step 1)
 

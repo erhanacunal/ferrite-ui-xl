@@ -205,7 +205,8 @@ impl Vm {
 
     /// Drop the libraries (back to the program's unit first).
     pub(super) fn clear_units(&mut self) {
-        if !self.units.is_empty() {
+        // (Unit 0's slot is parked empty while it runs: no switch then.)
+        if self.unit != 0 {
             self.switch_unit(0);
         }
         self.units.clear();

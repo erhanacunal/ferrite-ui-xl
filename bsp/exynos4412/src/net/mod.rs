@@ -1002,6 +1002,16 @@ fn app_json(info: &ferrite_core::apps::AppInfo) -> String {
     )
 }
 
+fn lib_json(info: &ferrite_core::apps::AppInfo) -> String {
+    format!(
+        "{{\"id\":{},\"name\":{},\"version\":{},\"caps\":{}}}",
+        json_str(&info.id),
+        json_str(&info.name),
+        json_str(&info.version_text()),
+        info.caps
+    )
+}
+
 /// The running app's id ("" = the system image), for CPU3's `/api/status`.
 static RUNNING_APP: CriticalSectionMutex<RefCell<String>> = CriticalSectionMutex::new(RefCell::new(String::new()));
 
@@ -1019,10 +1029,15 @@ pub(crate) fn running_app() -> String {
 fn install_app(image: Vec<u8>, run: bool) -> u8 {
     use ferrite_core::platform::Platform;
     type P = crate::platform::Exynos4412Platform;
-    let r = ferrite_core::apps::install(&crate::storage::BoardApps, &image, P::FS_BASE, P::CAPS);
+    let r = ferrite_core::apps::install_package(&crate::storage::BoardApps, &image, P::FS_BASE, P::CAPS);
     drop(image);
     let (status, answer) = match r {
-        Ok(done) => {
+        Ok(ferrite_core::apps::Package::Library(info, replaced)) => {
+            println!("ferrite: library {} {} installed", info.id, info.version_text());
+            let body = lib_json(&info);
+            (200, format!("{},\"library\":true,\"replaced\":{}}}", &body[..body.len() - 1], replaced))
+        }
+        Ok(ferrite_core::apps::Package::App(done)) => {
             println!("ferrite: app {} {} installed", done.info.id, done.info.version_text());
             // Run it (`?run=1`), or restart the running app if this updated it.
             let running = ferrite_core::apps::current().is_some_and(|a| a.id == done.info.id);
@@ -1190,6 +1205,10 @@ pub const STORAGE_APP_REMOVE: u8 = 8;
 pub const STORAGE_APP_RUN: u8 = 9;
 /// `POST /api/apps/boot?id=`: [`STORAGE_ARG`] is the id ("" = the system image).
 pub const STORAGE_APP_BOOT: u8 = 10;
+/// `GET /api/libs`: the installed libraries as JSON.
+pub const STORAGE_LIBS: u8 = 11;
+/// `DELETE /api/libs/{id}`: [`STORAGE_ARG`] is the id.
+pub const STORAGE_LIB_REMOVE: u8 = 12;
 /// A request's argument (an app id), set before [`STORAGE_WANTED`].
 static STORAGE_ARG: CriticalSectionMutex<RefCell<String>> = CriticalSectionMutex::new(RefCell::new(String::new()));
 static STORAGE_TEXT: CriticalSectionMutex<RefCell<Option<(bool, String)>>> = CriticalSectionMutex::new(RefCell::new(None));
@@ -1259,6 +1278,40 @@ fn storage_service() {
                     items.join(",")
                 ),
             )
+        }
+        STORAGE_LIBS => {
+            use ferrite_core::apps::AppFiles;
+            let libs = ferrite_core::libs::list(&crate::storage::BoardApps);
+            let items: Vec<String> = libs.iter().map(lib_json).collect();
+            let loaded: Vec<String> = ferrite_core::libs::loaded()
+                .iter()
+                .map(|(id, v, bytes)| {
+                    format!("{{\"id\":{},\"major\":{},\"code\":{}}}", json_str(id), v >> 16, bytes)
+                })
+                .collect();
+            (
+                true,
+                format!(
+                    "{{\"storage\":{},\"libs\":[{}],\"loaded\":[{}]}}",
+                    crate::storage::BoardApps.available(),
+                    items.join(","),
+                    loaded.join(",")
+                ),
+            )
+        }
+        // Programs using it keep their loaded copy; the next to start fails.
+        STORAGE_LIB_REMOVE => {
+            let id = STORAGE_ARG.lock(|a| a.borrow().clone());
+            match ferrite_core::libs::remove(&crate::storage::BoardApps, &id) {
+                Ok(()) => {
+                    println!("ferrite: library {} removed", id);
+                    (true, format!("{{\"removed\":{}}}", json_str(&id)))
+                }
+                Err(code) => {
+                    let (status, body) = app_error(code);
+                    (false, format!("{} {}", status, body))
+                }
+            }
         }
         // `POST /api/apps/run?id=ID` (no id: the system image): from the next pass.
         STORAGE_APP_RUN => {

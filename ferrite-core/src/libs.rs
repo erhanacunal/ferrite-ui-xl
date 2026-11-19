@@ -42,6 +42,13 @@ pub fn parse_libinfo(rec: &[u8]) -> Result<AppInfo, u8> {
     parse_manifest(rec, LIBINFO_MAGIC)
 }
 
+/// Whether `image` is a library package (an FS image with a `libinfo`;
+/// [`check`] says whether a good one).
+pub fn is_library(image: &[u8], base: u32) -> bool {
+    let flash = FlashImpl::with_backend(SliceFlash { data: image, base });
+    Fs::mount(&flash, base).is_ok_and(|fs| fs.find_kind(&flash, LIBINFO_NAME, RES_LIBINFO).is_some())
+}
+
 /// Checks a library package as the board would load it at `base` with
 /// `caps`: a whole FS image with a good CRC, a valid manifest, nothing needed
 /// that the firmware lacks, a `lib` program that is a library. Its manifest

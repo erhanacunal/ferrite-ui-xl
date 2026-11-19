@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "device": "exynos4412-xl",
+  "screen": [1280, 800],
+  "include_dirs": ["../../../../../ferrite-ui/lib"],
+  "programs": [
+    {"name": "lib", "source": "tapper.fl"}
+  ],
+  "library_id": "com.example.tapper",
+  "name": "Tapper",
+  "app_version": "1.0.0"
+}

@@ -3,7 +3,8 @@
 // EEPROM (byte 0 counts its starts here) and files (START.TXT), so the two
 // counters and the launcher's never mix. Started from the launcher (startApp)
 // it runs beside it: "Home" shows the launcher and the app keeps counting its
-// seconds in the background; "Exit" ends it (exitApp).
+// seconds in the background; "Exit" ends it (exitApp). The tap button comes
+// from the library in tapper/ (tapButton), built before the apps.
 
 #include "core.fl"
 #include "color.fl"
@@ -95,6 +96,8 @@ fn setup() {
     set(text_align, ALIGN_CENTER);
     parent(0);
     born = millis();
+
+    tapButton(390, 430);
 
     home = alloc();
     quit = alloc();

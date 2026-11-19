@@ -272,6 +272,19 @@ impl Image {
         None
     }
 
+    /// Marks the image ids `fs` holds in `out`.
+    pub fn ids_in<F: FlashBackend>(fs: &Fs, flash: &FlashImpl<F>, out: &mut [bool; 256]) {
+        for i in 0..fs.count_by_kind(flash, RES_IMAGE) {
+            if let Some(entry) = fs.find_nth_by_kind(flash, RES_IMAGE, i)
+                && entry.size >= HEADER_SIZE
+            {
+                let mut id = [0u8; 1];
+                flash.read(entry.offset + 8, &mut id);
+                out[usize::from(id[0])] = true;
+            }
+        }
+    }
+
     /// Draw the image at screen coordinates (x, y), which may be negative
     /// (partly off the top/left edge).
     /// Streaming decode — image is NOT loaded into RAM.
@@ -771,6 +784,54 @@ impl ImageList {
         self.images[self.count as usize] = image;
         self.count += 1;
         true
+    }
+
+    /// Drops the images whose id `gone` marks (a closed app's, `domain.rs`). The render copy
+    /// follows in `sync_from`.
+    pub fn remove_ids(&mut self, gone: &[bool; 256]) {
+        let mut kept = 0;
+        for i in 0..self.count as usize {
+            if !gone[usize::from(self.images[i].image_id)] {
+                self.images.swap(kept, i);
+                kept += 1;
+            }
+        }
+        for img in &mut self.images[kept..self.count as usize] {
+            *img = Image::empty();
+        }
+        self.count = kept as u8;
+    }
+
+    /// An app's image (`domain.rs`): image `local` of `fs` loaded as global id
+    /// `map[local]`. False if it has no global id, `fs` has no such image or the list is
+    /// full.
+    pub fn find_or_load_mapped<F: FlashBackend, #[cfg(feature = "jpeg")] J: JpegBackend>(
+        &mut self,
+        local: u8,
+        fs: &Fs,
+        flash: &FlashImpl<F>,
+        #[cfg(feature = "jpeg")] jpeg: &JpegImpl<J>,
+        map: &[u8; 256],
+    ) -> bool {
+        let global = map[usize::from(local)];
+        if global == 0 {
+            return false;
+        }
+        if self.find(global).is_some() {
+            return true;
+        }
+        if (self.count as usize) >= MAX_IMAGES {
+            return false;
+        }
+        let Some(mut image) = Image::load_by_id(fs, flash, local) else {
+            return false;
+        };
+        image.image_id = global;
+        #[cfg(feature = "jpeg")]
+        if !image.decode_jpeg(flash, jpeg) {
+            return false;
+        }
+        self.add(image)
     }
 
     /// Find a loaded image by image_id. Returns None if not loaded.

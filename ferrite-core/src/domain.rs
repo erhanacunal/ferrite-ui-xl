@@ -4,6 +4,12 @@
 //! (`Vm::domain`): which `Fs` its programs, resources and `F_READ` / `F_WRITE` see, which
 //! EEPROM and which storage root.
 //!
+//! Font and image ids are `u8`s each image numbers on its own, while widgets, the font and
+//! image lists and the renderer know one global id each. The system image keeps its ids; an
+//! app's are mapped to free global ids when it opens ([`IdMaps`], [`Domains::assign_ids`])
+//! and the VM translates at its boundary (`W_SET` / `W_GET` of the font and image props,
+//! the draw builtins).
+//!
 //! An app's EEPROM is a buffer here (not the board's), read from
 //! `ferrite/apps/{id}/data/eeprom.bin` through `AppFiles` when the domain opens and saved
 //! once writes settle ([`flush_eeproms`], from the runtime's pass and the BSP's restart
@@ -28,6 +34,45 @@ pub const EEPROM_FILE: &str = "eeprom.bin";
 /// An app's EEPROM is saved this long after its last write.
 pub const EEPROM_SETTLE_MS: u32 = 2000;
 
+/// An app's font and image ids → global ids (0 = none: the embedded font, no image).
+#[derive(Clone)]
+pub struct IdMaps {
+    pub fonts: [u8; 256],
+    pub images: [u8; 256],
+}
+
+impl Default for IdMaps {
+    fn default() -> Self {
+        Self { fonts: [0; 256], images: [0; 256] }
+    }
+}
+
+impl IdMaps {
+    /// The global ids these maps use, one flag each (fonts, images).
+    pub fn used(&self) -> ([bool; 256], [bool; 256]) {
+        let mut f = [false; 256];
+        let mut i = [false; 256];
+        for &g in self.fonts.iter().filter(|&&g| g != 0) {
+            f[usize::from(g)] = true;
+        }
+        for &g in self.images.iter().filter(|&&g| g != 0) {
+            i[usize::from(g)] = true;
+        }
+        (f, i)
+    }
+}
+
+/// Global `id`'s local id in `map` (0 if it is none of the app's).
+pub fn local_of(map: &[u8; 256], id: u8) -> u8 {
+    if id == 0 {
+        return 0;
+    }
+    map.iter().position(|&g| g == id).map_or(0, |l| l as u8)
+}
+
+/// Highest global id handed to an app (255 is no font id: a V1 font's "none").
+const TOP_ID: u8 = 254;
+
 /// A running app's image.
 pub struct AppDomain {
     pub info: AppInfo,
@@ -40,6 +85,8 @@ pub struct AppDomain {
     pub data: String,
     /// Unique per open (`StorageImpl::select_root` remembers the last one).
     pub serial: u32,
+    /// Its font and image ids → global ids.
+    pub ids: IdMaps,
 }
 
 impl AppDomain {
@@ -74,6 +121,26 @@ impl Domains {
         self.apps.get(i)?.as_ref()
     }
 
+    /// Domain `d`'s font id `local` as the global one (the system image's as it is).
+    pub fn font(&self, d: u8, local: u8) -> u8 {
+        self.get(d).map_or(local, |a| a.ids.fonts[usize::from(local)])
+    }
+
+    /// Domain `d`'s image id `local` as the global one.
+    pub fn image(&self, d: u8, local: u8) -> u8 {
+        self.get(d).map_or(local, |a| a.ids.images[usize::from(local)])
+    }
+
+    /// Global font id `global` as domain `d` numbers it (0 if not one of its fonts).
+    pub fn font_local(&self, d: u8, global: u8) -> u8 {
+        self.get(d).map_or(global, |a| local_of(&a.ids.fonts, global))
+    }
+
+    /// Global image id `global` as domain `d` numbers it (0 if not one of its images).
+    pub fn image_local(&self, d: u8, global: u8) -> u8 {
+        self.get(d).map_or(global, |a| local_of(&a.ids.images, global))
+    }
+
     /// The open app domains' ids.
     pub fn ids(&self) -> impl Iterator<Item = u8> + '_ {
         self.apps.iter().enumerate().filter(|(_, a)| a.is_some()).map(|(i, _)| i as u8 + 1)
@@ -98,14 +165,50 @@ impl Domains {
         (at.checked_add(len)? <= hi).then_some(at)
     }
 
-    /// Opens a domain for `info`, its image mounted as `fs` at `base` (`len` bytes kept).
-    /// None if [`MAX_APPS`] are open.
-    pub fn open(&mut self, info: AppInfo, base: u32, len: u32, fs: Fs) -> Option<u8> {
+    /// Global ids for an app holding the font / image ids `fonts` / `images` flags: free
+    /// ones (from [`TOP_ID`] down) that neither the system image (`system_*`) nor another
+    /// open app uses. None if there are not enough.
+    pub fn assign_ids(
+        &self,
+        fonts: &[bool; 256],
+        images: &[bool; 256],
+        system_fonts: &[bool; 256],
+        system_images: &[bool; 256],
+    ) -> Option<IdMaps> {
+        let mut taken_f = *system_fonts;
+        let mut taken_i = *system_images;
+        for app in self.apps.iter().flatten() {
+            let (f, i) = app.ids.used();
+            for g in 0..256 {
+                taken_f[g] |= f[g];
+                taken_i[g] |= i[g];
+            }
+        }
+        let mut maps = IdMaps::default();
+        for (wanted, taken, map) in [(fonts, &mut taken_f, &mut maps.fonts), (images, &mut taken_i, &mut maps.images)] {
+            let mut next = TOP_ID;
+            for local in 1..256 {
+                if !wanted[local] {
+                    continue;
+                }
+                while taken[usize::from(next)] {
+                    next = next.checked_sub(1).filter(|&n| n > 0)?;
+                }
+                map[local] = next;
+                taken[usize::from(next)] = true;
+            }
+        }
+        Some(maps)
+    }
+
+    /// Opens a domain for `info`, its image mounted as `fs` at `base` (`len` bytes kept),
+    /// its ids mapped by `ids`. None if [`MAX_APPS`] are open.
+    pub fn open(&mut self, info: AppInfo, base: u32, len: u32, fs: Fs, ids: IdMaps) -> Option<u8> {
         let i = self.apps.iter().position(Option::is_none)?;
         let data = alloc::format!("{}/{}", info.dir(), crate::apps::DATA_DIR);
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1).max(1);
-        self.apps[i] = Some(AppDomain { info, base, len, fs, data, serial });
+        self.apps[i] = Some(AppDomain { info, base, len, fs, data, serial, ids });
         Some(i as u8 + 1)
     }
 
@@ -247,10 +350,10 @@ mod tests {
         let lo = 0x50_0123;
         let a = d.place(lo, 0x400_0000, 0x2_0000).unwrap();
         assert_eq!(a, 0x51_0000);
-        let da = d.open(info("a"), a, 0x2_0000, fs()).unwrap();
+        let da = d.open(info("a"), a, 0x2_0000, fs(), IdMaps::default()).unwrap();
         let b = d.place(lo, 0x400_0000, 0x1000).unwrap();
         assert_eq!(b, 0x53_0000);
-        let db = d.open(info("b"), b, 0x1000, fs()).unwrap();
+        let db = d.open(info("b"), b, 0x1000, fs(), IdMaps::default()).unwrap();
         assert_eq!((da, db), (1, 2));
         assert_eq!(d.find("b"), Some(2));
         d.close(da);
@@ -259,9 +362,9 @@ mod tests {
         assert_eq!(d.place(lo, 0x400_0000, 0x3_0000), Some(0x54_0000));
         assert_eq!(d.place(lo, 0x54_0000, 0x3_0000), None);
         for n in ["c", "d", "e"] {
-            assert!(d.open(info(n), 0, 0, fs()).is_some());
+            assert!(d.open(info(n), 0, 0, fs(), IdMaps::default()).is_some());
         }
-        assert!(d.open(info("f"), 0, 0, fs()).is_none(), "four at most");
+        assert!(d.open(info("f"), 0, 0, fs(), IdMaps::default()).is_none(), "four at most");
     }
 
     #[test]
@@ -272,10 +375,41 @@ mod tests {
         img[36..40].copy_from_slice(&0x1030u32.to_le_bytes());
         assert!(rebase(&mut img, 0x1000, 0x60_0000));
         assert_eq!(u32::from_le_bytes(img[36..40].try_into().unwrap()), 0x60_0030);
-        let a = AppDomain { info: info("a"), base: 0x60_0000, len: 0x100, fs: fs(), data: String::new(), serial: 1 };
+        let a = AppDomain {
+            info: info("a"),
+            base: 0x60_0000,
+            len: 0x100,
+            fs: fs(),
+            data: String::new(),
+            serial: 1,
+            ids: IdMaps::default(),
+        };
         assert_eq!(a.flash_addr(0x1000, 0x1010, 0x10), Some(0x60_0010));
         assert_eq!(a.flash_addr(0x1000, 0x10f8, 0x10), None);
         assert_eq!(a.flash_addr(0x1000, 0xff0, 1), None);
+    }
+
+    #[test]
+    fn ids_avoid_the_system_and_other_apps() {
+        let flags = |ids: &[u8]| {
+            let mut f = [false; 256];
+            for &i in ids {
+                f[usize::from(i)] = true;
+            }
+            f
+        };
+        let mut d = Domains::new();
+        let sys_f = flags(&[1, 2, 254]);
+        let sys_i = flags(&[1, 253]);
+        let a = d.assign_ids(&flags(&[1, 3]), &flags(&[1, 2]), &sys_f, &sys_i).unwrap();
+        assert_eq!((a.fonts[1], a.fonts[3], a.fonts[0]), (253, 252, 0));
+        assert_eq!((a.images[1], a.images[2]), (254, 252));
+        assert_eq!((local_of(&a.fonts, 252), local_of(&a.fonts, 2), local_of(&a.images, 0)), (3, 0, 0));
+        d.open(info("a"), 0, 0, fs(), a).unwrap();
+        let b = d.assign_ids(&flags(&[1]), &flags(&[]), &sys_f, &sys_i).unwrap();
+        assert_eq!(b.fonts[1], 251, "past the system's and a's");
+        let all = flags(&(1..=254).collect::<Vec<u8>>());
+        assert!(d.assign_ids(&flags(&[1]), &flags(&[]), &all, &sys_i).is_none());
     }
 
     #[test]

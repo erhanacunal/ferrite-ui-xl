@@ -327,6 +327,15 @@ impl Font {
         None
     }
 
+    /// Marks the font ids `fs` holds in `out`.
+    pub fn ids_in<F: FlashBackend>(fs: &Fs, flash: &FlashImpl<F>, out: &mut [bool; 256]) {
+        for i in 0..fs.count_by_kind(flash, RES_FONT) {
+            if let Some(h) = fs.find_nth_by_kind(flash, RES_FONT, i).and_then(|e| Header::read(flash, &e)) {
+                out[usize::from(h.font_id)] = true;
+            }
+        }
+    }
+
     /// Create an embedded (ROM) font. Always gets font_id = 0.
     /// Glyphs and codepoints reference ROM directly — zero RAM cost.
     #[inline(never)]
@@ -1019,6 +1028,45 @@ impl FontList {
             return true;
         }
         false
+    }
+
+    /// An app's font (`domain.rs`): font `local` of `fs` loaded as global id `map[local]`,
+    /// its bold / italic variants mapped and loaded the same way. False if it has no
+    /// global id or `fs` has no such font.
+    pub fn find_or_load_mapped<F: FlashBackend>(
+        &mut self,
+        local: u8,
+        fs: &Fs,
+        flash: &FlashImpl<F>,
+        cache_bitmap: bool,
+        map: &[u8; 256],
+    ) -> bool {
+        let global = map[usize::from(local)];
+        if global == EMBEDDED_FONT_ID {
+            return local == EMBEDDED_FONT_ID;
+        }
+        if self.find(global).is_some() {
+            return true;
+        }
+        let Some(mut font) = Font::load_by_id(fs, flash, local, cache_bitmap) else {
+            return false;
+        };
+        let locals = font.variants;
+        font.font_id = global;
+        font.variants = locals.map(|v| if v == EMBEDDED_FONT_ID { v } else { map[usize::from(v)] });
+        self.add(font);
+        for v in locals {
+            if v != EMBEDDED_FONT_ID {
+                self.find_or_load_mapped(v, fs, flash, cache_bitmap, map);
+            }
+        }
+        true
+    }
+
+    /// Drops the fonts whose id `gone` marks (a closed app's, `domain.rs`); the embedded
+    /// one stays. The render copy follows in `sync_from`.
+    pub fn remove_ids(&mut self, gone: &[bool; 256]) {
+        self.fonts.retain(|f| f.font_id == EMBEDDED_FONT_ID || !gone[usize::from(f.font_id)]);
     }
 
     /// Make this list hold the fonts `other` holds (the render context's copy

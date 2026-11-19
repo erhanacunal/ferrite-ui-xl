@@ -1391,7 +1391,7 @@ impl Vm {
             OP_DRAW_IMAGE => canvas!(ctx, |c| {
                 let (xy, image_id) = self.pop2();
                 let (x, y) = unpack_pair(xy);
-                let image_id = image_id as u8;
+                let image_id = ctx.domains.image(self.domain, image_id as u8);
                 if let Some(img) = ctx.images.find(image_id) {
                     c.draw_image(img, &ctx.flash, x as i16, y as i16);
                 }
@@ -1404,7 +1404,7 @@ impl Vm {
                     self.pc = (start + len) as CodeAddr;
                     let (font_id, colors) = self.pop2();
                     let (fg, bg) = unpack_pair(colors);
-                    let font_id = font_id as u8;
+                    let font_id = ctx.domains.font(self.domain, font_id as u8);
                     let (x, y) = unpack_pair(self.pop());
                     if let Some(font) = ctx.fonts.resolve(font_id) {
                         let bg_opt = if bg == 0 { None } else { Some(bg) };
@@ -1420,7 +1420,7 @@ impl Vm {
                 let str_id = self.pop() as ObjPtr;
                 let (font_id, colors) = self.pop2();
                 let (fg, bg) = unpack_pair(colors);
-                let font_id = font_id as u8;
+                let font_id = ctx.domains.font(self.domain, font_id as u8);
                 let (x, y) = unpack_pair(self.pop());
                 let data = ctx.objs.str_get(str_id);
                 if let Some(font) = ctx.fonts.resolve(font_id) {
@@ -2218,6 +2218,12 @@ impl Vm {
                     // counted, and answered from the last render's snapshot when
                     // `snapshot::STALE` models the render core (`snapshot.rs`).
                     let v = ctx.objs.render.snapshot.read(self.target, prop_id, v);
+                    // Font / image ids as this program's image numbers them (`domain.rs`).
+                    let v = match prop_id {
+                        PROP_FONT_ID => i32::from(ctx.domains.font_local(self.domain, v as u8)),
+                        PROP_IMAGE_ID => i32::from(ctx.domains.image_local(self.domain, v as u8)),
+                        _ => v,
+                    };
                     self.push(v);
                 } else {
                     self.push(0);
@@ -3175,20 +3181,17 @@ impl Vm {
         if self.target.is_none() {
             return;
         }
+        // Widgets keep global font / image ids; an app's are mapped (`domain.rs`).
+        let local = val;
+        let val = match prop_id {
+            PROP_FONT_ID => i32::from(ctx.domains.font(self.domain, local as u8)),
+            PROP_IMAGE_ID => i32::from(ctx.domains.image(self.domain, local as u8)),
+            _ => val,
+        };
         self.set_scalar_prop(ctx, prop_id, val);
         ctx.objs.flex_note(self.target, prop_id);
-        if prop_id == PROP_FONT_ID {
-            if let Some(fs) = ctx.fs_of(self.domain).cloned() {
-                ctx.fonts.find_or_load(val as u8, &fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
-            }
-        }
-        if prop_id == PROP_IMAGE_ID {
-            if let Some(fs) = ctx.fs_of(self.domain).cloned() {
-                #[cfg(feature = "jpeg")]
-                ctx.images.find_or_load(val as u8, &fs, &ctx.flash, &ctx.jpeg);
-                #[cfg(not(feature = "jpeg"))]
-                ctx.images.find_or_load(val as u8, &fs, &ctx.flash);
-            }
+        if prop_id == PROP_FONT_ID || prop_id == PROP_IMAGE_ID {
+            self.load_resource(ctx, prop_id, local as u8);
         }
         // An active layer root's position/visibility only places its surface.
         if matches!(prop_id, PROP_LOC_X | PROP_LOC_Y | PROP_VISIBLE) && ctx.objs.is_active_layer_root(self.target) {
@@ -3885,6 +3888,33 @@ impl Vm {
         ctx.flash.read(f.offset + f.pos, &mut buf[..n]);
         f.pos += n as u32;
         n
+    }
+
+    /// Loads font / image `local` (`prop_id` says which) of this domain's image, under its
+    /// global id.
+    fn load_resource<P: Platform>(&self, ctx: &mut Ctx<P>, prop_id: u8, local: u8) {
+        let Some(fs) = ctx.fs_of(self.domain).cloned() else { return };
+        let map = ctx.domains.get(self.domain).map(|a| a.ids.clone());
+        match (prop_id == PROP_FONT_ID, map) {
+            (true, None) => {
+                ctx.fonts.find_or_load(local, &fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
+            }
+            (true, Some(m)) => {
+                ctx.fonts.find_or_load_mapped(local, &fs, &ctx.flash, P::CACHE_FONT_BITMAPS, &m.fonts);
+            }
+            (false, None) => {
+                #[cfg(feature = "jpeg")]
+                ctx.images.find_or_load(local, &fs, &ctx.flash, &ctx.jpeg);
+                #[cfg(not(feature = "jpeg"))]
+                ctx.images.find_or_load(local, &fs, &ctx.flash);
+            }
+            (false, Some(m)) => {
+                #[cfg(feature = "jpeg")]
+                ctx.images.find_or_load_mapped(local, &fs, &ctx.flash, &ctx.jpeg, &m.images);
+                #[cfg(not(feature = "jpeg"))]
+                ctx.images.find_or_load_mapped(local, &fs, &ctx.flash, &m.images);
+            }
+        }
     }
 
     /// `F_READ` / `F_WRITE`'s `addr..addr + len` in the flash region: as is for the system

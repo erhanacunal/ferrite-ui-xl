@@ -1124,8 +1124,20 @@ fn open_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, id: &str) -> Result<u8, u8> {
         P::place_image(ctx, base, len, None);
         return Err(err::BAD_IMAGE);
     };
+    // Its font and image ids → free global ones (`domain.rs`).
+    let (mut sys_f, mut sys_i, mut app_f, mut app_i) = ([false; 256], [false; 256], [false; 256], [false; 256]);
+    if let Some(sys) = ctx.fs.as_ref() {
+        font::Font::ids_in(sys, &ctx.flash, &mut sys_f);
+        crate::image::Image::ids_in(sys, &ctx.flash, &mut sys_i);
+    }
+    font::Font::ids_in(&fs, &ctx.flash, &mut app_f);
+    crate::image::Image::ids_in(&fs, &ctx.flash, &mut app_i);
     let data = alloc::format!("{}/{}", info.dir(), crate::apps::DATA_DIR);
-    let Some(d) = ctx.domains.open(info, base, len, fs) else {
+    let Some(d) = ctx
+        .domains
+        .assign_ids(&app_f, &app_i, &sys_f, &sys_i)
+        .and_then(|ids| ctx.domains.open(info, base, len, fs, ids))
+    else {
         P::place_image(ctx, base, len, None);
         return Err(err::LIMIT);
     };
@@ -1133,11 +1145,15 @@ fn open_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, id: &str) -> Result<u8, u8> {
     Ok(d)
 }
 
-/// Closes app domain `d`: its EEPROM saved, its range freed. Its tasks ended before.
+/// Closes app domain `d`: its fonts and images unloaded, its EEPROM saved, its range
+/// freed. Its tasks ended before.
 fn close_app<P: PlatformRuntime>(ctx: &mut Ctx<P>, d: u8) {
     if let Some(app) = ctx.domains.close(d) {
         crate::domain::close_eeprom(d, P::app_files());
         render::wait_idle(ctx);
+        let (fonts, images) = app.ids.used();
+        ctx.fonts.remove_ids(&fonts);
+        ctx.images.remove_ids(&images);
         P::place_image(ctx, app.base, app.len, None);
     }
 }

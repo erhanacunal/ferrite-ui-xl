@@ -108,6 +108,7 @@ error codes (ferrite_cli `ERROR_DESCRIPTIONS`):
 | 17 | no such app | 404 |
 | 18 | entry program not in the image | 400 |
 | 19 | package too large | 413 |
+| 20 | four apps already run | 409 |
 
 1. **HTTP:** `POST /api/apps` (body = the package, `X-CRC32` optional) →
    install, JSON `{"id","name","version","entry","icon","caps","replaced"}`
@@ -264,7 +265,10 @@ Phases:
   EEPROM / files per domain, `F_READ` / `F_WRITE` ranges; `runApp` and the
   boot app rebuilt on them (step 1's overlay removed). Board: step 1's tests
   again.
-- **2b:** font / image id maps.
+- **2b** (done 2026-11-19): font / image id maps (`IdMaps`, `Domains::assign_ids`;
+  `FontList` / `ImageList` `find_or_load_mapped`, `remove_ids`). Check: the
+  tablet built as an app renders pixel-identical to the tablet as the system
+  image (sim, also after opening Clock); board: it runs as an app.
 - **2c:** `startApp` / `showApp` / `appTask` / `exitApp`, containers, the
   home gesture, the 4-app limit, `/api/apps` `running` as a list, the
   launcher example on `startApp`, a sim scenario; board.

@@ -2,7 +2,11 @@
 //
 // - Two pages (swipe left/right): a glance clock + live performance card
 //   with four apps, and an "about" card with live system figures.
-// - The dock holds four more apps; swipe up for the app drawer (all eight).
+// - The dock holds four more apps; swipe up for the app drawer (all eight,
+//   and below them up to four installed app packages, ferrite-ui-xl
+//   docs/apps.md: a tap starts one beside the tablet with startApp; the
+//   home gesture, a swipe up from the bottom edge, comes back here while it
+//   keeps running).
 // - Swipe down for the shade: brightness and volume sliders (real backlight
 //   and codec volume), quick tiles and a notification.
 // - Tapping an app grows its colour from the icon to the full screen, then
@@ -12,6 +16,7 @@
 
 #include "ui.fl"
 #include "gesture.fl"
+#include "apps.fl"
 
 #hint_widgets 140 140
 
@@ -40,6 +45,12 @@ var tile_perf; var tile_wall; var tile_chime; var tile_restart;
 var scrim;
 var drawer_handle;
 var notif;
+// Installed app packages in the drawer (one clickable variable each).
+const PKG_MAX = 4;
+const PKG_Y   = 600;    // centre of their row in the drawer
+const PKG_COLOR = 0x4A69;
+var pk0; var pk1; var pk2; var pk3;
+var pkg_status;
 
 var pager;
 var pager_drag = 0;      // a finger is dragging the pager
@@ -225,6 +236,72 @@ fn build_drawer() {
     dr5 = alloc(); make_icon(dr5, drawer, 6, 520, 420, ICON_D, 1, 3); target(dr5); set(on_click, @on_icon);
     dr6 = alloc(); make_icon(dr6, drawer, 7, 760, 420, ICON_D, 1, 3); target(dr6); set(on_click, @on_icon);
     dr7 = alloc(); make_icon(dr7, drawer, 8, 1000, 420, ICON_D, 1, 3); target(dr7); set(on_click, @on_icon);
+    build_packages();
+}
+
+// The installed packages' row (appCount / appName): none installed, or no
+// app storage, leaves a hint instead.
+fn build_packages() {
+    var t = alloc();
+    style_label(80, 500, 600, 40, F20, DIM, ALIGN_LEFT, "Installed");
+    parent(drawer);
+    pkg_status = alloc();
+    style_label(240, 500, 900, 40, F20, DIM, ALIGN_LEFT, "");
+    parent(drawer);
+    var n = appCount();
+    if (n == 0) {
+        target(pkg_status);
+        set(text, "none: ferrite_cli app install PACKAGE.bin");
+    }
+    if (n > 0) { pk0 = alloc(); make_package(pk0, 0); target(pk0); set(on_click, @on_package); }
+    if (n > 1) { pk1 = alloc(); make_package(pk1, 1); target(pk1); set(on_click, @on_package); }
+    if (n > 2) { pk2 = alloc(); make_package(pk2, 2); target(pk2); set(on_click, @on_package); }
+    if (n > 3) { pk3 = alloc(); make_package(pk3, 3); target(pk3); set(on_click, @on_package); }
+    if (n > PKG_MAX) {
+        target(pkg_status);
+        set(text, sprintf("(%d more not shown)", n - PKG_MAX));
+    }
+}
+
+// Package `slot`'s icon: a circle with a plain glyph, its name under it.
+fn make_package(b: widget, slot) {
+    var cx = 280 + slot * 240;
+    target(b);
+    style_button(cx - ICON_D / 2, PKG_Y - ICON_D / 2, ICON_D, ICON_D, PKG_COLOR, ICON_D / 2);
+    parent(drawer);
+    var g = alloc();
+    style_box(32, 32, 40, 40, WHITE, 10);
+    parent(b);
+    var l = alloc();
+    style_label(cx - 110, PKG_Y + ICON_D / 2 + 6, 220, 32, F20, WHITE, ALIGN_CENTER, appName(slot));
+    parent(drawer);
+}
+
+// A package tapped: it starts beside the tablet (or shows, if it runs).
+fn on_package(w) {
+    if (launching) {
+        return 0;
+    }
+    var slot = -1;
+    if (w == pk0) { slot = 0; }
+    if (w == pk1) { slot = 1; }
+    if (w == pk2) { slot = 2; }
+    if (w == pk3) { slot = 3; }
+    if (slot < 0) {
+        return 0;
+    }
+    playSound("click");
+    var t = startApp(appId(slot));
+    target(pkg_status);
+    if (t < 0) {
+        set(text, t == -2 ? "four apps already run" : sprintf("could not start it (%d)", t));
+    } else {
+        set(text, "");
+        // Back from it (home gesture) to the home screen, not the drawer.
+        open_drawer(0);
+    }
+    dirty();
+    strClear();
 }
 
 // Quick tile: icon + caption in a pill.

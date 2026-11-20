@@ -721,6 +721,29 @@ impl Image {
 /// running app's share the list, and 64 left a 52-card game's last ones unloaded.
 const MAX_IMAGES: usize = 255;
 
+/// Why images a program set did not load, since boot (a widget showing one draws
+/// nothing): the list was full, or the program's image has no such id. Status: exynos
+/// `/api/status` `images`.
+pub mod stats {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    /// Loads refused because the list was full.
+    pub static FULL: AtomicU32 = AtomicU32::new(0);
+    /// Loads of an id the program's image holds no image for.
+    pub static MISSING: AtomicU32 = AtomicU32::new(0);
+    /// The id (global) of the last refused or missing load, 0 = none.
+    pub static LAST_ID: AtomicU32 = AtomicU32::new(0);
+    /// Most images the list held at once.
+    pub static PEAK: AtomicU32 = AtomicU32::new(0);
+    /// The list's size.
+    pub const MAX: usize = super::MAX_IMAGES;
+
+    pub(super) fn refused(counter: &AtomicU32, id: u8) {
+        counter.fetch_add(1, Relaxed);
+        LAST_ID.store(u32::from(id), Relaxed);
+    }
+}
+
 /// Application-wide image list. Holds loaded image metadata and supports
 /// lookup by image_id with lazy loading from flash.
 pub struct ImageList {
@@ -785,6 +808,7 @@ impl ImageList {
         }
         self.images[self.count as usize] = image;
         self.count += 1;
+        stats::PEAK.fetch_max(u32::from(self.count), core::sync::atomic::Ordering::Relaxed);
         true
     }
 
@@ -823,9 +847,11 @@ impl ImageList {
             return true;
         }
         if (self.count as usize) >= MAX_IMAGES {
+            stats::refused(&stats::FULL, global);
             return false;
         }
         let Some(mut image) = Image::load_by_id(fs, flash, local) else {
+            stats::refused(&stats::MISSING, global);
             return false;
         };
         image.image_id = global;
@@ -869,6 +895,7 @@ impl ImageList {
             return true;
         }
         if (self.count as usize) >= MAX_IMAGES {
+            stats::refused(&stats::FULL, image_id);
             return false;
         }
         #[cfg(feature = "jpeg")]
@@ -879,6 +906,7 @@ impl ImageList {
         if let Some(image) = Image::load_by_id(fs, flash, image_id) {
             return self.add(image);
         }
+        stats::refused(&stats::MISSING, image_id);
         false
     }
 }
@@ -1356,6 +1384,19 @@ mod tests {
         lcd.set_scissor(sc);
         img.draw(&lcd, flash, x, y);
         lcd.backend().px.borrow().clone()
+    }
+
+    #[test]
+    fn image_list_holds_every_global_id() {
+        let mut list = std::boxed::Box::new(ImageList::new());
+        for id in 1..=255u8 {
+            let mut img = Image::empty();
+            img.image_id = id;
+            assert!(list.add(img), "id {id}");
+        }
+        assert!(list.find(255).is_some());
+        assert!(!list.add(Image::empty()));
+        assert_eq!(stats::PEAK.load(core::sync::atomic::Ordering::Relaxed), stats::MAX as u32);
     }
 
     #[test]

@@ -1264,6 +1264,20 @@ fn status_json() -> String {
             crate::jpeg::FAILED.load(Relaxed),
             crate::jpeg::LAST_US.load(Relaxed)
         );
+        // Images a program set that did not load (`ferrite_core::image::stats`): the
+        // list was full, or no such image; the last such id; most held at once.
+        {
+            use ferrite_core::image::stats;
+            let _ = write!(
+                s,
+                ",\"images\":{{\"peak\":{},\"max\":{},\"full\":{},\"missing\":{},\"last_id\":{}}}",
+                stats::PEAK.load(Relaxed),
+                stats::MAX,
+                stats::FULL.load(Relaxed),
+                stats::MISSING.load(Relaxed),
+                stats::LAST_ID.load(Relaxed)
+            );
+        }
     }
     let _ = write!(s, ",\"cpu_mhz\":{}", crate::cpuclock::mhz());
     {

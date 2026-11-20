@@ -80,6 +80,17 @@ impl Platform for Exynos4412Platform {
         &crate::storage::BoardApps
     }
 
+    /// The settings' `app=` (also while the setup screen runs).
+    fn saved_boot_app() -> Option<alloc::string::String> {
+        crate::settings::boot_app()
+    }
+
+    fn set_boot_app(id: &str) -> bool {
+        crate::settings::set_boot_app(id);
+        exynos_4412_rs::println!("ferrite: boot app = {}", if id.is_empty() { "(system image)" } else { id });
+        true
+    }
+
     // 1 GB of DRAM (512 MB heap): pools far past the pool_large defaults
     // (2 MB / 8192), and the deepest VM stacks the u8 indices allow. A
     // program's `"memory"` block still overrides each one. 256K object

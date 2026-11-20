@@ -2891,7 +2891,22 @@ impl Vm {
                 for i in (0..actual).rev() {
                     args[i] = self.pop();
                 }
-                // App syscalls (0x80..=0x88) are the core's: `runApp` ends the task.
+                // App syscalls (0x80..=0x8A) are the core's: `runApp` ends the task.
+                if matches!(syscall_id, crate::apps::SYS_APP_BOOT | crate::apps::SYS_APP_SET_BOOT) {
+                    let r = crate::apps::boot_syscall(
+                        syscall_id,
+                        &args[..actual],
+                        &mut ctx.objs,
+                        P::app_files(),
+                        P::saved_boot_app,
+                        P::set_boot_app,
+                    );
+                    match r {
+                        Some(v) => self.push(v),
+                        None => self.fail(fault::STR_ALLOC),
+                    }
+                    return;
+                }
                 if (crate::apps::SYS_APP_CURRENT..=crate::apps::SYS_APP_EXIT).contains(&syscall_id) {
                     return self.app_call(ctx, syscall_id, &args[..actual]);
                 }

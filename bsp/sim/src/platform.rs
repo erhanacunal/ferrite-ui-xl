@@ -52,6 +52,14 @@ impl Platform for SimPlatform {
         crate::apps::files()
     }
 
+    fn saved_boot_app() -> Option<String> {
+        crate::apps::boot_app()
+    }
+
+    fn set_boot_app(id: &str) -> bool {
+        crate::apps::set_boot_app(id)
+    }
+
     const VERIFY_FS_ON_BOOT: bool = true;
 }
 

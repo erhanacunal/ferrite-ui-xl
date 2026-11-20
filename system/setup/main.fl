@@ -8,11 +8,14 @@
 // Left: the networks around (a scan every few seconds while not joined; tap
 // one to take its name). Right: the WiFi settings (name, passphrase, band,
 // hostname), saved as SYSTEM/WIFI.TXT on CACHE, which uart_boot reads too;
-// they count from the next start (Save & restart). Below: what the board has.
+// they count from the next start (Save & restart). Below the networks: the app
+// started at boot (a dropdown of the installed apps, system/settings.txt app=),
+// then what the board has.
 
 #include "core.fl"
 #include "color.fl"
 #include "system.fl"
+#include "apps.fl"
 
 const F20 = 1;
 const F26 = 2;
@@ -31,26 +34,31 @@ const TEXT       = 0xEF7D;
 const DIM        = 0x9CF3;
 const FIELD      = 0x0861;
 
-const ROWS = 7;
-const ROW_H = 64;
+const ROWS = 6;
+const ROW_H = 60;
 const LIST_X = 40;
 const LIST_Y = 180;
 const LIST_W = 560;
 const FORM_X = 664;
 const FORM_W = 576;
+const BOOT_Y = 556;
+const BOOT_W = 330;
+// The boot dropdown's options open upwards over the network list: the system
+// image and at most 6 apps.
+const OPTS = 7;
+const OPT_H = 52;
 
-// Array sizes must be literals: keep 7 = ROWS. The row buttons are also
-// file-scope vars (row0..row6) so set(on_click) can wire them.
-var row_btn[7];
-var row_name[7];
-var row_sig[7];
+// Array sizes must be literals: keep 6 = ROWS. The row buttons are also
+// file-scope vars (row0..row5) so set(on_click) can wire them.
+var row_btn[6];
+var row_name[6];
+var row_sig[6];
 var row0;
 var row1;
 var row2;
 var row3;
 var row4;
 var row5;
-var row6;
 var scan_btn;
 var save_btn;
 var restart_btn;
@@ -66,6 +74,9 @@ var msg_lbl;
 var wifi_lbl;
 var files_lbl;
 var scan_lbl;
+var boot_dd;
+var boot_opt[7];
+var boot_opts = 0;
 var shown_scans = -1;
 var shown_state = -1;
 var last_poll = 0;
@@ -309,6 +320,113 @@ fn on_save(w) {
     return 0;
 }
 
+// Option i of the boot dropdown: 0 the system image, then the apps by id.
+fn boot_name(i) -> string {
+    if (i == 0) {
+        return "System image";
+    }
+    var name = appName(i - 1);
+    if (strLen(name) == 0) {
+        return appId(i - 1);
+    }
+    return name;
+}
+
+// The option started at boot in the accent colour.
+fn boot_mark(sel) {
+    for (var k = 0; k < boot_opts; k++) {
+        target(boot_opt[k]);
+        if (k == sel) {
+            set(text_color, ACCENT_HI);
+        } else {
+            set(text_color, TEXT);
+        }
+    }
+}
+
+fn on_boot(w) {
+    target(boot_dd);
+    var i = get(value);
+    if (i < 0 || i >= boot_opts) {
+        return 0;
+    }
+    var id = "";
+    if (i > 0) {
+        id = appId(i - 1);
+    }
+    if (setBootApp(id)) {
+        boot_mark(i);
+        say(sprintf("At boot: %s (from the next start).", boot_name(i)), OK_COLOR);
+    } else {
+        say("Not set: the app is gone or the board keeps no settings.", BAD_COLOR);
+    }
+    return 0;
+}
+
+// The "Start at boot" row: a dropdown of the system image and the installed
+// apps, showing the one the settings start now.
+fn boot_picker() {
+    label(alloc(), LIST_X, BOOT_Y, LIST_W - BOOT_W - 8, 56, F26, WHITE, ALIGN_LEFT, "Start at boot");
+    var apps = appCount();
+    boot_opts = apps + 1;
+    if (boot_opts > OPTS) {
+        boot_opts = OPTS;
+    }
+    var boot = bootApp();
+    var sel = 0;
+    for (var i = 1; i < boot_opts; i++) {
+        if (strcmp(appId(i - 1), boot) == 0) {
+            sel = i;
+        }
+    }
+    var x = LIST_X + LIST_W - BOOT_W;
+    boot_dd = alloc();
+    target(boot_dd);
+    set(kind, KIND_DROPDOWN);
+    set(location, x, BOOT_Y);
+    set(size, BOOT_W, 56);
+    set(bg_color, FIELD);
+    set(border_color, ROW_HI);
+    set(border, 2, 2, 2, 2);
+    set(border_radius, 12);
+    set(padding, 16, 12, 16, 12);
+    set(font_id, F26);
+    set(text_color, TEXT);
+    if (sel == 0 && strLen(boot) > 0) {
+        set(text, sprintf("%s (not installed)", boot));
+    } else if (apps == 0) {
+        set(text, "No apps installed");
+    } else {
+        set(text, boot_name(sel));
+    }
+    set(value, sel);
+    if (apps > 0) {
+        set(clickable, ON);
+    }
+    set(on_click, @on_boot);
+    parent(0);
+    for (var k = 0; k < boot_opts; k++) {
+        var o = alloc();
+        target(o);
+        set(kind, KIND_LABEL);
+        set(location, 0, (k - boot_opts) * OPT_H - 4);
+        set(size, BOOT_W, OPT_H);
+        set(bg_color, ROW);
+        set(press_color, ROW_HI);
+        set(border_color, ROW_HI);
+        set(border, 1, 1, 1, 1);
+        set(padding, 0, 16, 0, 16);
+        set(font_id, F26);
+        set(text_align, ALIGN_LEFT);
+        set(text, boot_name(k));
+        set(clickable, ON);
+        set(visible, OFF);
+        parent(boot_dd);
+        boot_opt[k] = o;
+    }
+    boot_mark(sel);
+}
+
 fn on_restart(w) {
     say("Restarting...", DIM);
     render();
@@ -343,14 +461,12 @@ fn setup() {
     row3 = alloc();
     row4 = alloc();
     row5 = alloc();
-    row6 = alloc();
     row_btn[0] = row0;
     row_btn[1] = row1;
     row_btn[2] = row2;
     row_btn[3] = row3;
     row_btn[4] = row4;
     row_btn[5] = row5;
-    row_btn[6] = row6;
     for (var i = 0; i < ROWS; i++) {
         var b: widget = row_btn[i];
         target(b);
@@ -396,8 +512,6 @@ fn setup() {
     set(on_click, @on_row);
     target(row5);
     set(on_click, @on_row);
-    target(row6);
-    set(on_click, @on_row);
 
     // Settings
     panel(alloc(), 648, 96, 608, 680);
@@ -432,6 +546,9 @@ fn setup() {
         "Tap a field to type. Saved settings count from the next start.");
     target(msg_lbl);
     set(multi_line, ON);
+
+    // The app started at boot (after the network rows: its options open over them)
+    boot_picker();
 
     // Board
     wifi_lbl = alloc();

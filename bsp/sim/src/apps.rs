@@ -76,7 +76,8 @@ unsafe impl Sync for SimApps {}
 unsafe impl Send for SimApps {}
 
 static APPS: OnceLock<SimApps> = OnceLock::new();
-static BOOT_APP: OnceLock<Option<String>> = OnceLock::new();
+/// `--app`, or what `setBootApp` set (for the run only, like the sim's other settings).
+static BOOT_APP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Call once at start: where apps live, the boot app, packages to install.
 pub fn init(storage: Option<&str>, boot_app: Option<String>, install: &[String], base: u32, caps: u32) {
@@ -86,7 +87,7 @@ pub fn init(storage: Option<&str>, boot_app: Option<String>, install: &[String],
         None => Files::Mem(MemAppFiles::default()),
     };
     let _ = APPS.set(SimApps { files: store, storage });
-    let _ = BOOT_APP.set(boot_app);
+    *BOOT_APP.lock().unwrap() = boot_app;
     for pkg in install {
         match fs::read(pkg) {
             Ok(image) => match ferrite_core::apps::install_package(files(), &image, base, caps) {
@@ -112,7 +113,14 @@ pub fn files() -> &'static dyn AppFiles {
 }
 
 pub fn boot_app() -> Option<String> {
-    BOOT_APP.get().cloned().flatten()
+    BOOT_APP.lock().unwrap().clone()
+}
+
+/// `setBootApp`: kept for the run (the next `--app` default is not changed).
+pub fn set_boot_app(id: &str) -> bool {
+    println!("app: boot app = {}", if id.is_empty() { "(system image)" } else { id });
+    *BOOT_APP.lock().unwrap() = (!id.is_empty()).then(|| String::from(id));
+    true
 }
 
 /// `PlatformRuntime::place_image`: an app's image at `addr` of the flash (`len` bytes kept),

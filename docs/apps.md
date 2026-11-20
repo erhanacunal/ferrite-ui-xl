@@ -160,7 +160,7 @@ static (`apps::request_run`); the runtime's next pass takes it
 
 A system-image writefs while an app runs leaves the app first (`FsReady`),
 so the upload lands in the system image. Boot: `settings.txt` `app=` (set
-with `/api/apps/boot`) names the app to enter after the system image's
+with `/api/apps/boot`, `setBootApp` or the setup screen's "Start at boot") names the app to enter after the system image's
 syscfg sized the pools; a missing or bad one boots the system image.
 Volume-up (setup) skips it. `runProgram` / `spawnProgram` inside an app
 find programs in that app's image (the app is the whole FS).
@@ -175,6 +175,8 @@ find programs in that app's image (the app is the whole FS).
 | 0x82 | `appName(i)` | string |
 | 0x83 | `runApp(id)` | like `runProgram`: nothing of the caller runs after it; 0 if not installed. `""` = the system image |
 | 0x84 | `currentApp()` | string, "" for the system image |
+| 0x89 | `bootApp()` | string: the settings' `app=`, "" for the system image (`Platform::saved_boot_app`) |
+| 0x8A | `setBootApp(id)` | 1 set (saved like any setting change); 0 not installed or no settings (`Platform::set_boot_app`). `""` = the system image |
 
 The list is cached until an install or removal (`apps::list_cached`).
 

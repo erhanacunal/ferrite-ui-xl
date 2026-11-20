@@ -406,6 +406,12 @@ pub const SYS_APP_SHOW: u8 = 0x86;
 pub const SYS_APP_TASK: u8 = 0x87;
 /// `()` → ends the calling app (every task of it); in the system image 0 and nothing.
 pub const SYS_APP_EXIT: u8 = 0x88;
+/// `()` → string: the app the board starts at boot (its settings' `app=`), "" = the system
+/// image (also on boards without settings).
+pub const SYS_APP_BOOT: u8 = 0x89;
+/// `(id: string)` → makes app `id` ("" = the system image) the one started at boot, saved with
+/// the board's settings: 1, or 0 if `id` is not installed or the board keeps no settings.
+pub const SYS_APP_SET_BOOT: u8 = 0x8A;
 
 /// What an app syscall did.
 pub enum Call {
@@ -542,6 +548,34 @@ pub fn syscall(id: u8, args: &[i32], objs: &mut crate::pool::ObjPool, files: &dy
         SYS_APP_CURRENT => {
             let cur = current();
             string(objs, cur.as_ref().map_or("", |a| a.id.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Answers [`SYS_APP_BOOT`] / [`SYS_APP_SET_BOOT`] (None for any other id, or no string slot):
+/// `get` reads the board's boot app, `set` changes it (false: the board keeps no settings).
+pub fn boot_syscall(
+    id: u8,
+    args: &[i32],
+    objs: &mut crate::pool::ObjPool,
+    files: &dyn AppFiles,
+    get: fn() -> Option<String>,
+    set: fn(&str) -> bool,
+) -> Option<i32> {
+    match id {
+        SYS_APP_BOOT => {
+            let boot = get().unwrap_or_default();
+            objs.str_alloc(boot.as_bytes()).map(|p| p as i32)
+        }
+        SYS_APP_SET_BOOT => {
+            let raw = objs.str_get(args.first().copied().unwrap_or(0) as crate::pool::ObjPtr);
+            let Ok(target) = core::str::from_utf8(raw) else { return Some(0) };
+            if !target.is_empty() && find(files, target).is_none() {
+                return Some(0);
+            }
+            let target = String::from(target);
+            Some(set(&target) as i32)
         }
         _ => None,
     }
@@ -738,6 +772,41 @@ mod tests {
         let files = MemAppFiles::default();
         assert_eq!(install(&files, &image(&[("main", RES_PROGRAM, vec![1])]), BASE, 1), Err(err::NO_APPINFO));
         assert!(files.list(APPS_DIR).is_none());
+    }
+
+    #[test]
+    fn boot_syscalls_read_and_set_the_boot_app() {
+        use std::sync::Mutex;
+        static BOOT: Mutex<Option<String>> = Mutex::new(None);
+        fn get() -> Option<String> {
+            BOOT.lock().unwrap().clone()
+        }
+        fn set(id: &str) -> bool {
+            *BOOT.lock().unwrap() = (!id.is_empty()).then(|| String::from(id));
+            true
+        }
+        fn no_settings(_: &str) -> bool {
+            false
+        }
+        let files = MemAppFiles::default();
+        let mut objs = crate::pool::ObjPool::new();
+        install(&files, &package("a.app", 1), BASE, 1).unwrap();
+        let mut call = |objs: &mut crate::pool::ObjPool, id, args: &[i32], set| {
+            boot_syscall(id, args, objs, &files, get, set).unwrap()
+        };
+        let boot = call(&mut objs, SYS_APP_BOOT, &[], set);
+        assert_eq!(objs.str_get(boot as crate::pool::ObjPtr), b"");
+        let a = objs.str_alloc(b"a.app").unwrap() as i32;
+        let missing = objs.str_alloc(b"c.app").unwrap() as i32;
+        let none = objs.str_alloc(b"").unwrap() as i32;
+        assert_eq!(call(&mut objs, SYS_APP_SET_BOOT, &[missing], set), 0);
+        assert_eq!(call(&mut objs, SYS_APP_SET_BOOT, &[a], no_settings), 0);
+        assert_eq!(get(), None);
+        assert_eq!(call(&mut objs, SYS_APP_SET_BOOT, &[a], set), 1);
+        let boot = call(&mut objs, SYS_APP_BOOT, &[], set);
+        assert_eq!(objs.str_get(boot as crate::pool::ObjPtr), b"a.app");
+        assert_eq!(call(&mut objs, SYS_APP_SET_BOOT, &[none], set), 1);
+        assert_eq!(get(), None);
     }
 
     #[test]

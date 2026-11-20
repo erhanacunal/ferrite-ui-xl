@@ -146,6 +146,19 @@ pub trait Platform: Sized {
         &crate::apps::NoAppFiles
     }
 
+    /// The app the board's settings start at boot (`apps::SYS_APP_BOOT`), None = the system
+    /// image. The default: no settings.
+    fn saved_boot_app() -> Option<alloc::string::String> {
+        None
+    }
+
+    /// Makes `id` (installed; "" = the system image) the app started at boot, saved with the
+    /// board's settings (`apps::SYS_APP_SET_BOOT`). False: the board keeps no settings.
+    fn set_boot_app(id: &str) -> bool {
+        let _ = id;
+        false
+    }
+
     /// Run `job` on the render context `r` somewhere else (another core;
     /// plan step 3c). `Ok` = taken: [`Platform::render_poll`] hands `r` back
     /// once the job is done, and until then nothing may draw on the screen.

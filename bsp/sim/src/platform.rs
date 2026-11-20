@@ -246,6 +246,9 @@ impl PlatformRuntime for SimPlatform {
             0x50..=0x56 => ferrite_core::settings::syscall(id, args, objs, systick::millis(), &mut SimNtp),
             // The setup screen's WiFi / settings syscalls (lib/system.fl): a fake chip.
             0x70..=0x7A => crate::setup::syscall(id, args, objs),
+            // GPS (lib/gps.fl): a receiver that never finds a position, unless
+            // `FERRITE_SIM_GPS=LAT,LON[,ALT_M]` fakes a fix.
+            0x90..=0x94 => ferrite_core::gps::syscall(id, args, objs, &mut SimGps),
             // No heap figures on the host; frames = passes.
             _ => ferrite_core::sysinfo::syscall(id, args, objs, || {
                 let passes = PASSES.load(Ordering::Relaxed);
@@ -354,6 +357,61 @@ fn sim_battery(id: u8) -> i32 {
         (0x09, Some((_, c))) => *c,
         (0x09, None) => 2,
         _ => -1,
+    }
+}
+
+/// The sim's GPS: `FERRITE_SIM_GPS=LAT,LON[,ALT_M]` (degrees, metres) gives a fix with 8
+/// satellites once powered; without it the receiver talks but never finds a position.
+struct SimGps;
+
+static SIM_GPS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Degrees (decimal text) to degrees x 10^7.
+fn sim_degrees(text: &str) -> Option<i32> {
+    let v: f64 = text.trim().parse().ok()?;
+    (v.abs() <= 180.0).then(|| (v * 1e7).round() as i32)
+}
+
+impl ferrite_core::gps::GpsBackend for SimGps {
+    fn power(&mut self, on: bool) -> bool {
+        SIM_GPS_ON.store(on, Ordering::Relaxed);
+        true
+    }
+
+    fn data(&mut self) -> ferrite_core::gps::GpsData {
+        static FAKE: std::sync::OnceLock<Option<(i32, i32, i32)>> = std::sync::OnceLock::new();
+        let fake = FAKE.get_or_init(|| {
+            let v = std::env::var("FERRITE_SIM_GPS").ok()?;
+            let mut parts = v.split(',');
+            let lat = sim_degrees(parts.next()?)?;
+            let lon = sim_degrees(parts.next()?)?;
+            let alt_dm = parts.next().and_then(|a| a.trim().parse::<f64>().ok()).map_or(0, |m| (m * 10.0).round() as i32);
+            Some((lat, lon, alt_dm))
+        });
+        let powered = SIM_GPS_ON.load(Ordering::Relaxed);
+        let mut d = ferrite_core::gps::GpsData { powered, hdop_centi: 9999, ..Default::default() };
+        if !powered {
+            return d;
+        }
+        d.sentence_age_ms = Some(0);
+        if let Some((lat, lon, alt_dm)) = *fake {
+            let unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |t| t.as_secs() as i64);
+            d = ferrite_core::gps::GpsData {
+                fix_age_ms: Some(0),
+                latitude: lat,
+                longitude: lon,
+                altitude_dm: alt_dm,
+                quality: 1,
+                satellites_used: 8,
+                satellites_in_view: 11,
+                hdop_centi: 90,
+                utc_unix: unix,
+                ..d
+            };
+        }
+        d
     }
 }
 

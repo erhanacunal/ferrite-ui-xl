@@ -1238,6 +1238,16 @@ fn status_json() -> String {
             crate::battery::LAST_PERCENT.load(Relaxed),
             crate::battery::LAST_CHARGER.load(Relaxed)
         );
+        // GPS (gps.rs): state -1 = never powered, else GPS_*; position in degrees x 10^7.
+        let _ = write!(
+            s,
+            ",\"gps\":{{\"state\":{},\"sats_used\":{},\"sats_view\":{},\"lat\":{},\"lon\":{}}}",
+            crate::gps::LAST_STATE.load(Relaxed),
+            crate::gps::LAST_SATS_USED.load(Relaxed),
+            crate::gps::LAST_SATS_VIEW.load(Relaxed),
+            crate::gps::LAST_LAT.load(Relaxed),
+            crate::gps::LAST_LON.load(Relaxed)
+        );
         // Touch (touch.rs): read on CPU1 by interrupt (queued) or polled on CPU0.
         // chg = [level, interrupt masked, pending].
         let chg = crate::touch::chg_bits();

@@ -73,6 +73,7 @@ mod compose;
 #[cfg_attr(not(feature = "wifi"), allow(dead_code))]
 mod cpuclock;
 mod eeprom;
+mod gps;
 mod gpu;
 // CPU1 / CPU3 stopped for standby and started again.
 mod hotplug;

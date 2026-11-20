@@ -212,6 +212,10 @@ impl PlatformRuntime for Exynos4412Platform {
             ferrite_core::setup::SYS_WIFI_STATE..=ferrite_core::setup::SYS_WIFI_SCANS => {
                 crate::setup::syscall(id, args, objs)
             }
+            // GPS (lib/gps.fl): the u-blox G6010 on UART1.
+            ferrite_core::gps::SYS_GPS_POWER..=ferrite_core::gps::SYS_GPS_TEXT => {
+                ferrite_core::gps::syscall(id, args, objs, &mut crate::gps::Board)
+            }
             _ => sysinfo::syscall(id, args, objs, || {
                 let heap = heap::stats();
                 sysinfo::Info {
@@ -316,6 +320,8 @@ impl PlatformRuntime for Exynos4412Platform {
         crate::cpuclock::service();
         // A backlight level asked for over HTTP.
         crate::backlight::service(ctx);
+        // GPS sentences that came since the last pass (nothing until a program powers it).
+        crate::gps::poll();
         // Config writes (touch calibration…): save once they settle.
         crate::flash::save_if_dirty(false);
         // Programs' written files and the EEPROM: once writes settle.

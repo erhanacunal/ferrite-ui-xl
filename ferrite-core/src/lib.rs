@@ -43,6 +43,7 @@ pub mod font;
 pub mod fs;
 pub mod geo;
 pub mod gesture;
+pub mod gps;
 pub mod heap;
 pub mod image;
 pub mod keyboard;

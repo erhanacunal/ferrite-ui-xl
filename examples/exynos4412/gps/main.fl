@@ -1,0 +1,115 @@
+// main.fl — GPS: the receiver's state, satellites, position and time (lib/gps.fl).
+//
+// The receiver is turned on at start; "Power" turns it off and on again. The
+// panel is read twice a second. After power-on the receiver needs from ~30 s
+// under open sky to minutes to find a position, and gets none indoors; the
+// time and the satellites in view often come before. On the sim, run with
+// FERRITE_SIM_GPS=41.0082,28.9784,40 for a fix.
+
+#include "core.fl"
+#include "color.fl"
+#include "gps.fl"
+
+// RGB565
+const BG        = 0x0862;
+const PANEL     = 0x10A4;
+const LINE      = 0x3A2D;
+const BTN       = 0x3A91;
+const BTN_PRESS = 0x641A;
+const DIM       = 0xA559;
+
+// A row: name on the left, value on the right.
+widget Name : Label(text_color: DIM, font_id: 0, size: [300, 48]);
+widget Value : Label(text_color: WHITE, font_id: 0, size: [700, 48]);
+// The power button.
+widget PanelButton : Button(clickable: 1, size: [260, 64], bg_color: BTN, press_color: BTN_PRESS,
+                            border_radius: 12);
+
+var power_btn;
+var power_lbl;
+var state_lbl;
+var sats_lbl;
+var pos_lbl;
+var alt_lbl;
+var speed_lbl;
+var time_lbl;
+var age_lbl;
+var powered = 1;
+
+fn show_power() {
+    power_lbl.text = powered ? "Power: on" : "Power: off";
+}
+
+fn on_power(wid) {
+    powered = 1 - powered;
+    gpsPower(powered);
+    show_power();
+}
+
+// "12.3" from tenths (decimetres, km/h x 10).
+fn tenths(v) -> string {
+    var a = v < 0 ? 0 - v : v;
+    return sprintf("%s%d.%d", v < 0 ? "-" : "", a / 10, a % 10);
+}
+
+fn refresh() {
+    strClear();
+    var state = gpsState();
+    state_lbl.text = gpsStateText(state);
+    state_lbl.text_color = state == GPS_FIX ? GREEN : (state == GPS_SEARCHING ? YELLOW : WHITE);
+    var hdop = gpsGet(GPS_HDOP);
+    sats_lbl.text = sprintf("%d used / %d in view, HDOP %s", gpsGet(GPS_SATS_USED), gpsGet(GPS_SATS_VIEW),
+                            hdop == 9999 ? "-" : sprintf("%d.%02d", hdop / 100, hdop % 100));
+    if (state == GPS_FIX) {
+        pos_lbl.text = gpsText(GPS_TEXT_POSITION);
+        alt_lbl.text = concat(tenths(gpsGet(GPS_ALT)), str(" m"));
+        speed_lbl.text = sprintf("%s km/h, course %d deg", tenths(gpsGet(GPS_SPEED)), gpsGet(GPS_COURSE) / 100);
+    } else {
+        pos_lbl.text = "-";
+        alt_lbl.text = "-";
+        speed_lbl.text = "-";
+    }
+    var t = gpsTime();
+    if (t > 0) {
+        var s = t % 86400;
+        time_lbl.text = sprintf("%02d:%02d:%02d UTC", s / 3600, s / 60 % 60, s % 60);
+    } else {
+        time_lbl.text = "-";
+    }
+    var age = gpsGet(GPS_FIX_AGE);
+    age_lbl.text = age < 0 ? "no position since power-on" : sprintf("%d ms ago", age);
+}
+
+fn setup() {
+    Box(parent: 0, size: [1280, 800], bg_color: BG, children: [
+        Label(text: "GPS", location: [60, 30], size: [600, 60], text_color: WHITE, font_id: 0),
+        power_btn = PanelButton(location: [960, 30], on_click: @on_power, children: [
+            power_lbl = Label(size: [260, 64], text_color: WHITE, text_align: ALIGN_CENTER, font_id: 0),
+        ]),
+        Box(location: [60, 120], size: [1160, 620], bg_color: PANEL, border: [2, 2, 2, 2],
+            border_color: LINE, border_radius: 12, children: [
+            Name(text: "State", location: [30, 30]),
+            state_lbl = Value(location: [330, 30]),
+            Name(text: "Satellites", location: [30, 100]),
+            sats_lbl = Value(location: [330, 100]),
+            Name(text: "Position", location: [30, 170]),
+            pos_lbl = Value(location: [330, 170]),
+            Name(text: "Altitude", location: [30, 240]),
+            alt_lbl = Value(location: [330, 240]),
+            Name(text: "Speed", location: [30, 310]),
+            speed_lbl = Value(location: [330, 310]),
+            Name(text: "Time", location: [30, 380]),
+            time_lbl = Value(location: [330, 380]),
+            Name(text: "Last position", location: [30, 450]),
+            age_lbl = Value(location: [330, 450]),
+        ]),
+    ]);
+    gpsPower(powered);
+    show_power();
+    refresh();
+}
+
+fn loop() {
+    refresh();
+    delay(500);
+}

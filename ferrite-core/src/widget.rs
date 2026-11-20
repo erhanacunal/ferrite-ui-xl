@@ -250,7 +250,8 @@ struct SecExtra {
     flex: u8,
     flex_gap: u8,
     flex_grow: u8,
-    _pad: [u8; 3],
+    grid_cols: u8,
+    _pad: [u8; 2],
 }
 
 const _: () = assert!(
@@ -371,7 +372,8 @@ impl Section for SecExtra {
         flex: 0,
         flex_gap: 0,
         flex_grow: 0,
-        _pad: [0; 3],
+        grid_cols: 0,
+        _pad: [0; 2],
     };
     fn read(e: &WidgetExt) -> Self {
         Self {
@@ -380,7 +382,8 @@ impl Section for SecExtra {
             flex: e.flex,
             flex_gap: e.flex_gap,
             flex_grow: e.flex_grow,
-            _pad: [0; 3],
+            grid_cols: e.grid_cols,
+            _pad: [0; 2],
         }
     }
     fn write(&self, e: &mut WidgetExt) {
@@ -389,6 +392,7 @@ impl Section for SecExtra {
         e.flex = self.flex;
         e.flex_gap = self.flex_gap;
         e.flex_grow = self.flex_grow;
+        e.grid_cols = self.grid_cols;
     }
 }
 
@@ -453,6 +457,7 @@ pub struct WidgetExt {
     pub flex: u8,      // lib/flex.fl container mode (0 = not a flex container)
     pub flex_gap: u8,  // lib/flex.fl gap between children, px
     pub flex_grow: u8, // lib/flex.fl grow factor of a child (0 = fixed size)
+    pub grid_cols: u8, // lib/flex.fl FLEX_GRID columns (0 = as many as fit)
 
     // Box model edges
     pub border: Edges,
@@ -491,6 +496,7 @@ impl WidgetExt {
         flex: 0,
         flex_gap: 0,
         flex_grow: 0,
+        grid_cols: 0,
         border: Edges::ZERO,
         padding: Edges::ZERO,
         text_color: 0xFFFF,

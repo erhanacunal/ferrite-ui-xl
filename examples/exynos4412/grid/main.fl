@@ -1,0 +1,105 @@
+// main.fl — GridView: a scrolling grid of tiles (lib/flex.fl FLEX_GRID).
+//
+// The grid places its children itself (FLEX_AUTO): in rows of grid_cols equal
+// cells, each row as tall as its tallest tile. "Columns" cycles grid_cols and
+// "Align" switches between stretched tiles (JUSTIFY_STRETCH) and tiles of
+// their own width centred in their cells; the grid lays itself out again.
+// Drag or fling the grid to scroll it.
+
+#include "core.fl"
+#include "color.fl"
+#include "flex.fl"
+#include "gesture.fl"
+
+const TILES = 60;
+
+// RGB565
+const BG         = 0x0862;
+const GRID_BG    = 0x10A4;
+const GRID_LINE  = 0x3A2D;
+const BTN        = 0x3A91;
+const BTN_PRESS  = 0x641A;
+const TILE_PRESS = 0xCE5C;
+const INFO       = 0xA559;
+
+// White centred text.
+widget Caption : Label(text_color: WHITE, text_align: ALIGN_CENTER, font_id: 0);
+// A tile: its number centred (a nested flex row; the grid sets its width).
+widget Tile : Button(clickable: 1, press_color: TILE_PRESS, border_radius: 10,
+                     flex: FLEX_ROW | JUSTIFY_STRETCH | ITEMS_CENTER | FLEX_AUTO);
+// The buttons on the right.
+widget PanelButton : Button(clickable: 1, size: [260, 64], bg_color: BTN, press_color: BTN_PRESS,
+                            border_radius: 12);
+
+var grid;
+var cols_btn;
+var align_btn;
+var cols_lbl;
+var align_lbl;
+var info;
+var cols = 4;
+var stretch = 1;
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+// A tile's tap (onGesture: works for any widget, not only global ones).
+fn on_tile(wid: widget, ev) {
+    if (ev != GE_TAP) {
+        return;
+    }
+    strClear();
+    info.text = concat(concat(str("Tile "), itos(wid.value)), str(" tapped"));
+}
+
+fn show_cols() {
+    strClear();
+    cols_lbl.text = concat(str("Columns: "), itos(cols));
+}
+
+fn on_cols(wid) {
+    cols = cols % 6 + 1;
+    grid.grid_cols = cols;
+    show_cols();
+}
+
+fn on_align(wid) {
+    stretch = 1 - stretch;
+    if (stretch) {
+        grid.flex = FLEX_GRID | JUSTIFY_STRETCH | FLEX_AUTO;
+        align_lbl.text = "Align: stretch";
+    } else {
+        grid.flex = FLEX_GRID | JUSTIFY_CENTER | ITEMS_CENTER | FLEX_AUTO;
+        align_lbl.text = "Align: centre";
+    }
+}
+
+fn setup() {
+    Box(parent: 0, size: [1280, 800], bg_color: BG, children: [
+        Caption(text: "GridView: 60 tiles in a scrolling grid", location: [0, 20], size: [1280, 40]),
+        grid = GridView(location: [40, 80], size: [900, 690], grid_cols: cols, flex_gap: 12,
+                        padding: [12, 12, 12, 12], bg_color: GRID_BG,
+                        border: [2, 2, 2, 2], border_color: GRID_LINE, border_radius: 12),
+        cols_btn = PanelButton(location: [980, 80], on_click: @on_cols, children: [
+            cols_lbl = Caption(size: [260, 64]),
+        ]),
+        align_btn = PanelButton(location: [980, 164], on_click: @on_align, children: [
+            align_lbl = Caption(text: "Align: stretch", size: [260, 64]),
+        ]),
+        info = Label(text: "Tap a tile", location: [980, 260], size: [260, 40],
+                     text_color: INFO, font_id: 0),
+    ]);
+    show_cols();
+
+    for (var i = 0; i < TILES; i++) {
+        var t = Tile(parent: grid, size: [120, 90 + (i % 3) * 25], value: i + 1,
+                     bg_color: rgb565(40 + (i % 5) * 30, 60 + (i % 7) * 15, 140 - (i % 4) * 20),
+                     children: [Caption(text: itos(i + 1), size: [0, 30])]);
+        onGesture(t, GESTURE_TAP, @on_tile);
+    }
+}
+
+fn loop() {
+    delay(100);
+}

@@ -451,6 +451,7 @@ fn same_ext(a: &WidgetExt, b: &WidgetExt) -> bool {
         && a.flex == b.flex
         && a.flex_gap == b.flex_gap
         && a.flex_grow == b.flex_grow
+        && a.grid_cols == b.grid_cols
         && a.border == b.border
         && a.padding == b.padding
         && a.text_color == b.text_color

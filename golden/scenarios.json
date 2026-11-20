@@ -6,6 +6,7 @@
     "tablet_clock":     { "example": "tablet",     "taps": [[340, 468, 2000]], "dump": [3500, 4500] },
     "tablet_calc":      { "example": "tablet",     "taps": [[540, 468, 2000]], "dump": [3000] },
     "tablet_paint":     { "example": "tablet",     "taps": [[740, 468, 2000]], "dump": [3000] },
+    "tablet_drawer":    { "example": "tablet",     "swipes": [[640, 650, 640, 250, 1000, 250]], "taps": [[334, 200, 3000]], "dump": [2200, 3200, 4500] },
     "tablet_monitor":   { "example": "tablet",     "taps": [[940, 468, 2000]], "dump": [3000, 4000] },
     "scroll":           { "example": "scroll",     "swipes": [[400, 500, 400, 200, 2000, 300], [1000, 500, 1000, 250, 4000, 300]], "dump": [1500, 3000, 5500] },
     "paint":            { "example": "paint",      "taps": [[160, 748, 2000]], "dump": [1500, 2500, 3500] },
@@ -13,6 +14,7 @@
     "multitask":        { "example": "multitask",  "taps": [[640, 700, 2000]], "dump": [1500, 3000] },
     "launcher":         { "example": "launcher",   "taps": [[188, 400, 2000]], "dump": [1500, 3000] },
     "audio_demo":       { "example": "audio_demo", "taps": [[168, 232, 2000]], "dump": [1500, 2500] },
-    "model3d":          { "example": "model3d",    "taps": [[1152, 60, 2000]], "dump": [1500, 3000] }
+    "model3d":          { "example": "model3d",    "taps": [[1152, 60, 2000]], "dump": [1500, 3000] },
+    "grid":             { "example": "grid",       "swipes": [[500, 600, 500, 250, 2000, 300]], "taps": [[1110, 112, 4000], [1110, 196, 5500], [300, 400, 7000]], "dump": [1500, 3500, 5000, 6500, 7500] }
   }
 }

@@ -2,11 +2,11 @@
 //
 // - Two pages (swipe left/right): a glance clock + live performance card
 //   with four apps, and an "about" card with live system figures.
-// - The dock holds four more apps; swipe up for the app drawer (all eight,
-//   and below them up to four installed app packages, ferrite-ui-xl
-//   docs/apps.md: a tap starts one beside the tablet with startApp; the
-//   home gesture, a swipe up from the bottom edge, comes back here while it
-//   keeps running).
+// - The dock holds four more apps; swipe up for the app drawer: a scrolling
+//   grid (lib/flex.fl GridView) of all eight and every installed app package
+//   (ferrite-ui-xl docs/apps.md: a tap starts one beside the tablet with
+//   startApp; the home gesture, a swipe up from the bottom edge, comes back
+//   here while it keeps running).
 // - Swipe down for the shade: brightness and volume sliders (real backlight
 //   and codec volume), quick tiles and a notification.
 // - Tapping an app grows its colour from the icon to the full screen, then
@@ -17,6 +17,7 @@
 #include "ui.fl"
 #include "gesture.fl"
 #include "apps.fl"
+#include "flex.fl"
 
 #hint_widgets 140 140
 
@@ -28,29 +29,37 @@ const ROW_Y    = 430;   // centre of the page-0 app row
 const SHADE_H  = 480;
 const HIST     = 48;    // performance graph samples
 
-// --- Hit table: every app icon (home, dock, drawer) ---
+// --- Hit table: the home and dock app icons ---
 var hit_w[20];
 var hit_app[20];
 var hit_x[20];      // centre, in its container
 var hit_y[20];
-var hit_where[20];  // 0 page 0, 1 page 1, 2 dock, 3 drawer
+var hit_where[20];  // 0 page 0, 1 page 1, 2 dock
 var hits = 0;
 
 // Clickable widgets need one file-scope variable each (on_click wiring).
 var ic0; var ic1; var ic2; var ic3;           // page 0
 var dk0; var dk1; var dk2; var dk3;           // dock
-var dr0; var dr1; var dr2; var dr3; var dr4; var dr5; var dr6; var dr7;  // drawer
 var bright_sl; var vol_sl;
 var tile_perf; var tile_wall; var tile_chime; var tile_restart;
 var scrim;
 var drawer_handle;
 var notif;
-// Installed app packages in the drawer (one clickable variable each).
-const PKG_MAX = 4;
-const PKG_Y   = 600;    // centre of their row in the drawer
-const PKG_COLOR = 0x4A69;
-var pk0; var pk1; var pk2; var pk3;
+// The drawer's grid: one tile per app, its circle's value = the app
+// (APP_*), or PKG_BASE + i for installed package i.
+const DRAWER_COLS = 6;
+const TILE_W      = 190;
+const TILE_H      = 168;
+const PKG_BASE    = 100;
+const PKG_COLOR   = 0x4A69;
+var drawer_grid;
 var pkg_status;
+
+// A drawer tile: a transparent box holding the circle and the name under it.
+widget DrawerTile : Label(size: [190, 168]);
+widget DrawerIcon : Button(location: [43, 8], size: [104, 104], border_radius: 52, clickable: 1);
+widget DrawerName : Label(location: [0, 122], size: [190, 32], font_id: F20, text_color: WHITE,
+                          text_align: ALIGN_CENTER);
 
 var pager;
 var pager_drag = 0;      // a finger is dragging the pager
@@ -207,100 +216,88 @@ fn build_dock() {
 // pixels, which the renderer then moves instead of redrawing them (only the
 // strip coming into view is drawn). A translucent one would show the
 // wallpaper moving with it, so it is redrawn whole every frame.
+//
+// Its apps are a GridView: DRAWER_COLS centred tiles a row, scrolling once
+// there are more rows than fit. A drag that scrolls it is no swipe, so it
+// doesn't close the drawer (the handle and a swipe down elsewhere do).
 fn build_drawer() {
-    drawer = alloc();
-    style_box(0, SCREEN_H, SCREEN_W, SCREEN_H - STATUS_H, APP_BG, 32);
-    parent(0);
     // Layer 2: it slides over the pager (layer 1), which keeps its window
     // (a plain widget over it would hand the pager back to the tree).
-    set(layer, 2);
-    drawer_handle = alloc();
-    target(drawer_handle);
-    set(kind, KIND_LABEL);
-    set(location, 440, 0);
-    set(size, 400, 44);
-    set(clickable, ON);
-    set(on_click, @on_drawer_handle);
-    parent(drawer);
-    var bar = alloc();
-    style_box(160, 18, 80, 6, DIM, 3);
-    parent(drawer_handle);
-    var t = alloc();
-    style_label(80, 44, 600, 50, F26, WHITE, ALIGN_LEFT, "All apps");
-    parent(drawer);
-    dr0 = alloc(); make_icon(dr0, drawer, 1, 280, 220, ICON_D, 1, 3); target(dr0); set(on_click, @on_icon);
-    dr1 = alloc(); make_icon(dr1, drawer, 2, 520, 220, ICON_D, 1, 3); target(dr1); set(on_click, @on_icon);
-    dr2 = alloc(); make_icon(dr2, drawer, 3, 760, 220, ICON_D, 1, 3); target(dr2); set(on_click, @on_icon);
-    dr3 = alloc(); make_icon(dr3, drawer, 4, 1000, 220, ICON_D, 1, 3); target(dr3); set(on_click, @on_icon);
-    dr4 = alloc(); make_icon(dr4, drawer, 5, 280, 420, ICON_D, 1, 3); target(dr4); set(on_click, @on_icon);
-    dr5 = alloc(); make_icon(dr5, drawer, 6, 520, 420, ICON_D, 1, 3); target(dr5); set(on_click, @on_icon);
-    dr6 = alloc(); make_icon(dr6, drawer, 7, 760, 420, ICON_D, 1, 3); target(dr6); set(on_click, @on_icon);
-    dr7 = alloc(); make_icon(dr7, drawer, 8, 1000, 420, ICON_D, 1, 3); target(dr7); set(on_click, @on_icon);
-    build_packages();
-}
-
-// The installed packages' row (appCount / appName): none installed, or no
-// app storage, leaves a hint instead.
-fn build_packages() {
-    var t = alloc();
-    style_label(80, 500, 600, 40, F20, DIM, ALIGN_LEFT, "Installed");
-    parent(drawer);
-    pkg_status = alloc();
-    style_label(240, 500, 900, 40, F20, DIM, ALIGN_LEFT, "");
-    parent(drawer);
+    drawer = Box(parent: 0, location: [0, SCREEN_H], size: [SCREEN_W, SCREEN_H - STATUS_H],
+                 bg_color: APP_BG, border_radius: 32, layer: 2, children: [
+        drawer_handle = Label(location: [440, 0], size: [400, 44], clickable: 1,
+                              on_click: @on_drawer_handle, children: [
+            Box(location: [160, 18], size: [80, 6], bg_color: DIM, border_radius: 3),
+        ]),
+        Label(text: "All apps", location: [80, 44], size: [600, 50], font_id: F26,
+              text_color: WHITE, text_align: ALIGN_LEFT),
+        pkg_status = Label(location: [600, 44], size: [600, 50], font_id: F20,
+                           text_color: DIM, text_align: ALIGN_RIGHT),
+        drawer_grid = GridView(location: [40, 100], size: [SCREEN_W - 80, SCREEN_H - STATUS_H - 116],
+                               grid_cols: DRAWER_COLS, flex: FLEX_GRID | JUSTIFY_CENTER | FLEX_AUTO,
+                               flex_gap: 8, bg_color: APP_BG),
+    ]);
+    for (var app = APP_CLOCK; app <= APP_SETTINGS; app++) {
+        add_drawer_tile(app, app_color(app));
+    }
+    // The installed packages (appCount / appName): none installed, or no
+    // app storage, leaves a hint instead.
     var n = appCount();
     if (n == 0) {
-        target(pkg_status);
-        set(text, "none: ferrite_cli app install PACKAGE.bin");
+        pkg_status.text = "No packages: ferrite_cli app install PACKAGE.bin";
     }
-    if (n > 0) { pk0 = alloc(); make_package(pk0, 0); target(pk0); set(on_click, @on_package); }
-    if (n > 1) { pk1 = alloc(); make_package(pk1, 1); target(pk1); set(on_click, @on_package); }
-    if (n > 2) { pk2 = alloc(); make_package(pk2, 2); target(pk2); set(on_click, @on_package); }
-    if (n > 3) { pk3 = alloc(); make_package(pk3, 3); target(pk3); set(on_click, @on_package); }
-    if (n > PKG_MAX) {
-        target(pkg_status);
-        set(text, sprintf("(%d more not shown)", n - PKG_MAX));
+    for (var i = 0; i < n; i++) {
+        add_drawer_tile(PKG_BASE + i, PKG_COLOR);
     }
 }
 
-// Package `slot`'s icon: a circle with a plain glyph, its name under it.
-fn make_package(b: widget, slot) {
-    var cx = 280 + slot * 240;
-    target(b);
-    style_button(cx - ICON_D / 2, PKG_Y - ICON_D / 2, ICON_D, ICON_D, PKG_COLOR, ICON_D / 2);
-    parent(drawer);
-    var g = alloc();
-    style_box(32, 32, 40, 40, WHITE, 10);
-    parent(b);
-    var l = alloc();
-    style_label(cx - 110, PKG_Y + ICON_D / 2 + 6, 220, 32, F20, WHITE, ALIGN_CENTER, appName(slot));
-    parent(drawer);
+// The drawer tile for `v` (an APP_* or PKG_BASE + package index).
+fn add_drawer_tile(v, color) {
+    var name = v >= PKG_BASE ? appName(v - PKG_BASE) : app_title(v);
+    var b;
+    DrawerTile(parent: drawer_grid, children: [
+        b = DrawerIcon(value: v, bg_color: color, press_color: lighten(color)),
+        DrawerName(text: name),
+    ]);
+    if (v >= PKG_BASE) {
+        // A package's plain glyph.
+        Box(parent: b, location: [32, 32], size: [40, 40], bg_color: WHITE, border_radius: 10);
+    } else {
+        Image(parent: b, size: [ICON_D, ICON_D], image_id: app_glyph(v));
+    }
+    onGesture(b, GESTURE_TAP, @on_drawer_tap);
+    strClear();
 }
 
-// A package tapped: it starts beside the tablet (or shows, if it runs).
-fn on_package(w) {
-    if (launching) {
+// A drawer circle tapped: an app grows from where its circle is on the
+// screen (the grid may be scrolled); a package starts beside the tablet.
+fn on_drawer_tap(w: widget, ev) {
+    if (ev != GE_TAP || launching) {
         return 0;
     }
-    var slot = -1;
-    if (w == pk0) { slot = 0; }
-    if (w == pk1) { slot = 1; }
-    if (w == pk2) { slot = 2; }
-    if (w == pk3) { slot = 3; }
-    if (slot < 0) {
+    var v = w.value;
+    if (v >= PKG_BASE) {
+        start_package(v - PKG_BASE);
         return 0;
     }
+    launching = 1;
+    launch_app = v;
+    playSound("click");
+    grow(gestureInfo(GI_X) - gestureInfo(GI_LOCAL_X) + ICON_D / 2,
+         gestureInfo(GI_Y) - gestureInfo(GI_LOCAL_Y) + ICON_D / 2, v);
+}
+
+// Package `slot` started (or shown, if it runs).
+fn start_package(slot) {
     playSound("click");
     var t = startApp(appId(slot));
-    target(pkg_status);
     if (t < 0) {
-        set(text, t == -2 ? "four apps already run" : sprintf("could not start it (%d)", t));
+        pkg_status.text = t == -2 ? "four apps already run" : sprintf("could not start it (%d)", t);
     } else {
-        set(text, "");
+        pkg_status.text = "";
         // Back from it (home gesture) to the home screen, not the drawer.
         open_drawer(0);
     }
-    dirty();
     strClear();
 }
 
@@ -615,15 +612,12 @@ fn hit_screen_x(i) {
 
 fn hit_screen_y(i) {
     var where = hit_where[i];
-    if (where == 0) { return STATUS_H + hit_y[i]; }
     if (where == 2) { return DOCK_Y - 4 + hit_y[i]; }
-    if (where == 3) { return STATUS_H + hit_y[i]; }
-    return hit_y[i];
+    return STATUS_H + hit_y[i];
 }
 
-fn grow(i, app) {
-    var x = hit_screen_x(i);
-    var y = hit_screen_y(i);
+// The launch colour grows from an icon centred at (x, y) on the screen.
+fn grow(x, y, app) {
     target(launch);
     set(location, x - ICON_D / 2, y - ICON_D / 2);
     set(size, ICON_D, ICON_D);
@@ -652,7 +646,7 @@ fn on_icon(w) {
             launching = 1;
             launch_app = hit_app[i];
             playSound("click");
-            grow(i, launch_app);
+            grow(hit_screen_x(i), hit_screen_y(i), launch_app);
         }
     }
 }
@@ -662,7 +656,7 @@ fn shrink(app) {
     var x = SCREEN_W / 2;
     var y = SCREEN_H / 2;
     for (var i = 0; i < hits; i++) {
-        if (hit_app[i] == app && hit_where[i] != 3) {
+        if (hit_app[i] == app) {
             if (hit_where[i] == 2 || hit_where[i] == ui_page) {
                 x = hit_screen_x(i);
                 y = hit_screen_y(i);

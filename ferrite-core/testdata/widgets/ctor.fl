@@ -4,7 +4,7 @@
 #include "core.fl"
 #include "flex.fl"
 
-var r[20];
+var r[30];
 var root;
 var title;
 var ok;
@@ -21,6 +21,10 @@ fn on_ok(w) {
 // A component: returns the widget it built.
 fn card(t) -> widget {
     return Box(size: [100, 50], children: [Label(text: t)]);
+}
+
+fn twice(v) -> int {
+    return v * 2;
 }
 
 fn count(w: widget) -> int {
@@ -86,6 +90,38 @@ fn setup() {
     r[16] = get(flex);                  // 98: FLEX_COLUMN | ITEMS_STRETCH
     flexLayout(root);
     r[17] = title.width;                // 400: stretched
+
+    // Values of every kind (with superops one W_SETALL per run): constants
+    // inline, variables and arithmetic popped, a call (twice) in between as a
+    // plain write. A grid of three cells (lib/flex.fl FLEX_GRID).
+    var px = 7;
+    var g = GridView(parent: root, grid_cols: 2, location: [px, px * 2], size: [210 + px, 100],
+                     flex_gap: px - 7, bg_color: twice(px), text_color: px + 1, children: [
+        Box(size: [0, 20]),
+        Box(size: [0, 30]),
+        Box(size: [0, px]),
+    ]);
+    flexLayout(g);
+    target(g);
+    r[20] = get(loc_x);                 // 7
+    r[21] = get(loc_y);                 // 14
+    r[22] = get(size_w);                // 217
+    r[23] = get(bg_color);              // 14
+    r[24] = get(text_color);            // 8
+    r[25] = get(grid_cols);             // 2
+    var g1: widget = get(first_child);
+    target(g1);
+    r[28] = get(size_w);                // 103: (217 - 10 scrollbar) / 2
+    var g2: widget = get(next_sibling);
+    target(g2);
+    r[26] = get(loc_x);                 // 103
+    var g3: widget = get(next_sibling);
+    target(g3);
+    r[27] = get(loc_y);                 // 30: below the first row (its tallest is 30)
+    // A value read from another widget: the write still lands on `title`.
+    title.bg_color = ok.bg_color;
+    target(title);
+    r[29] = get(bg_color);              // 31: ok's (Primary's)
     r[0] = 17;
 }
 

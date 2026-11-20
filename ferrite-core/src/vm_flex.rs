@@ -14,8 +14,8 @@ use super::{Platform, Vm};
 use crate::ctx::Ctx;
 use crate::pool::ObjPtr;
 use crate::proto::{
-    PROP_BORDER_B, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T, PROP_FIRST_CHILD, PROP_FLEX,
-    PROP_FLEX_GAP, PROP_FLEX_GROW, PROP_LOC_X, PROP_LOC_Y, PROP_NEXT_SIBLING, PROP_PADDING_B,
+    PROP_BORDER_B, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T, PROP_CLIP_CHILDREN, PROP_FIRST_CHILD,
+    PROP_FLEX, PROP_FLEX_GAP, PROP_FLEX_GROW, PROP_GRID_COLS, PROP_LOC_X, PROP_LOC_Y, PROP_NEXT_SIBLING, PROP_PADDING_B,
     PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T, PROP_SIZE_H, PROP_SIZE_W, PROP_VISIBLE,
 };
 use crate::widget::WidgetId;
@@ -23,6 +23,7 @@ use crate::widget::WidgetId;
 // lib/flex.fl constants.
 const FLEX_ROW: i32 = 1;
 const FLEX_COLUMN: i32 = 2;
+const FLEX_GRID: i32 = 3;
 const JUSTIFY_CENTER: i32 = 4;
 const JUSTIFY_END: i32 = 8;
 const JUSTIFY_SPACE_BETWEEN: i32 = 12;
@@ -30,6 +31,8 @@ const JUSTIFY_STRETCH: i32 = 16;
 const ITEMS_CENTER: i32 = 32;
 const ITEMS_END: i32 = 64;
 const ITEMS_STRETCH: i32 = 96;
+const GRID_SCROLLBAR_W: i32 = 10;
+const _: () = assert!(GRID_SCROLLBAR_W == crate::render::SCROLLBAR_W as i32);
 
 /// VM `OP_DIV` / `OP_MOD`: wrapping, 0 for a zero divisor.
 #[inline]
@@ -121,6 +124,10 @@ fn layout<P: Platform>(ctx: &mut Ctx<P>, l: &mut Cursor, bx: i32) {
         .wrapping_sub(l.get(ctx, PROP_BORDER_B))
         .wrapping_sub(l.get(ctx, PROP_PADDING_T))
         .wrapping_sub(l.get(ctx, PROP_PADDING_B));
+    if dir == FLEX_GRID {
+        grid(ctx, l, bx, cw, gap, justify, items);
+        return;
+    }
     let (main_len, cross_len) = if dir == FLEX_COLUMN { (ch, cw) } else { (cw, ch) };
 
     // Pass 1: count visible children, sum their main sizes and grow factors.
@@ -241,6 +248,92 @@ fn layout<P: Platform>(ctx: &mut Ctx<P>, l: &mut Cursor, bx: i32) {
     }
 }
 
+/// lib/flex.fl `gridPlace` (FLEX_GRID), the target at `bx`; then the flex
+/// containers among the children, as `layout` does.
+fn grid<P: Platform>(ctx: &mut Ctx<P>, l: &mut Cursor, bx: i32, mut cw: i32, gap: i32, justify: i32, items: i32) {
+    if l.get(ctx, PROP_CLIP_CHILDREN) != 0 {
+        cw = cw.wrapping_sub(GRID_SCROLLBAR_W);
+    }
+    let mut cols = l.get(ctx, PROP_GRID_COLS);
+    if cols < 1 {
+        cols = 1;
+    }
+    let mut avail = cw.wrapping_sub(gap.wrapping_mul(cols.wrapping_sub(1)));
+    if avail < 0 {
+        avail = 0;
+    }
+    let mut col = 0i32;
+    let mut y = 0i32;
+    let mut row_h = 0i32;
+    let mut c = l.get(ctx, PROP_FIRST_CHILD);
+    while c >= 0 {
+        l.target(c);
+        if l.get(ctx, PROP_VISIBLE) != 0 {
+            if col == 0 {
+                // Row height: the tallest of the row's children.
+                row_h = 0;
+                let mut scan = c;
+                let mut seen = 0i32;
+                while scan >= 0 && seen < cols {
+                    l.target(scan);
+                    if l.get(ctx, PROP_VISIBLE) != 0 {
+                        let h = l.get(ctx, PROP_SIZE_H);
+                        if h > row_h {
+                            row_h = h;
+                        }
+                        seen = seen.wrapping_add(1);
+                    }
+                    scan = l.get(ctx, PROP_NEXT_SIBLING);
+                }
+                l.target(c);
+            }
+            let mut cell_x = div(avail.wrapping_mul(col), cols);
+            let cell_w = div(avail.wrapping_mul(col.wrapping_add(1)), cols).wrapping_sub(cell_x);
+            cell_x = cell_x.wrapping_add(gap.wrapping_mul(col));
+            let mut w = l.get(ctx, PROP_SIZE_W);
+            let mut h = l.get(ctx, PROP_SIZE_H);
+            let mut x = cell_x;
+            let mut iy = y;
+            if justify == JUSTIFY_STRETCH {
+                w = cell_w;
+            } else if justify == JUSTIFY_CENTER {
+                x = cell_x.wrapping_add(div(cell_w.wrapping_sub(w), 2));
+            } else if justify == JUSTIFY_END {
+                x = cell_x.wrapping_add(cell_w).wrapping_sub(w);
+            }
+            if items == ITEMS_STRETCH {
+                h = row_h;
+            } else if items == ITEMS_CENTER {
+                iy = y.wrapping_add(div(row_h.wrapping_sub(h), 2));
+            } else if items == ITEMS_END {
+                iy = y.wrapping_add(row_h).wrapping_sub(h);
+            }
+            l.set(ctx, PROP_LOC_X, x);
+            l.set(ctx, PROP_LOC_Y, iy);
+            l.set(ctx, PROP_SIZE_W, w);
+            l.set(ctx, PROP_SIZE_H, h);
+            col = col.wrapping_add(1);
+            if col == cols {
+                col = 0;
+                y = y.wrapping_add(row_h).wrapping_add(gap);
+            }
+
+            // Nested container: its size is final now.
+            if l.get(ctx, PROP_FLEX) & 3 != 0 {
+                layout(ctx, l, c);
+                l.target(c);
+            }
+        }
+        c = l.get(ctx, PROP_NEXT_SIBLING);
+    }
+
+    // Children moved: repaint the container so their old spots are cleared.
+    l.target(bx);
+    if l.t.is_some() {
+        ctx.objs.mark_dirty(l.t);
+    }
+}
+
 // --- Automatic layout (FLEX_AUTO) ---
 //
 // A container whose flex mode has `FLEX_AUTO` is laid out by the firmware
@@ -300,6 +393,8 @@ impl ObjPool {
                 | PROP_PADDING
                 | PROP_FLEX
                 | PROP_FLEX_GAP
+                | PROP_GRID_COLS
+                | PROP_CLIP_CHILDREN
         ) {
             self.flex_mark(id);
         }

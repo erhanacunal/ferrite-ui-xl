@@ -8,7 +8,7 @@ use crate::proto::{
     PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_RADIUS, PROP_BORDER_T, PROP_CHECKED, PROP_CLICKABLE,
     PROP_CLIP_CHILDREN, PROP_CURSOR_POS, PROP_ENABLED, PROP_FIRST_CHILD, PROP_FLEX,
     PROP_FLEX_GAP, PROP_FLEX_GROW, PROP_FONT_ID, PROP_GRADIENT_COLOR,
-    PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_GROUP_ID,
+    PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_GRID_COLS, PROP_GROUP_ID,
     PROP_IMAGE_ID, PROP_KIND, PROP_LOC_X, PROP_LOC_Y, PROP_LOCATION, PROP_MAX_LENGTH,
     PROP_MULTI_LINE, PROP_RICH_TEXT, PROP_NEXT_SIBLING, PROP_ON_CHANGE, PROP_ON_CLICK, PROP_PARENT,
     PROP_ON_PAINT, PROP_ON_TAP, PROP_PADDING, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R,
@@ -336,6 +336,12 @@ const OP_STORE_OP: u8 = 0x4D; // + u8 op + u8 slot: pop b; var = var <op> b
 const OP_FRAME_A: u8 = 0x4E; // + u8 local_count + u8 nargs: FRAME, then pop the args into locals nargs-1..0
 const OP_CALL_IMP: u8 = 0x4F; // + u16 import: call an imported library function (vm/units.rs)
 const OP_FN_REF: u8 = 0x50; // + u16 func_id: push it tagged with the running unit
+// Widget build: varint length + fields, each a varint key (prop << 3 | wire
+// type) and its value: WT_VARINT zigzag varint, WT_LEN varint length +
+// payload (as W_SET_LEN's), WT_STACK popped (the compiler pushes those values
+// in reverse field order). Each field does what its W_SET / W_SET_LEN would,
+// in field order, on the target.
+const OP_W_SETALL: u8 = 0x51;
 
 /// The integer binary ops (and comparisons, as 0/1) by opcode, as the plain
 /// opcodes compute them. None = not a binary op.
@@ -2327,6 +2333,7 @@ impl Vm {
                 let off = self.read_u16();
                 self.load_page_block(ctx, off as u32);
             }
+            OP_W_SETALL => self.w_setall(ctx),
             OP_W_SET_LEN => {
                 let prop_id = self.read_u8();
                 let len = self.read_u8() as usize;
@@ -3339,6 +3346,89 @@ impl Vm {
         }
     }
 
+    /// OP_W_SETALL: the fields after the varint length, in order.
+    #[inline(never)]
+    fn w_setall<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
+        // Length: an unsigned varint of at most 5 bytes.
+        let mut len = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = self.read_u8();
+            if self.state == VmState::Error {
+                return;
+            }
+            len |= ((b & 0x7F) as usize) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 35 {
+                return self.fail(fault::BAD_OPERAND);
+            }
+        }
+        let start = self.pc as usize;
+        let end = start + len;
+        if end > self.code.len() {
+            return self.fail(fault::CODE_OOB);
+        }
+        // The fields are copied out: each write needs `&mut self`.
+        let mut small = [0u8; 64];
+        let mut big = Vec::new();
+        let buf: &mut [u8] = if len <= small.len() {
+            &mut small[..len]
+        } else if big.try_reserve_exact(len).is_ok() {
+            big.resize(len, 0);
+            &mut big
+        } else {
+            return self.fail(fault::STR_ALLOC);
+        };
+        self.code.read_bytes(start, buf);
+        self.pc = end as CodeAddr;
+        self.run_setall(ctx, buf);
+    }
+
+    /// W_SETALL fields (`buf` = what follows the length).
+    fn run_setall<P: Platform>(&mut self, ctx: &mut Ctx<P>, buf: &[u8]) {
+        let mut i = 0;
+        while i < buf.len() && self.state != VmState::Error {
+            let Some((key, n)) = proto::decode_varint(buf, i) else {
+                return self.fail(fault::CODE_OOB);
+            };
+            i += n;
+            let Ok(prop) = u8::try_from(key >> 3) else {
+                return self.fail(fault::BAD_OPERAND);
+            };
+            match (key & 7) as u8 {
+                proto::WT_VARINT => {
+                    let Some((val, n)) = proto::decode_signed_varint(buf, i) else {
+                        return self.fail(fault::CODE_OOB);
+                    };
+                    i += n;
+                    self.w_set(ctx, prop, val);
+                }
+                proto::WT_STACK => {
+                    let val = self.pop();
+                    if self.state == VmState::Error {
+                        return;
+                    }
+                    self.w_set(ctx, prop, val);
+                }
+                proto::WT_LEN => {
+                    let Some((len, n)) = proto::decode_varint(buf, i) else {
+                        return self.fail(fault::CODE_OOB);
+                    };
+                    i += n;
+                    let Some(data) = buf.get(i..i + len as usize) else {
+                        return self.fail(fault::CODE_OOB);
+                    };
+                    i += len as usize;
+                    self.w_set_len(ctx, prop, data);
+                }
+                _ => return self.fail(fault::BAD_OPERAND),
+            }
+        }
+    }
+
     /// OP_W_LOAD: run one block of the widget page — a run of static widget
     /// setup statements the compiler moved out of the bytecode. Block at
     /// `off`: u16 LE length + ops (see `PG_*`). Each op does exactly what its
@@ -3561,6 +3651,7 @@ impl Vm {
                 PROP_FLEX => ext.flex = val as u8,
                 PROP_FLEX_GAP => ext.flex_gap = val as u8,
                 PROP_FLEX_GROW => ext.flex_grow = val as u8,
+                PROP_GRID_COLS => ext.grid_cols = val as u8,
                 // KIND_GRAPH props share storage with value/max_length/image_id;
                 // safe because a single widget kind is exclusive.
                 PROP_GRAPH_ARR => ext.value = val as WValue,
@@ -3673,6 +3764,7 @@ impl Vm {
             PROP_FLEX => e.flex as i32,
             PROP_FLEX_GAP => e.flex_gap as i32,
             PROP_FLEX_GROW => e.flex_grow as i32,
+            PROP_GRID_COLS => e.grid_cols as i32,
             PROP_GRAPH_ARR => e.value as i32,
             PROP_GRAPH_COUNT => e.max_length as i32,
             PROP_GRAPH_FLAGS => e.image_id as i32,
@@ -6014,6 +6106,93 @@ mod anim_tests {
         vm.tick(&mut ctx, 8);
         assert_eq!(vm.fault(), fault::NONE);
         assert_eq!(ctx.objs.str_get(ctx.objs.text_id(w)), text);
+    }
+
+    fn svarint(v: i32) -> Vec<u8> {
+        let mut b = [0u8; 5];
+        let n = proto::encode_signed_varint(&mut b, 0, v);
+        b[..n].to_vec()
+    }
+
+    fn uvarint(v: u32) -> Vec<u8> {
+        let mut b = [0u8; 5];
+        let n = proto::encode_varint(&mut b, 0, v);
+        b[..n].to_vec()
+    }
+
+    /// A W_SETALL field: key varint + value bytes.
+    fn field(prop: u8, wt: u8, value: &[u8]) -> Vec<u8> {
+        let mut f = uvarint(u32::from(prop) << 3 | u32::from(wt));
+        f.extend_from_slice(value);
+        f
+    }
+
+    /// Runs `code` on a fresh pool (root + widget 1); widget 1 afterwards.
+    fn run_on_widget(code: &[u8]) -> (Vm, (i16, i16, u16, u16, u16, Vec<u8>, u8)) {
+        let mut ctx = mock_ctx();
+        ctx.objs.root = ctx.objs.alloc_widget().unwrap();
+        let w = ctx.objs.alloc_widget().unwrap();
+        let mut vm = cb_vm(code);
+        vm.tick(&mut ctx, 64);
+        let x = *ctx.objs.get(w);
+        let text = ctx.objs.str_get(ctx.objs.text_id(w)).to_vec();
+        let state = (x.location.x, x.location.y, x.size.w, x.size.h, x.background_color, text, ctx.objs.ext(w).flex_gap);
+        (vm, state)
+    }
+
+    #[test]
+    fn w_setall_matches_plain_sets() {
+        let text = b"A text longer than the 64-byte buffer W_SETALL copies its fields to, \n                     and long enough for a two-byte length varint in front of them.";
+        let mut size = svarint(300);
+        size.extend(svarint(140));
+        // Plain: bg (from a variable), loc_x, size, loc_y (computed), text, flex_gap.
+        let mut plain = alloc::vec![OP_W_TARGET, 1, OP_PUSH_I16, 0x34, 0x12, OP_W_SET, PROP_BG_COLOR,
+                                    OP_PUSH_I8, (-10i8) as u8, OP_W_SET, PROP_LOC_X,
+                                    OP_W_SET_LEN, PROP_SIZE, size.len() as u8];
+        plain.extend_from_slice(&size);
+        plain.extend_from_slice(&[OP_PUSH_I8, 33, OP_W_SET, PROP_LOC_Y, OP_W_SET_LEN, PROP_TEXT, text.len() as u8]);
+        plain.extend_from_slice(text);
+        plain.extend_from_slice(&[OP_PUSH_I8, 6, OP_W_SET, PROP_FLEX_GAP, OP_HALT]);
+
+        let mut fields = field(PROP_BG_COLOR, proto::WT_STACK, &[]);
+        fields.extend(field(PROP_LOC_X, proto::WT_VARINT, &svarint(-10)));
+        let mut len = uvarint(size.len() as u32);
+        len.extend_from_slice(&size);
+        fields.extend(field(PROP_SIZE, proto::WT_LEN, &len));
+        fields.extend(field(PROP_LOC_Y, proto::WT_STACK, &[]));
+        let mut t = uvarint(text.len() as u32);
+        t.extend_from_slice(text);
+        fields.extend(field(PROP_TEXT, proto::WT_LEN, &t));
+        fields.extend(field(PROP_FLEX_GAP, proto::WT_VARINT, &svarint(6)));
+        assert!(fields.len() > 128, "a two-byte length");
+        // The stack values in reverse field order: loc_y, then bg on top.
+        let mut setall = alloc::vec![OP_W_TARGET, 1, OP_PUSH_I8, 33, OP_PUSH_I16, 0x34, 0x12, OP_W_SETALL];
+        setall.extend(uvarint(fields.len() as u32));
+        setall.extend(fields);
+        setall.push(OP_HALT);
+
+        let (pvm, pstate) = run_on_widget(&plain);
+        let (svm, sstate) = run_on_widget(&setall);
+        assert_eq!(pvm.fault(), fault::NONE);
+        assert_eq!(svm.fault(), fault::NONE);
+        assert_eq!(pstate, (-10, 33, 300, 140, 0x1234, text.to_vec(), 6));
+        assert_eq!(sstate, pstate);
+        assert_eq!(svm.sp, 0, "the stack values were popped");
+    }
+
+    #[test]
+    fn w_setall_rejects_malformed_fields() {
+        let cases: [(&[u8], u8); 5] = [
+            (&[OP_W_SETALL, 3, PROP_BG_COLOR << 3, 0x82], fault::CODE_OOB),       // past the code
+            (&[OP_W_SETALL, 2, PROP_BG_COLOR << 3, 0x82, OP_HALT], fault::CODE_OOB), // truncated varint
+            (&[OP_W_SETALL, 2, PROP_BG_COLOR << 3 | 7, 0, OP_HALT], fault::BAD_OPERAND), // wire type
+            (&[OP_W_SETALL, 3, PROP_SIZE << 3 | 2, 5, 1, OP_HALT], fault::CODE_OOB), // payload past the fields
+            (&[OP_W_SETALL, 1, PROP_BG_COLOR << 3 | 3, OP_HALT], fault::STACK_UNDERFLOW), // empty stack
+        ];
+        for (code, want) in cases {
+            let (vm, _) = run_on_widget(code);
+            assert_eq!(vm.fault(), want, "{code:?}");
+        }
     }
 
     #[test]

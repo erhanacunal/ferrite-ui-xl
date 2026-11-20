@@ -3378,6 +3378,8 @@ mod widget_ctor_tests {
         rt.tasks.widget_click(&rt.ctx.objs, ok);
         rt.step();
         assert_eq!(r(&rt)[19], 1, "on_ok ran");
+        // The GridView built from mixed values, laid out.
+        assert_eq!(&r(&rt)[20..30], &[7, 14, 217, 14, 8, 2, 103, 30, 103, 31]);
     }
 
     #[test]

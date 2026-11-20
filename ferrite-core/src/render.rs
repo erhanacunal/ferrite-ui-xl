@@ -2074,7 +2074,7 @@ fn dl_key<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
     h.u16(w.border_color);
     h.i32(w.value);
     // Extras (the last-drawn rects aside).
-    for v in [e.group_id, e.flex, e.flex_gap, e.flex_grow, e.font_id, e.text_align, e.image_id, e.max_length, e.gradient_dir, e.alpha] {
+    for v in [e.group_id, e.flex, e.flex_gap, e.flex_grow, e.grid_cols, e.font_id, e.text_align, e.image_id, e.max_length, e.gradient_dir, e.alpha] {
         h.u8(v);
     }
     for edges in [e.border, e.padding] {

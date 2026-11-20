@@ -8,6 +8,7 @@
 pub const WT_VARINT: u8 = 0; // Signed/unsigned varint
 pub const WT_I16: u8 = 1; // Fixed 16-bit (2 byte LE)
 pub const WT_LEN: u8 = 2; // Length-delimited (varint len + payload)
+pub const WT_STACK: u8 = 3; // W_SETALL: the value is popped from the VM stack
 pub const WT_NO_ARG: u8 = 5; // No argument
 
 // --- Widget Property IDs ---
@@ -62,7 +63,7 @@ pub const PROP_GRAPH_FLAGS: u8 = 0x2F;
 pub const PROP_MULTI_LINE: u8 = 0x30;
 pub const PROP_ALPHA: u8 = 0x31;
 pub const PROP_GROUP_ID: u8 = 0x32; // KIND_BUTTON_GROUP selection group
-// Flex layout data for lib/flex.fl. Stored only; the firmware never lays out.
+// Flex layout data for lib/flex.fl (laid out natively by `vm_flex.rs` with caps.native_flex).
 pub const PROP_FLEX: u8 = 0x33; // container: direction | justify | align bits
 pub const PROP_FLEX_GAP: u8 = 0x34; // container: px between children
 pub const PROP_FLEX_GROW: u8 = 0x35; // child: share of the leftover main-axis space
@@ -71,6 +72,8 @@ pub const PROP_LAYER: u8 = 0x36; // subtree root: layer 1..=4 it is drawn into, 
 pub const PROP_LAYER_ALPHA: u8 = 0x37; // layer root: plane alpha 0..255
 // Rich text (`rich.rs`, ferrite-ui-xl; caps.rich_text): labels and buttons read their text as HTML.
 pub const PROP_RICH_TEXT: u8 = 0x38;
+// Grid layout (`FLEX_GRID` containers, `vm_flex.rs` / lib/flex.fl): columns, 0 = as many as fit.
+pub const PROP_GRID_COLS: u8 = 0x39;
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

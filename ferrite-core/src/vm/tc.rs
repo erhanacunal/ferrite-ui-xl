@@ -474,12 +474,17 @@ fn op_ret(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 /// SYSCALL id argc: the platform's handler on the top `argc` values (fewer
-/// on the stack, or no handler: `exec_one`, which faults).
+/// on the stack, or no handler: `exec_one`, which faults). The app syscalls
+/// (`SYS_APP_COUNT..=SYS_APP_SET_BOOT`) are the core's, not the platform's:
+/// `exec_one` answers them.
 fn op_syscall(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let Some(f) = vm.syscall_fn else {
         become slow(vm, pc, sp, n)
     };
     let (id, argc) = unsafe { (*pc, *pc.add(1) as usize) };
+    if (crate::apps::SYS_APP_COUNT..=crate::apps::SYS_APP_SET_BOOT).contains(&id) {
+        become slow(vm, pc, sp, n)
+    }
     let k = argc.min(MAX_SYSCALL_ARGS);
     if (sp as usize) < vm.tc_lo + 4 * k {
         become slow(vm, pc, sp, n)

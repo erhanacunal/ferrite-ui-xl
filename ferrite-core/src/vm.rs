@@ -5225,6 +5225,32 @@ mod anim_tests {
         }
     }
 
+    /// The app syscalls are the core's: threaded dispatch hands them to
+    /// `exec_one` instead of the platform's handler (which knows none of
+    /// them), so `appCount()` in `loop()` doesn't fault.
+    #[test]
+    fn threaded_dispatch_answers_app_syscalls() {
+        fn sys(_: u8, _: &[i32], _: &mut ObjPool) -> Option<i32> {
+            None
+        }
+        // appCount(); appTask(""): store both, halt.
+        let code = [
+            OP_SYSCALL, crate::apps::SYS_APP_COUNT, 0, OP_STORE, 0, //
+            OP_PUSH_0, OP_SYSCALL, crate::apps::SYS_APP_TASK, 1, OP_STORE, 1, OP_HALT,
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        vm.load_raw(code.to_vec());
+        vm.syscall_fn = Some(sys);
+        vm.global_count = 2;
+        vm.frame_base = 2;
+        vm.state = VmState::Running;
+        tc::run(&mut vm, &mut ctx, 100);
+        assert!(vm.state == VmState::Halted, "fault {}", vm.fault);
+        // The installed-app list is cached process-wide (other tests install).
+        assert!(vm.var_get(0) >= 0 && vm.var_get(1) == -1);
+    }
+
     #[test]
     fn callback_preempts_main_and_keeps_its_stack() {
         // main @0: 7 9 ADD -> g0, HALT     callback @7: arg -> g1, leaves junk, RET

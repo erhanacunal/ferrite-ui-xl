@@ -44,8 +44,8 @@ const FORM_W = 576;
 const BOOT_Y = 556;
 const BOOT_W = 330;
 // The boot dropdown's options open upwards over the network list: the system
-// image and at most 6 apps.
-const OPTS = 7;
+// image and at most 7 apps.
+const OPTS = 8;
 const OPT_H = 52;
 
 // Array sizes must be literals: keep 6 = ROWS. The row buttons are also
@@ -75,7 +75,7 @@ var wifi_lbl;
 var files_lbl;
 var scan_lbl;
 var boot_dd;
-var boot_opt[7];
+var boot_opt[8];
 var boot_opts = 0;
 var shown_scans = -1;
 var shown_state = -1;

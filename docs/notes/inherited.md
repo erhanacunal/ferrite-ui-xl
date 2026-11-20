@@ -321,7 +321,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 ### Tablet Demo (`examples/exynos4412/tablet`)
 - Android-like launcher (`main`) + 8 apps (clock, calc, paint, monitor, gallery, music, notes, settings), one program each; shared look/state in `ui.fl` (state crosses `runProgram` in the int arg). `make_assets.py` generates icons (from the Visual Studio Image Library SVGs, `--icons` / `FERRITE_ICONS`, default `E:\ico\images`), fonts, pictures and sounds into `assets/` — git-ignored (icon license), regenerate before building.
 - Sim: `cargo build -p bsp-sim --features tablet` (1280×800, `ANIM_SLOTS` 64 like exynos). `--swipe X0,Y0,X1,Y1,MS[,DUR]` scripts a drag (with `--tap`).
-- `.fl` pitfalls found here: a generated on_click dispatcher calls **every** handler registered for a widget (ui.fl's back button uses `ui_back_custom` for apps that override it); arrays can't be passed to functions; a global may not share a name with any function's param/local (`color`, `radius` in ui.fl).
+- `.fl` pitfalls found here: a generated on_click dispatcher calls **every** handler registered for a widget (ui.fl's back button uses `ui_back_custom` for apps that override it); arrays go to functions only as `: array` parameters (an array's bare name is accepted only where an array is expected; since 2026-11-20); a global may not share a name with any function's param/local (`color`, `radius` in ui.fl).
 - Images: `MAX_IMAGES` 64 with `pool_large`/`host` (8 otherwise); `Image::draw` takes signed coords and clips to the scissor/screen (a picture sliding in from off-screen).
 
 ### Compiler: untyped float locals

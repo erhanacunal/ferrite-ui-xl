@@ -2,7 +2,7 @@
 // pushes nothing before RET and its callers don't pop. Results go to `r`,
 // the first global, which the test reads back.
 
-var r[16];
+var r[20];
 var count = 0;
 
 fn bump(k) { count += k; }                         // void, with an arg
@@ -26,6 +26,27 @@ class Double : Counter {
     fn add(k) { super.add(k); super.add(k); }
     fn mixed(k) { count += k; return k; }
 }
+// Arrays as values: a `: array` parameter, a `-> array` return, another
+// name for an array, a field typed array.
+var g[3] = [4, 5, 6];
+var gm = make3(9);                             // a global set from a call
+fn sum(a: array) {
+    var s = 0;
+    for (var i = 0; i < arrLen(a); i++) { s += a[i]; }
+    return s;
+}
+fn sum_via(a: array) { return sum(a) * 10; }   // passed on
+fn make3(v) -> array {
+    var l[3];
+    l[0] = v; l[1] = v + 1; l[2] = v + 2;
+    return l;
+}
+fn fill(a: array, v) { a[0] = v; }             // writes reach the caller's array
+class Bag {
+    var items: array;
+    fn total() { return sum(self.items); }
+}
+
 class Solo {                                   // no hierarchy: static calls
     var v;
     fn put(k) { self.v = k; count += k; }
@@ -65,6 +86,19 @@ fn setup() {
     free(d);                           // 5135
     free(c);                           // 6135
     r[12] = count;                     // 6135
+    r[13] = sum(g) + sum_via(g);       // 15 + 150 = 165
+    var m = make3(1);
+    var alias = m;
+    fill(alias, 10);
+    r[14] = m[0] + sum(make3(0)) + gm[2];  // 10 + 3 + 11 = 24
+    var b: array;
+    b = g;
+    b[1] = 50;
+    r[15] = g[1];                      // 50: b and g are one array
+    var bag = Bag();
+    bag.items = m;
+    r[16] = bag.total();               // 10 + 2 + 3 = 15
+    arrFree(m);
     r[8] = 42;                  // setup ran to the end
 }
 

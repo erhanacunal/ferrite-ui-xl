@@ -52,7 +52,7 @@ Working branch: `main` (commit and push there).
 - uart_boot is installed with fastboot only (`fastboot flash boot uart_boot.img`; power + volume down held 2 s under ferrite restarts into fastboot). The one on the board (2026-11-15) autoboots even while polled.
 - A program with an empty `fn loop() {}` keeps the runtime busy (no idle sleep).
 - G2D/GIC: `Gic::enable` routes an SPI to the calling core; code enabling interrupts on CPU1–3 must set the target explicitly where CPU0 should take it.
-- `.fl` pitfalls: no recursion (compile error; loop or an array as a stack); a generated `on_click` dispatcher calls every handler registered for a widget; arrays can't be passed to functions; a global may not share a name with any function's param/local.
+- `.fl` pitfalls: no recursion (compile error; loop or an array as a stack); a generated `on_click` dispatcher calls every handler registered for a widget; arrays go to functions only as `: array` parameters (an array's bare name is accepted only where an array is expected; since 2026-11-20); a global may not share a name with any function's param/local.
 
 ## Debug switches (sim env vars)
 

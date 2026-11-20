@@ -8,7 +8,9 @@
 //   startApp; the home gesture, a swipe up from the bottom edge, comes back
 //   here while it keeps running).
 // - Swipe down for the shade: brightness and volume sliders (real backlight
-//   and codec volume), quick tiles and a notification.
+//   and codec volume), quick tiles and a notification. The GPS tile turns
+//   the receiver on and off (lib/gps.fl) and shows its state; it stays as
+//   set while apps run.
 // - Tapping an app grows its colour from the icon to the full screen, then
 //   starts the app's program; coming back shrinks it into the icon again.
 //
@@ -18,6 +20,7 @@
 #include "gesture.fl"
 #include "apps.fl"
 #include "flex.fl"
+#include "gps.fl"
 
 #hint_widgets 140 140
 
@@ -27,6 +30,7 @@ const DOCK_D   = 88;
 const DOCK_Y   = 652;
 const ROW_Y    = 430;   // centre of the page-0 app row
 const SHADE_H  = 480;
+const QS_W     = 228;   // quick tile width: five in 1192 px, 13 px apart
 const HIST     = 48;    // performance graph samples
 
 // --- Hit table: the home and dock app icons ---
@@ -41,7 +45,8 @@ var hits = 0;
 var ic0; var ic1; var ic2; var ic3;           // page 0
 var dk0; var dk1; var dk2; var dk3;           // dock
 var bright_sl; var vol_sl;
-var tile_perf; var tile_wall; var tile_chime; var tile_restart;
+var tile_perf; var tile_wall; var tile_chime; var tile_restart; var tile_gps;
+var gps_lbl;        // the GPS tile's caption
 var scrim;
 var drawer_handle;
 var notif;
@@ -301,16 +306,16 @@ fn start_package(slot) {
     strClear();
 }
 
-// Quick tile: icon + caption in a pill.
-fn make_tile(b: widget, x, img, text) {
+// Quick tile `n` (0..4): icon + caption `l` in a pill.
+fn make_tile(b: widget, l: widget, n, img, text) {
     target(b);
-    style_button(x, 300, 270, 76, SURFACE_HI, 38);
+    style_button(44 + n * (QS_W + 13), 300, QS_W, 76, SURFACE_HI, 38);
     parent(shade);
     var i = alloc();
-    style_image(22, 0, 40, 76, img);
+    style_image(14, 0, 40, 76, img);
     parent(b);
-    var l = alloc();
-    style_label(72, 0, 190, 76, F20, WHITE, ALIGN_LEFT, text);
+    target(l);
+    style_label(58, 0, QS_W - 62, 76, F20, WHITE, ALIGN_LEFT, text);
     parent(b);
 }
 
@@ -360,10 +365,11 @@ fn build_shade() {
     style_label(1136, 228, 100, 44, F20, WHITE, ALIGN_RIGHT, "");
     parent(shade);
 
-    tile_perf = alloc();    make_tile(tile_perf, 44, IMG_QS_PERF, "Performance"); target(tile_perf); set(on_click, @on_tile);
-    tile_wall = alloc();    make_tile(tile_wall, 346, IMG_QS_DARK, "Wallpaper"); target(tile_wall); set(on_click, @on_tile);
-    tile_chime = alloc();   make_tile(tile_chime, 648, IMG_QS_VOLUME, "Chime"); target(tile_chime); set(on_click, @on_tile);
-    tile_restart = alloc(); make_tile(tile_restart, 950, IMG_QS_RESTART, "Restart"); target(tile_restart); set(on_click, @on_tile);
+    tile_perf = alloc();    make_tile(tile_perf, alloc(), 0, IMG_QS_PERF, "Performance"); target(tile_perf); set(on_click, @on_tile);
+    tile_wall = alloc();    make_tile(tile_wall, alloc(), 1, IMG_QS_DARK, "Wallpaper"); target(tile_wall); set(on_click, @on_tile);
+    tile_chime = alloc();   make_tile(tile_chime, alloc(), 2, IMG_QS_VOLUME, "Chime"); target(tile_chime); set(on_click, @on_tile);
+    tile_gps = alloc();     gps_lbl = alloc(); make_tile(tile_gps, gps_lbl, 3, IMG_QS_GPS, ""); target(tile_gps); set(on_click, @on_tile);
+    tile_restart = alloc(); make_tile(tile_restart, alloc(), 4, IMG_QS_RESTART, "Restart"); target(tile_restart); set(on_click, @on_tile);
 
     notif = alloc();
     style_button(44, 400, 1192, 64, SURFACE_HI, 20);
@@ -424,6 +430,27 @@ fn show_tiles() {
     target(perf_lbl);
     set(visible, ui_flags & 1);
     dirty();
+    show_gps();
+}
+
+// The GPS tile: lit while the receiver is on, its state as the caption.
+fn show_gps() {
+    var st = gpsState();
+    target(tile_gps);
+    set(bg_color, st == GPS_OFF ? SURFACE_HI : ACCENT);
+    dirty();
+    target(gps_lbl);
+    if (st == GPS_FIX) {
+        set(text, sprintf("GPS  ·  %d sats", gpsGet(GPS_SATS_USED)));
+    } else if (st == GPS_SEARCHING) {
+        set(text, "Searching");
+    } else if (st == GPS_NO_DATA) {
+        set(text, "GPS starting");
+    } else {
+        set(text, "GPS off");
+    }
+    dirty();
+    strClear();
 }
 
 fn show_page() {
@@ -476,6 +503,7 @@ fn sample_perf(dt) {
     set(text, sprintf("%d widgets  ·  %d strings  ·  %d arrays", sysObjCount(1), sysObjCount(2), sysObjCount(3)));
     dirty();
     strClear();
+    show_gps();
 }
 
 // ============================================================
@@ -719,6 +747,9 @@ fn on_tile(w) {
     }
     if (w == tile_chime) {
         playSound("chime");
+    }
+    if (w == tile_gps) {
+        gpsPower(gpsState() == GPS_OFF ? 1 : 0);
     }
     if (w == tile_restart) {
         if (restart_armed) {

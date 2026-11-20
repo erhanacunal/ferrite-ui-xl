@@ -113,6 +113,7 @@ const IMG_PIC0         = 31;   // 6 pictures, 960x560
 const IMG_THUMB0       = 37;   // 6 thumbnails, 288x168
 const IMG_WALL1        = 43;   // home wallpapers, 1280x800, opaque raw
 const IMG_WALL2        = 44;
+const IMG_QS_GPS       = 45;   // quick tile: GPS on / off
 
 // --- Shared state (programArg) ---
 var ui_volume = 70;

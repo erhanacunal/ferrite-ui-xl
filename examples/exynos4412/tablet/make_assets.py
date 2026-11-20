@@ -8,8 +8,8 @@
   with an alpha channel (PySide6 QtSvg). They come from the Visual Studio
   Image Library, which may not be redistributed, so assets/ is git-ignored
   and only this script and the icon names are in the repository.
-- Fonts: fonts/Ubuntu-R.ttf (repository root), 2 bpp anti-aliased, through
-  tools/ferrite_font_converter.py.
+- Fonts: ferrite-ui fonts/Ubuntu-R.ttf, 2 bpp anti-aliased, through ferrite-ui
+  tools/ferrite_font_converter.py (FERRITE_UI, default ../ferrite-ui).
 - Gallery pictures: procedural landscapes drawn here (PIL).
 - Sounds: synthesized here (numpy), 11025 Hz mono.
 
@@ -30,6 +30,8 @@ from PIL import Image, ImageDraw, ImageFilter
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
+# Tools and fonts live in ferrite-ui (FERRITE_UI, default: next to this repo).
+FERRITE_UI = Path(os.environ.get("FERRITE_UI", ROOT.parent / "ferrite-ui"))
 OUT = HERE / "assets"
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,7 @@ ICONS = [
     ("qs_dark", "DarkTheme", 30),
     ("qs_restart", "Restart", 30),
     ("qs_perf", "Performance", 30),
+    ("qs_gps", "Compass", 30),
     ("ui_back", "Previous", 30),
     ("ui_add", "Add", 30),
     ("ui_delete", "Delete", 30),
@@ -108,8 +111,8 @@ def make_icons(icon_dir: Path):
 
 
 def make_fonts():
-    conv = ROOT / "tools" / "ferrite_font_converter.py"
-    ttf = ROOT / "fonts" / "Ubuntu-R.ttf"
+    conv = FERRITE_UI / "tools" / "ferrite_font_converter.py"
+    ttf = FERRITE_UI / "fonts" / "Ubuntu-R.ttf"
     for i, (name, size, ranges) in enumerate(FONTS):
         subprocess.run([sys.executable, str(conv), "resource", str(ttf), str(size),
                         "--bpp", "2", "--font-id", str(i + 1), "-r", ranges,

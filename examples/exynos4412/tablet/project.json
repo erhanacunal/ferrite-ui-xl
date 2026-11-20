@@ -276,6 +276,11 @@
       "image_id": 44,
       "source": "assets/wall2.png",
       "mode": "raw"
+    },
+    {
+      "name": "qs_gps",
+      "image_id": 45,
+      "source": "assets/qs_gps.png"
     }
   ],
   "sounds": [

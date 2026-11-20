@@ -6,7 +6,11 @@
 //   grid (lib/flex.fl GridView) of all eight and every installed app package
 //   (ferrite-ui-xl docs/apps.md: a tap starts one beside the tablet with
 //   startApp; the home gesture, a swipe up from the bottom edge, comes back
-//   here while it keeps running).
+//   here while it keeps running). While packages run, a "Running" strip over
+//   the grid lists them (tap: show it, x: end it, "Close all"), and a pill
+//   right of the dock says how many run and opens the drawer. The built-in
+//   apps are no tasks: they replace this program (runProgram), which also
+//   ends every running package.
 // - Swipe down for the shade: brightness and volume sliders (real backlight
 //   and codec volume), quick tiles and a notification. The GPS tile turns
 //   the receiver on and off (lib/gps.fl) and shows its state; it stays as
@@ -59,6 +63,24 @@ const PKG_BASE    = 100;
 const PKG_COLOR   = 0x4A69;
 var drawer_grid;
 var pkg_status;
+
+// Running packages (startApp tasks, at most four): a strip of cards over the
+// drawer's grid, shown only while one runs, and a pill on the home screen
+// that opens the drawer. A card's tap shows its app, its x ends it.
+const RUN_MAX    = 4;
+const RUN_H      = 140;   // the strip's height; the grid moves down by it
+const RUN_CARD_W = 268;   // four in 1120 px, 16 px apart
+const RUN_CARD_H = 88;
+var run_task[4];          // the running apps' task ids, in package order
+var run_slot[4];          // their package indexes
+var run_n = 0;
+var run_card[4];
+var run_name[4];
+var run_sub[4];
+var run_box;
+var run_close_all;
+var run_pill;
+var run_pill_lbl;
 
 // A drawer tile: a transparent box holding the circle and the name under it.
 widget DrawerTile : Label(size: [190, 168]);
@@ -215,6 +237,14 @@ fn build_dock() {
     dk1 = alloc(); make_icon(dk1, dock, APP_MUSIC, 220, 60, DOCK_D, 0, 2); target(dk1); set(on_click, @on_icon);
     dk2 = alloc(); make_icon(dk2, dock, APP_NOTES, 340, 60, DOCK_D, 0, 2); target(dk2); set(on_click, @on_icon);
     dk3 = alloc(); make_icon(dk3, dock, APP_SETTINGS, 460, 60, DOCK_D, 0, 2); target(dk3); set(on_click, @on_icon);
+
+    // The running apps' pill (build_running): right of the dock, clear of the
+    // pager's layer, under the drawer and the shade.
+    run_pill = Box(parent: 0, location: [1000, DOCK_Y + 28], size: [220, 56], bg_color: WHITE,
+                   alpha: 40, border_radius: 28, clickable: 1, on_click: @on_run_pill,
+                   visible: OFF, children: [
+        run_pill_lbl = Label(size: [220, 56], font_id: F20, text_color: WHITE, text_align: ALIGN_CENTER),
+    ]);
 }
 
 // The drawer and the shade are opaque: a panel that only slides keeps its
@@ -254,6 +284,150 @@ fn build_drawer() {
     for (var i = 0; i < n; i++) {
         add_drawer_tile(PKG_BASE + i, PKG_COLOR);
     }
+    build_running();
+}
+
+// The running apps' strip in the drawer (hidden until one runs) and the home
+// screen's pill.
+fn build_running() {
+    run_box = Label(parent: drawer, location: [80, 100], size: [SCREEN_W - 160, RUN_H - 8],
+                    visible: OFF, children: [
+        Label(text: "Running", location: [0, 0], size: [400, 36], font_id: F20,
+              text_color: DIM, text_align: ALIGN_LEFT),
+        run_close_all = Label(text: "Close all", location: [SCREEN_W - 160 - 160, 0], size: [160, 36],
+                              font_id: F20, text_color: WHITE, text_align: ALIGN_CENTER,
+                              bg_color: SURFACE_HI, press_color: RED, border_radius: 18,
+                              clickable: 1, on_click: @on_close_all),
+    ]);
+    for (var k = 0; k < RUN_MAX; k++) {
+        var c;
+        var nm;
+        var sb;
+        var x;
+        c = Box(parent: run_box, location: [k * (RUN_CARD_W + 16), 44], size: [RUN_CARD_W, RUN_CARD_H],
+                bg_color: SURFACE_HI, press_color: lighten(SURFACE_HI), border_radius: 24,
+                clickable: 1, value: k, visible: OFF, children: [
+            Box(location: [14, 12], size: [64, 64], bg_color: PKG_COLOR, border_radius: 32, children: [
+                Box(location: [20, 20], size: [24, 24], bg_color: WHITE, border_radius: 6),
+            ]),
+            nm = Label(location: [92, 12], size: [RUN_CARD_W - 156, 32], font_id: F20,
+                       text_color: WHITE, text_align: ALIGN_LEFT),
+            sb = Label(location: [92, 46], size: [RUN_CARD_W - 156, 28], font_id: F16,
+                       text_color: DIM, text_align: ALIGN_LEFT),
+            x = Box(location: [RUN_CARD_W - 60, 20], size: [48, 48], bg_color: SURFACE,
+                    press_color: RED, border_radius: 24, clickable: 1, value: k, children: [
+                Image(size: [48, 48], image_id: IMG_DELETE),
+            ]),
+        ]);
+        onGesture(c, GESTURE_TAP, @on_run_open);
+        onGesture(x, GESTURE_TAP, @on_run_close);
+        run_card[k] = c;
+        run_name[k] = nm;
+        run_sub[k] = sb;
+    }
+}
+
+// Which packages run now (appTask); the strip and the pill follow when that
+// changed.
+fn refresh_running() {
+    var n = 0;
+    var changed = 0;
+    var cnt = appCount();
+    for (var i = 0; i < cnt; i++) {
+        var t = appTask(appId(i));
+        if (t >= 0 && n < RUN_MAX) {
+            if (n >= run_n || run_task[n] != t || run_slot[n] != i) {
+                changed = 1;
+            }
+            run_task[n] = t;
+            run_slot[n] = i;
+            n++;
+        }
+    }
+    strClear();
+    if (n != run_n) {
+        changed = 1;
+    }
+    run_n = n;
+    if (changed) {
+        show_running();
+    }
+}
+
+fn show_running() {
+    for (var k = 0; k < RUN_MAX; k++) {
+        target(run_card[k]);
+        set(visible, k < run_n ? ON : OFF);
+        if (k < run_n) {
+            target(run_name[k]);
+            set(text, appName(run_slot[k]));
+            dirty();
+            target(run_sub[k]);
+            set(text, sprintf("task %d", run_task[k]));
+            dirty();
+        }
+    }
+    target(run_box);
+    set(visible, run_n > 0 ? ON : OFF);
+    // The grid gives the strip its room.
+    var top = run_n > 0 ? 100 + RUN_H : 100;
+    target(drawer_grid);
+    set(location, 40, top);
+    set(size, SCREEN_W - 80, SCREEN_H - STATUS_H - 16 - top);
+    dirty();
+    target(run_pill);
+    set(visible, run_n > 0 ? ON : OFF);
+    target(run_pill_lbl);
+    set(text, run_n == 1 ? "1 app running" : sprintf("%d apps running", run_n));
+    dirty();
+    strClear();
+}
+
+// A card tapped: its app shows (back from it, the home screen).
+fn on_run_open(w: widget, ev) {
+    if (ev != GE_TAP) {
+        return 0;
+    }
+    var k = w.value;
+    if (k < run_n) {
+        playSound("click");
+        showApp(run_task[k]);
+        open_drawer(0);
+    }
+}
+
+// A card's x: its app ends after this pass; on_task_exit updates the strip.
+fn on_run_close(w: widget, ev) {
+    if (ev != GE_TAP) {
+        return 0;
+    }
+    var k = w.value;
+    if (k < run_n) {
+        killProgram(run_task[k]);
+    }
+}
+
+fn on_close_all(w) {
+    for (var k = 0; k < run_n; k++) {
+        killProgram(run_task[k]);
+    }
+}
+
+fn on_run_pill(w) {
+    if (!launching && !shade_open) {
+        open_drawer(1);
+    }
+}
+
+// A started app ended (closed here, exitApp, a fault) or could not start.
+fn on_task_exit(task, code) {
+    if (code > 0) {
+        pkg_status.text = sprintf("an app stopped: VM fault %d", code);
+    } else if (code < 0) {
+        pkg_status.text = "the app could not start";
+    }
+    strClear();
+    refresh_running();
 }
 
 // The drawer tile for `v` (an APP_* or PKG_BASE + package index).
@@ -302,6 +476,7 @@ fn start_package(slot) {
         pkg_status.text = "";
         // Back from it (home gesture) to the home screen, not the drawer.
         open_drawer(0);
+        refresh_running();
     }
     strClear();
 }
@@ -828,6 +1003,7 @@ fn loop() {
     if (dt >= 1000) {
         last_sec = t;
         sample_perf(dt);
+        refresh_running();
     }
     if (restart_armed && t - restart_at > 3000) {
         restart_armed = 0;

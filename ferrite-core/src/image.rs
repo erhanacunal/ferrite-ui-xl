@@ -717,7 +717,9 @@ impl Image {
 // ImageList — application-wide image registry
 // ============================================================
 
-const MAX_IMAGES: usize = 64;
+/// Every global image id (1..=255, `count` is a u8): the launcher's images and a
+/// running app's share the list, and 64 left a 52-card game's last ones unloaded.
+const MAX_IMAGES: usize = 255;
 
 /// Application-wide image list. Holds loaded image metadata and supports
 /// lookup by image_id with lazy loading from flash.

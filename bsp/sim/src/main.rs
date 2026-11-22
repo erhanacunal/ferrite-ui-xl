@@ -204,6 +204,13 @@ fn main() {
     #[cfg(all(windows, target_arch = "x86_64"))]
     prof::start_from_args();
 
+    // FERRITE_SIM_VMPROF=1: the dynamic opcode profile (ferrite_core::vm::prof)
+    // from the start, written to stderr when the sim ends (`platform::print_vmprof`;
+    // `scripts/vmprof.py --sim` names and sorts it).
+    if env::var("FERRITE_SIM_VMPROF").is_ok_and(|v| v == "1") {
+        ferrite_core::vm::prof::ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
 }
 

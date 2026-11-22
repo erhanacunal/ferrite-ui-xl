@@ -18,10 +18,11 @@
 //! jump / call targets), so no handler tests it; `run` and `slow` (a unit
 //! switch may change it) pick one.
 //!
-//! Quickening: a superinstruction whose cond / op operand has a quickened
-//! form (`QUICK`) rewrites its opcode to that form the first time it runs
-//! here (`quicken!`); the form's handler has the operation built in, with no
-//! dispatch on the operand (`q_*`). `exec_one` runs both forms the same.
+//! Quickening: an instruction with a quickened form (`QUICK`: a
+//! superinstruction by its cond / op, LOAD / STORE / ADD_VI by their slot's
+//! kind) rewrites its opcode to that form the first time it runs here
+//! (`quicken!`); the form's handler has the operation / slot kind built in,
+//! with no dispatch on the operand (`q_*`). `exec_one` runs both the same.
 //!
 //! Cold paths (faults) are tail calls with the handler's own four arguments
 //! (the fault code a const parameter): no argument goes on the stack, so the
@@ -96,11 +97,11 @@ macro_rules! push {
     }};
 }
 
-/// Superinstruction `$op` (cond / op operand at `$pc`): if that operand has
-/// a quickened form, rewrite the opcode to it and run it.
+/// If `$q` is a quickened form (not 0), rewrite the running instruction's
+/// opcode to it and run it.
 macro_rules! quicken {
-    ($vm:ident, $pc:ident, $sp:ident, $n:ident, $op:expr) => {
-        let q = quick_of($op, unsafe { *$pc });
+    ($vm:ident, $pc:ident, $sp:ident, $n:ident, $q:expr) => {
+        let q: u8 = $q;
         if q != 0 {
             // SAFETY: the opcode is inside the code (module docs); one
             // thread runs the VMs (`VmCode`).
@@ -396,18 +397,31 @@ fn op_push_i32<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) 
     push!(vm, pc, sp, n, i32::from_le_bytes(unsafe { bytes(pc) }), unsafe { pc.add(4) })
 }
 
+/// The variable slot of a local slot operand (bit 7 ignored).
+#[inline(always)]
+fn local(vm: &Vm, raw: u8) -> u32 {
+    vm.frame_base + (raw & 0x7F) as u32
+}
+
+/// The variable slot of a global slot operand (bit 7 ignored).
+#[inline(always)]
+fn global(vm: &Vm, raw: u8) -> u32 {
+    vm.gbase + (raw & 0x7F) as u32
+}
+
+/// LOAD / STORE: always quickened (by the slot's kind).
 fn op_load<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    let slot = vm.resolve_slot(unsafe { *pc });
-    push!(vm, pc, sp, n, vm.var_get(slot), unsafe { pc.add(1) })
+    let q = if unsafe { *pc } & 0x80 != 0 { Q_LOAD_L } else { Q_LOAD_G };
+    // SAFETY: as in `quicken!`.
+    unsafe { vm.code.quicken(pc.sub(1), q) };
+    become tab::<W>()[q as usize](vm, pc, sp, n)
 }
 
 fn op_store<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    need!(vm, pc, sp, n, 1);
-    unsafe {
-        let sp = sp.sub(1);
-        vm.var_set(vm.resolve_slot(*pc), *sp);
-        next!(vm, pc.add(1), sp, n)
-    }
+    let q = if unsafe { *pc } & 0x80 != 0 { Q_STORE_L } else { Q_STORE_G };
+    // SAFETY: as in `quicken!`.
+    unsafe { vm.code.quicken(pc.sub(1), q) };
+    become tab::<W>()[q as usize](vm, pc, sp, n)
 }
 
 fn op_frame<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
@@ -565,7 +579,7 @@ macro_rules! jump_if {
 }
 
 fn op_jcmp<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    quicken!(vm, pc, sp, n, OP_JCMP);
+    quicken!(vm, pc, sp, n, quick_of(OP_JCMP, unsafe { *pc }, 0));
     need!(vm, pc, sp, n, 2);
     unsafe {
         let cond = *pc;
@@ -577,7 +591,7 @@ fn op_jcmp<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 fn op_jcmp_vi<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    quicken!(vm, pc, sp, n, OP_JCMP_VI);
+    quicken!(vm, pc, sp, n, unsafe { quick_of(OP_JCMP_VI, *pc, *pc.add(1)) });
     unsafe {
         let [cond, raw, lo, hi] = bytes(pc);
         let (t, after) = addr::<W>(pc.add(4));
@@ -587,7 +601,7 @@ fn op_jcmp_vi<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 fn op_jcmp_vv<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    quicken!(vm, pc, sp, n, OP_JCMP_VV);
+    quicken!(vm, pc, sp, n, quick_of(OP_JCMP_VV, unsafe { *pc }, 0));
     unsafe {
         let [cond, ra, rb] = bytes(pc);
         let (t, after) = addr::<W>(pc.add(3));
@@ -613,7 +627,7 @@ macro_rules! top_binop {
 }
 
 fn op_bin_i<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    quicken!(vm, pc, sp, n, OP_BIN_I);
+    quicken!(vm, pc, sp, n, quick_of(OP_BIN_I, unsafe { *pc }, 0));
     let [op, lo, hi] = unsafe { bytes(pc) };
     top_binop!(vm, pc, sp, n, op, i16::from_le_bytes([lo, hi]) as i32, unsafe { pc.add(3) })
 }
@@ -624,13 +638,14 @@ fn op_bin_i32<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 fn op_bin_v<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    quicken!(vm, pc, sp, n, OP_BIN_V);
+    quicken!(vm, pc, sp, n, quick_of(OP_BIN_V, unsafe { *pc }, 0));
     let [op, raw] = unsafe { bytes(pc) };
     let b = vm.var_get(vm.resolve_slot(raw));
     top_binop!(vm, pc, sp, n, op, b, unsafe { pc.add(2) })
 }
 
 fn op_add_vi<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    quicken!(vm, pc, sp, n, if unsafe { *pc } & 0x80 != 0 { Q_ADD_VI_L } else { 0 });
     let [raw, lo, hi] = unsafe { bytes(pc) };
     let slot = vm.resolve_slot(raw);
     vm.var_set(slot, vm.var_get(slot).wrapping_add(i16::from_le_bytes([lo, hi]) as i32));
@@ -638,7 +653,7 @@ fn op_add_vi<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 fn op_store_op<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    quicken!(vm, pc, sp, n, OP_STORE_OP);
+    quicken!(vm, pc, sp, n, unsafe { quick_of(OP_STORE_OP, *pc, *pc.add(1)) });
     need!(vm, pc, sp, n, 1);
     unsafe {
         let [op, raw] = bytes(pc);
@@ -695,7 +710,7 @@ fn q_jcmp_vi<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i3
     unsafe {
         let [_, raw, lo, hi] = bytes(pc);
         let (t, after) = addr::<W>(pc.add(4));
-        let a = vm.var_get(vm.resolve_slot(raw));
+        let a = vm.var_get(local(vm, raw));
         branch!(vm, sp, n, cmp::<C>(a, i16::from_le_bytes([lo, hi]) as i32), t, after)
     }
 }
@@ -734,10 +749,46 @@ fn q_store_op<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i
     need!(vm, pc, sp, n, 1);
     unsafe {
         let sp = sp.sub(1);
-        let slot = vm.resolve_slot(*pc.add(1));
+        let slot = local(vm, *pc.add(1));
         vm.var_set(slot, binop::<C>(vm.var_get(slot), *sp));
         next!(vm, pc.add(2), sp, n)
     }
+}
+
+/// LOAD of a local / global slot (`C`: unused).
+fn q_load_l<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    push!(vm, pc, sp, n, vm.var_get(local(vm, unsafe { *pc })), unsafe { pc.add(1) })
+}
+
+fn q_load_g<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    push!(vm, pc, sp, n, vm.var_get(global(vm, unsafe { *pc })), unsafe { pc.add(1) })
+}
+
+/// STORE to a local / global slot.
+fn q_store_l<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    need!(vm, pc, sp, n, 1);
+    unsafe {
+        let sp = sp.sub(1);
+        vm.var_set(local(vm, *pc), *sp);
+        next!(vm, pc.add(1), sp, n)
+    }
+}
+
+fn q_store_g<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    need!(vm, pc, sp, n, 1);
+    unsafe {
+        let sp = sp.sub(1);
+        vm.var_set(global(vm, *pc), *sp);
+        next!(vm, pc.add(1), sp, n)
+    }
+}
+
+/// ADD_VI on a local slot.
+fn q_add_vi_l<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    let [raw, lo, hi] = unsafe { bytes(pc) };
+    let slot = local(vm, raw);
+    vm.var_set(slot, vm.var_get(slot).wrapping_add(i16::from_le_bytes([lo, hi]) as i32));
+    next!(vm, unsafe { pc.add(3) }, sp, n)
 }
 
 // --- The tables ---
@@ -813,24 +864,29 @@ const fn table<const W: bool>() -> [Handler; 256] {
     // time).
     let mut i = 0;
     macro_rules! quick {
-        ($($h:ident $op:ident $c:ident),* $(,)?) => {$(
-            assert!(QUICK[i].0 == $op && QUICK[i].1 == $c, "tc::table and QUICK differ");
+        ($($h:ident $op:ident $c:tt $k:ident),* $(,)?) => {$(
+            assert!(QUICK[i].0 == $op && QUICK[i].1 == $c && QUICK[i].2 == $k, "tc::table and QUICK differ");
             t[Q_FIRST as usize + i] = $h::<W, $c>;
             i += 1;
         )*};
     }
     quick!(
-        q_jcmp OP_JCMP OP_EQ, q_jcmp OP_JCMP OP_NE, q_jcmp OP_JCMP OP_LT,
-        q_jcmp OP_JCMP OP_LE, q_jcmp OP_JCMP OP_GT, q_jcmp OP_JCMP OP_GE,
-        q_jcmp_vi OP_JCMP_VI OP_EQ, q_jcmp_vi OP_JCMP_VI OP_NE, q_jcmp_vi OP_JCMP_VI OP_LT,
-        q_jcmp_vi OP_JCMP_VI OP_LE, q_jcmp_vi OP_JCMP_VI OP_GT, q_jcmp_vi OP_JCMP_VI OP_GE,
-        q_jcmp_vv OP_JCMP_VV OP_EQ, q_jcmp_vv OP_JCMP_VV OP_NE, q_jcmp_vv OP_JCMP_VV OP_LT,
-        q_jcmp_vv OP_JCMP_VV OP_LE, q_jcmp_vv OP_JCMP_VV OP_GT, q_jcmp_vv OP_JCMP_VV OP_GE,
-        q_bin_i OP_BIN_I OP_ADD, q_bin_i OP_BIN_I OP_SUB, q_bin_i OP_BIN_I OP_MUL,
-        q_bin_i OP_BIN_I OP_AND, q_bin_i OP_BIN_I OP_OR, q_bin_i OP_BIN_I OP_SHL,
-        q_bin_i OP_BIN_I OP_SHR,
-        q_bin_v OP_BIN_V OP_ADD, q_bin_v OP_BIN_V OP_SUB,
-        q_store_op OP_STORE_OP OP_ADD,
+        q_jcmp OP_JCMP OP_EQ SLOT_ANY, q_jcmp OP_JCMP OP_NE SLOT_ANY, q_jcmp OP_JCMP OP_LT SLOT_ANY,
+        q_jcmp OP_JCMP OP_LE SLOT_ANY, q_jcmp OP_JCMP OP_GT SLOT_ANY, q_jcmp OP_JCMP OP_GE SLOT_ANY,
+        q_jcmp_vi OP_JCMP_VI OP_EQ SLOT_L, q_jcmp_vi OP_JCMP_VI OP_NE SLOT_L,
+        q_jcmp_vi OP_JCMP_VI OP_LT SLOT_L, q_jcmp_vi OP_JCMP_VI OP_LE SLOT_L,
+        q_jcmp_vi OP_JCMP_VI OP_GT SLOT_L, q_jcmp_vi OP_JCMP_VI OP_GE SLOT_L,
+        q_jcmp_vv OP_JCMP_VV OP_EQ SLOT_ANY, q_jcmp_vv OP_JCMP_VV OP_NE SLOT_ANY,
+        q_jcmp_vv OP_JCMP_VV OP_LT SLOT_ANY, q_jcmp_vv OP_JCMP_VV OP_LE SLOT_ANY,
+        q_jcmp_vv OP_JCMP_VV OP_GT SLOT_ANY, q_jcmp_vv OP_JCMP_VV OP_GE SLOT_ANY,
+        q_bin_i OP_BIN_I OP_ADD SLOT_ANY, q_bin_i OP_BIN_I OP_SUB SLOT_ANY, q_bin_i OP_BIN_I OP_MUL SLOT_ANY,
+        q_bin_i OP_BIN_I OP_DIV SLOT_ANY, q_bin_i OP_BIN_I OP_MOD SLOT_ANY, q_bin_i OP_BIN_I OP_AND SLOT_ANY,
+        q_bin_i OP_BIN_I OP_OR SLOT_ANY, q_bin_i OP_BIN_I OP_SHL SLOT_ANY, q_bin_i OP_BIN_I OP_SHR SLOT_ANY,
+        q_bin_v OP_BIN_V OP_ADD SLOT_ANY, q_bin_v OP_BIN_V OP_SUB SLOT_ANY,
+        q_store_op OP_STORE_OP OP_ADD SLOT_L,
+        q_load_l OP_LOAD 0 SLOT_L, q_load_g OP_LOAD 0 SLOT_G,
+        q_store_l OP_STORE 0 SLOT_L, q_store_g OP_STORE 0 SLOT_G,
+        q_add_vi_l OP_ADD_VI 0 SLOT_L,
     );
     assert!(i == QUICK.len(), "tc::table and QUICK differ");
     t

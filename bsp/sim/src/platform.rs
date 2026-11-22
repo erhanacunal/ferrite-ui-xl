@@ -267,6 +267,7 @@ impl PlatformRuntime for SimPlatform {
             };
 
             if !host.window.is_open() || host.window.is_key_down(Key::Escape) {
+                print_vmprof();
                 std::process::exit(0);
             }
 
@@ -333,6 +334,7 @@ impl PlatformRuntime for SimPlatform {
                     if d.next == d.at.len() {
                         print_dl_stats();
                         print_snapshot_stats();
+                        print_vmprof();
                         std::process::exit(0);
                     }
                     systick::sim::advance(d.step_ms);
@@ -487,6 +489,13 @@ fn print_snapshot_stats() {
         scene::UPDATED.load(Relaxed),
         if scene::VERIFY.load(Relaxed) { " (verified)" } else { "" }
     );
+}
+
+/// The dynamic opcode profile (`FERRITE_SIM_VMPROF=1`), between marker lines.
+fn print_vmprof() {
+    if ferrite_core::vm::prof::ON.load(core::sync::atomic::Ordering::Relaxed) {
+        eprint!("sim: vmprof\n{}sim: vmprof end\n", ferrite_core::vm::prof::report());
+    }
 }
 
 /// Display-list cache counters (stderr; with `FERRITE_SIM_DL`).

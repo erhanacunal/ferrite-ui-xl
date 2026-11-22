@@ -58,6 +58,8 @@ macro_rules! canvas {
     };
 }
 
+/// Dynamic opcode profile (vm/prof.rs).
+pub mod prof;
 /// Threaded dispatch of `tick`'s bursts (vm/tc.rs).
 mod tc;
 /// Code units: a program's libraries (vm/units.rs).
@@ -369,35 +371,80 @@ const OP_FN_REF: u8 = 0x50; // + u16 func_id: push it tagged with the running un
 // in field order, on the target.
 const OP_W_SETALL: u8 = 0x51;
 
-// Quickened superinstructions: VM-internal opcodes 0x60..=0x7F, never
-// emitted by the compiler (ferrite-ui `ferrite_cc.py` keeps the range free;
-// `docs/bytecode.md`). The threaded dispatch (`vm/tc.rs`) rewrites a
-// superinstruction it runs whose cond / op operand has a form here into
-// that form, which has its own handler (no dispatch on the operand). Same
-// length and operands: `QUICK[q - Q_FIRST]` = (the superinstruction, the
-// cond / op), and every path runs `q` as that pair, ignoring the operand
-// byte (so any byte sequence runs the same in `exec_one` and `tc`).
-pub(crate) const Q_FIRST: u8 = 0x60;
-pub(crate) const QUICK: [(u8, u8); 28] = [
-    (OP_JCMP, OP_EQ), (OP_JCMP, OP_NE), (OP_JCMP, OP_LT),
-    (OP_JCMP, OP_LE), (OP_JCMP, OP_GT), (OP_JCMP, OP_GE),
-    (OP_JCMP_VI, OP_EQ), (OP_JCMP_VI, OP_NE), (OP_JCMP_VI, OP_LT),
-    (OP_JCMP_VI, OP_LE), (OP_JCMP_VI, OP_GT), (OP_JCMP_VI, OP_GE),
-    (OP_JCMP_VV, OP_EQ), (OP_JCMP_VV, OP_NE), (OP_JCMP_VV, OP_LT),
-    (OP_JCMP_VV, OP_LE), (OP_JCMP_VV, OP_GT), (OP_JCMP_VV, OP_GE),
-    (OP_BIN_I, OP_ADD), (OP_BIN_I, OP_SUB), (OP_BIN_I, OP_MUL), (OP_BIN_I, OP_AND),
-    (OP_BIN_I, OP_OR), (OP_BIN_I, OP_SHL), (OP_BIN_I, OP_SHR),
-    (OP_BIN_V, OP_ADD), (OP_BIN_V, OP_SUB),
-    (OP_STORE_OP, OP_ADD),
+// Quickened forms: VM-internal opcodes 0x58..=0x7F, never emitted by the
+// compiler (ferrite-ui `ferrite_cc.py` keeps the range free;
+// `docs/bytecode.md`). The threaded dispatch (`vm/tc.rs`) rewrites an
+// instruction it runs into its form here, which has its own handler: a
+// superinstruction by its cond / op operand (no dispatch on it), LOAD /
+// STORE / ADD_VI by the kind of their slot (no local-or-global choice). Same
+// length and operands. `QUICK[q - Q_FIRST]` = (the instruction, the cond /
+// op, the slot kind), and every path runs `q` as that instruction with that
+// cond / op (the operand byte ignored) and the slot operand forced to that
+// kind (`force_slot`), so any byte sequence runs the same in `exec_one` and
+// `tc`. Picked by the dynamic profile (`vm/prof.rs`, `scripts/vmprof.py`).
+pub(crate) const Q_FIRST: u8 = 0x58;
+/// Slot kinds of a quickened form: the operand as it is, forced local,
+/// forced global.
+pub(crate) const SLOT_ANY: u8 = 0;
+pub(crate) const SLOT_L: u8 = 1;
+pub(crate) const SLOT_G: u8 = 2;
+pub(crate) const QUICK: [(u8, u8, u8); 35] = [
+    (OP_JCMP, OP_EQ, SLOT_ANY), (OP_JCMP, OP_NE, SLOT_ANY), (OP_JCMP, OP_LT, SLOT_ANY),
+    (OP_JCMP, OP_LE, SLOT_ANY), (OP_JCMP, OP_GT, SLOT_ANY), (OP_JCMP, OP_GE, SLOT_ANY),
+    (OP_JCMP_VI, OP_EQ, SLOT_L), (OP_JCMP_VI, OP_NE, SLOT_L), (OP_JCMP_VI, OP_LT, SLOT_L),
+    (OP_JCMP_VI, OP_LE, SLOT_L), (OP_JCMP_VI, OP_GT, SLOT_L), (OP_JCMP_VI, OP_GE, SLOT_L),
+    (OP_JCMP_VV, OP_EQ, SLOT_ANY), (OP_JCMP_VV, OP_NE, SLOT_ANY), (OP_JCMP_VV, OP_LT, SLOT_ANY),
+    (OP_JCMP_VV, OP_LE, SLOT_ANY), (OP_JCMP_VV, OP_GT, SLOT_ANY), (OP_JCMP_VV, OP_GE, SLOT_ANY),
+    (OP_BIN_I, OP_ADD, SLOT_ANY), (OP_BIN_I, OP_SUB, SLOT_ANY), (OP_BIN_I, OP_MUL, SLOT_ANY),
+    (OP_BIN_I, OP_DIV, SLOT_ANY), (OP_BIN_I, OP_MOD, SLOT_ANY), (OP_BIN_I, OP_AND, SLOT_ANY),
+    (OP_BIN_I, OP_OR, SLOT_ANY), (OP_BIN_I, OP_SHL, SLOT_ANY), (OP_BIN_I, OP_SHR, SLOT_ANY),
+    (OP_BIN_V, OP_ADD, SLOT_ANY), (OP_BIN_V, OP_SUB, SLOT_ANY),
+    (OP_STORE_OP, OP_ADD, SLOT_L),
+    (OP_LOAD, 0, SLOT_L), (OP_LOAD, 0, SLOT_G), (OP_STORE, 0, SLOT_L), (OP_STORE, 0, SLOT_G),
+    (OP_ADD_VI, 0, SLOT_L),
 ];
 pub(crate) const Q_LAST: u8 = Q_FIRST + QUICK.len() as u8 - 1;
 const _: () = assert!(Q_LAST <= 0x7F);
 
-/// The quickened form of superinstruction `op` with cond / op operand
-/// `sub`, 0 if it has none.
+/// The form of (`op`, `sub`, `slot`) in `QUICK`, at compile time.
+const fn q_find(op: u8, sub: u8, slot: u8) -> u8 {
+    let mut i = 0;
+    while i < QUICK.len() {
+        if QUICK[i].0 == op && QUICK[i].1 == sub && QUICK[i].2 == slot {
+            return Q_FIRST + i as u8;
+        }
+        i += 1;
+    }
+    panic!("no such quickened form")
+}
+
+pub(crate) const Q_LOAD_L: u8 = q_find(OP_LOAD, 0, SLOT_L);
+pub(crate) const Q_LOAD_G: u8 = q_find(OP_LOAD, 0, SLOT_G);
+pub(crate) const Q_STORE_L: u8 = q_find(OP_STORE, 0, SLOT_L);
+pub(crate) const Q_STORE_G: u8 = q_find(OP_STORE, 0, SLOT_G);
+pub(crate) const Q_ADD_VI_L: u8 = q_find(OP_ADD_VI, 0, SLOT_L);
+
+/// A slot operand as a form of slot kind `kind` takes it.
 #[inline(always)]
-pub(crate) fn quick_of(op: u8, sub: u8) -> u8 {
-    QUICK_OF[(op - OP_JCMP) as usize & 15][sub as usize & 31] * (sub < 32) as u8
+pub(crate) fn force_slot(raw: u8, kind: u8) -> u8 {
+    match kind {
+        SLOT_L => raw | 0x80,
+        SLOT_G => raw & 0x7F,
+        _ => raw,
+    }
+}
+
+/// The quickened form of superinstruction `op` with cond / op operand
+/// `sub` and slot operand `slot` (any byte for those without one), 0 if it
+/// has none (or only one for the other slot kind).
+#[inline(always)]
+pub(crate) fn quick_of(op: u8, sub: u8, slot: u8) -> u8 {
+    let q = QUICK_OF[op.wrapping_sub(OP_JCMP) as usize & 15][sub as usize & 31] * (sub < 32) as u8;
+    // A superinstruction's forms are SLOT_ANY or SLOT_L.
+    if q != 0 && QUICK[(q - Q_FIRST) as usize].2 == SLOT_L && slot & 0x80 == 0 {
+        return 0;
+    }
+    q
 }
 
 /// `quick_of` as a table: [op - OP_JCMP][sub] (superinstructions without a
@@ -406,8 +453,10 @@ static QUICK_OF: [[u8; 32]; 16] = {
     let mut t = [[0u8; 32]; 16];
     let mut i = 0;
     while i < QUICK.len() {
-        let (op, sub) = QUICK[i];
-        t[(op - OP_JCMP) as usize][sub as usize] = Q_FIRST + i as u8;
+        let (op, sub, _) = QUICK[i];
+        if op >= OP_JCMP && op <= OP_STORE_OP && op != OP_ADD_VI {
+            t[(op - OP_JCMP) as usize][sub as usize] = Q_FIRST + i as u8;
+        }
         i += 1;
     }
     t
@@ -1336,7 +1385,9 @@ impl Vm {
             return;
         }
         let budget = budget.max(1);
-        let n = if THREADED { tc::run(self, ctx, budget) as u64 } else { self.burst_ref(ctx, budget) };
+        // The profile counts in `exec_one`: the burst goes there while it's on.
+        let threaded = THREADED && !prof::ON.load(core::sync::atomic::Ordering::Relaxed);
+        let n = if threaded { tc::run(self, ctx, budget) as u64 } else { self.burst_ref(ctx, budget) };
         self.instructions = self.instructions.wrapping_add(n);
     }
 
@@ -2050,6 +2101,9 @@ impl Vm {
     #[inline(always)]
     fn exec_one<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         self.op_pc = self.pc;
+        if prof::ON.load(core::sync::atomic::Ordering::Relaxed) {
+            prof::count(&self.code, self.pc as usize);
+        }
         let op = self.read_u8();
         if self.state == VmState::Error {
             return;
@@ -3085,12 +3139,9 @@ impl Vm {
             }
 
             OP_JCMP | OP_JCMP_VI | OP_JCMP_VV | OP_BIN_I | OP_BIN_I32 | OP_BIN_V | OP_STORE_OP => {
-                self.exec_super(op, None)
+                self.exec_super(op, None, SLOT_ANY)
             }
-            Q_FIRST..=Q_LAST => {
-                let (op, sub) = QUICK[(op - Q_FIRST) as usize];
-                self.exec_super(op, Some(sub))
-            }
+            Q_FIRST..=Q_LAST => self.exec_quick(op),
             OP_ADD_VI => {
                 let [raw, lo, hi] = self.fetch();
                 let imm = i16::from_le_bytes([lo, hi]) as i32;
@@ -3181,11 +3232,43 @@ impl Vm {
         }
     }
 
+    /// A quickened form (`QUICK`; pc past its opcode): its instruction with
+    /// the form's cond / op and slot kind.
+    #[inline(never)]
+    fn exec_quick(&mut self, q: u8) {
+        let (op, sub, kind) = QUICK[(q - Q_FIRST) as usize];
+        match op {
+            // As the plain LOAD / STORE / ADD_VI in `exec_one`.
+            OP_LOAD => {
+                let raw = force_slot(self.read_u8(), kind);
+                let slot = self.resolve_slot(raw);
+                let v = self.var_get(slot);
+                self.push(v);
+            }
+            OP_STORE => {
+                let raw = force_slot(self.read_u8(), kind);
+                let slot = self.resolve_slot(raw);
+                let v = self.pop();
+                self.var_set(slot, v);
+            }
+            OP_ADD_VI => {
+                let [raw, lo, hi] = self.fetch();
+                let imm = i16::from_le_bytes([lo, hi]) as i32;
+                if self.state != VmState::Error {
+                    let slot = self.resolve_slot(force_slot(raw, kind));
+                    let v = self.var_get(slot).wrapping_add(imm);
+                    self.var_set(slot, v);
+                }
+            }
+            _ => self.exec_super(op, Some(sub), kind),
+        }
+    }
+
     /// A superinstruction (pc past its opcode), its cond / op operand
     /// replaced by `sub` when given (a quickened form, `QUICK`: the operand
     /// byte is still read, then ignored).
     #[inline(always)]
-    fn exec_super(&mut self, op: u8, sub: Option<u8>) {
+    fn exec_super(&mut self, op: u8, sub: Option<u8>, kind: u8) {
         match op {
             OP_JCMP => {
                 let cond = sub.unwrap_or(self.read_u8());
@@ -3197,7 +3280,7 @@ impl Vm {
                 let [cond, raw, lo, hi] = self.fetch();
                 let imm = i16::from_le_bytes([lo, hi]) as i32;
                 let target = self.read_addr();
-                let a = self.var_get(self.resolve_slot(raw));
+                let a = self.var_get(self.resolve_slot(force_slot(raw, kind)));
                 self.jump_if(sub.unwrap_or(cond), a, imm, target);
             }
             OP_JCMP_VV => {
@@ -3225,7 +3308,7 @@ impl Vm {
                 let [op, raw] = self.fetch();
                 let b = self.pop();
                 if self.state != VmState::Error {
-                    let slot = self.resolve_slot(raw);
+                    let slot = self.resolve_slot(force_slot(raw, kind));
                     match int_binop(sub.unwrap_or(op), self.var_get(slot), b) {
                         Some(v) => self.var_set(slot, v),
                         None => self.fail(fault::BAD_OPCODE),
@@ -5183,9 +5266,11 @@ mod anim_tests {
             (OP_JCMP, 3), (OP_JCMP_VI, 6), (OP_JCMP_VV, 5), (OP_BIN_I, 3), (OP_BIN_I32, 5),
             (OP_BIN_V, 2), (OP_ADD_VI, 3), (OP_STORE_OP, 2), (OP_RET, 0), (OP_YIELD, 0),
             (OP_HALT, 0), (0xEE, 0), (OP_SYSCALL, 2),
-            // Quickened forms (QUICK), junk in their cond / op byte.
+            // Quickened forms (QUICK), junk in their cond / op byte, slots of
+            // either kind.
             (Q_FIRST + 2, 3), (Q_FIRST + 7, 6), (Q_FIRST + 15, 5), (Q_FIRST + 18, 3),
-            (Q_FIRST + 24, 3), (Q_FIRST + 26, 2), (Q_FIRST + 27, 2),
+            (Q_FIRST + 22, 3), (Q_FIRST + 26, 3), (Q_FIRST + 28, 2), (Q_FIRST + 29, 2),
+            (Q_LOAD_L, 1), (Q_LOAD_G, 1), (Q_STORE_L, 1), (Q_STORE_G, 1), (Q_ADD_VI_L, 3),
         ];
         // The quickened jumps (JCMP, JCMP_VI, JCMP_VV forms).
         let q_jump = |op: u8| (Q_FIRST..Q_FIRST + 18).contains(&op);
@@ -6141,9 +6226,10 @@ mod anim_tests {
     }
 
 
-    /// Each quickened form (`QUICK`) against its superinstruction, through
+    /// Each quickened form (`QUICK`) against its instruction, through
     /// `exec_one` and the threaded dispatch, with a junk cond / op operand
-    /// (ignored); the threaded dispatch rewrites the superinstruction to it.
+    /// and the slot operand's kind bit flipped (both ignored by the form);
+    /// the threaded dispatch rewrites the instruction to it.
     #[test]
     fn quickened_superops_match() {
         const VALS: [i32; 6] = [0, 1, -1, 7, -13, i32::MIN];
@@ -6151,11 +6237,14 @@ mod anim_tests {
             c.push(OP_PUSH_I32);
             c.extend_from_slice(&v.to_le_bytes());
         }
-        // (code, position of the superinstruction's opcode). Leaves the
-        // result on the stack.
-        fn program(op: u8, sub: u8, a: i32, b: i32) -> (std::vec::Vec<u8>, usize) {
+        // (code, position of the instruction's opcode, position of its
+        // forced slot operand). Leaves the result on the stack. Variable 1
+        // is global 1 and local 1 (frame_base and gbase 0); `slot` is the
+        // form's slot operand for it.
+        fn program(op: u8, sub: u8, slot: u8, a: i32, b: i32) -> (std::vec::Vec<u8>, usize, Option<usize>) {
             let mut c = std::vec::Vec::new();
             let at;
+            let mut slot_at = None;
             match op {
                 OP_JCMP | OP_JCMP_VI | OP_JCMP_VV => {
                     push32(&mut c, a);
@@ -6169,7 +6258,8 @@ mod anim_tests {
                     match op {
                         OP_JCMP => c.extend_from_slice(&[op, sub]),
                         OP_JCMP_VI => {
-                            c.extend_from_slice(&[op, sub, 1]);
+                            slot_at = Some(at + 2);
+                            c.extend_from_slice(&[op, sub, slot]);
                             c.extend_from_slice(&(b as i16).to_le_bytes());
                         }
                         _ => c.extend_from_slice(&[op, sub, 1, 2]),
@@ -6192,15 +6282,39 @@ mod anim_tests {
                     at = c.len();
                     c.extend_from_slice(&[op, sub, 1, OP_HALT]);
                 }
-                _ => {
+                OP_STORE_OP => {
                     push32(&mut c, a);
                     c.extend_from_slice(&[OP_STORE, 1]);
                     push32(&mut c, b);
                     at = c.len();
-                    c.extend_from_slice(&[op, sub, 1, OP_LOAD, 1, OP_HALT]);
+                    slot_at = Some(at + 2);
+                    c.extend_from_slice(&[op, sub, slot, OP_LOAD, 1, OP_HALT]);
+                }
+                OP_LOAD => {
+                    push32(&mut c, a);
+                    c.extend_from_slice(&[OP_STORE, 1]);
+                    at = c.len();
+                    slot_at = Some(at + 1);
+                    c.extend_from_slice(&[op, slot, OP_HALT]);
+                }
+                OP_STORE => {
+                    push32(&mut c, a);
+                    at = c.len();
+                    slot_at = Some(at + 1);
+                    c.extend_from_slice(&[op, slot, OP_LOAD, 1, OP_HALT]);
+                }
+                _ => {
+                    // OP_ADD_VI
+                    push32(&mut c, a);
+                    c.extend_from_slice(&[OP_STORE, 1]);
+                    at = c.len();
+                    slot_at = Some(at + 1);
+                    c.extend_from_slice(&[op, slot]);
+                    c.extend_from_slice(&(b as i16).to_le_bytes());
+                    c.extend_from_slice(&[OP_LOAD, 1, OP_HALT]);
                 }
             }
-            (c, at)
+            (c, at, slot_at)
         }
         fn threaded(code: &[u8]) -> Vm {
             let mut ctx = mock_ctx();
@@ -6216,31 +6330,116 @@ mod anim_tests {
             assert!(vm.state == VmState::Halted);
             vm.stack[vm.sp as usize - 1]
         }
-        for (i, &(op, sub)) in QUICK.iter().enumerate() {
+        let has_sub = |op: u8| (OP_JCMP..=OP_STORE_OP).contains(&op) && op != OP_ADD_VI;
+        for (i, &(op, sub, kind)) in QUICK.iter().enumerate() {
             let q = Q_FIRST + i as u8;
+            let slot = if kind == SLOT_L { 0x81 } else { 0x01 };
             for a in VALS {
                 for b in VALS {
-                    let what = alloc::format!("{op:#x} {sub:#x} {a} {b}");
-                    let (plain, at) = program(op, sub, a, b);
+                    let what = alloc::format!("{op:#x} {sub:#x} {kind} {a} {b}");
+                    let (plain, at, slot_at) = program(op, sub, slot, a, b);
                     let mut quick = plain.clone();
                     quick[at] = q;
-                    quick[at + 1] = 0xEE;
+                    if has_sub(op) {
+                        quick[at + 1] = 0xEE;
+                    }
+                    if let Some(k) = slot_at.filter(|_| kind != SLOT_ANY) {
+                        quick[k] ^= 0x80;
+                    }
                     let want = top(&run_code(&plain));
                     assert_eq!(top(&run_code(&quick)), want, "exec_one, {what}");
                     assert_eq!(top(&threaded(&quick)), want, "threaded, {what}");
                     let vm = threaded(&plain);
                     assert_eq!(top(&vm), want, "threaded plain, {what}");
                     assert_eq!(vm.code.bytes()[at], q, "quickened, {what}");
-                    assert_eq!(&vm.code.bytes()[at + 1..], &plain[at + 1..], "operands, {what}");
+                    // Its operands as they were (later LOADs / STOREs are quickened too).
+                    for k in [Some(at + 1), slot_at].into_iter().flatten() {
+                        assert_eq!(vm.code.bytes()[k], plain[k], "operand {k}, {what}");
+                    }
                 }
             }
         }
-        // Without a quickened form (DIV), or a bad op: left as it is.
-        for sub in [OP_DIV, 0x7F] {
-            let (plain, at) = program(OP_BIN_I, sub, 7, 2);
+        // Without a quickened form (BIN_I EQ, a bad op, JCMP_VI / STORE_OP /
+        // ADD_VI on a global): left as they are.
+        for (op, sub) in [(OP_BIN_I, OP_EQ), (OP_BIN_I, 0x7F), (OP_JCMP_VI, OP_LT), (OP_STORE_OP, OP_ADD), (OP_ADD_VI, 0)] {
+            let (plain, at, _) = program(op, sub, 0x01, 7, 2);
             let vm = threaded(&plain);
-            assert_eq!(vm.code.bytes()[at], OP_BIN_I);
+            assert_eq!(vm.code.bytes()[at], op, "{op:#x} {sub:#x}");
         }
+    }
+
+    /// A quickened form's slot kind is forced: a local form reads the local
+    /// whatever bit 7 says, a global form the global, on both paths.
+    #[test]
+    fn quickened_slot_kind_is_forced() {
+        // (code, the variable it reads / writes as its result): frame_base 4,
+        // so local 1 = variable 5 (42) and global 1 = variable 1 (7).
+        let cases: [(std::vec::Vec<u8>, i32); 6] = [
+            (std::vec![Q_LOAD_L, 0x01, OP_HALT], 42),
+            (std::vec![Q_LOAD_G, 0x81, OP_HALT], 7),
+            (std::vec![OP_PUSH_2, Q_STORE_L, 0x01, OP_LOAD, 0x81, OP_HALT], 2),
+            (std::vec![OP_PUSH_2, Q_STORE_G, 0x81, OP_LOAD, 0x01, OP_HALT], 2),
+            (std::vec![Q_ADD_VI_L, 0x01, 3, 0, OP_LOAD, 0x81, OP_HALT], 45),
+            (std::vec![OP_PUSH_1, quick_of(OP_STORE_OP, OP_ADD, 0x80), OP_ADD, 0x01, OP_LOAD, 0x81, OP_HALT], 43),
+        ];
+        for (code, want) in cases {
+            for threaded in [false, true] {
+                let mut ctx = mock_ctx();
+                let mut vm = Vm::new();
+                vm.code = VmCode::new(code.clone());
+                vm.frame_base = 4;
+                vm.var_set(5, 42);
+                vm.var_set(1, 7);
+                vm.state = VmState::Running;
+                while vm.state == VmState::Running {
+                    if threaded {
+                        vm.tick(&mut ctx, 1000);
+                    } else {
+                        vm.exec_one(&mut ctx);
+                    }
+                }
+                assert!(vm.state == VmState::Halted, "{code:x?}");
+                assert_eq!(vm.stack[vm.sp as usize - 1], want, "{code:x?} threaded {threaded}");
+            }
+        }
+    }
+
+    /// The profile counts quickened code as its instruction, with the cond
+    /// and the slot kinds. (Other tests running meanwhile may add to
+    /// the shared counters: at least the loop's counts.)
+    #[test]
+    fn profile_counts_superinstructions() {
+        // g1 = 0; loop: g1 += 1; if g1 != 100 goto loop
+        let code = std::vec![
+            OP_PUSH_0, OP_STORE, 0x81, OP_ADD_VI, 0x81, 1, 0, OP_JCMP_VI, OP_NE, 0x81, 100, 0, 3, 0, OP_HALT,
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        vm.code = VmCode::new(code);
+        let run = |vm: &mut Vm, ctx: &mut Ctx<crate::mock::MockPlatform>| {
+            vm.pc = 0;
+            vm.sp = 0;
+            vm.state = VmState::Running;
+            while vm.state == VmState::Running {
+                vm.tick(ctx, 1000);
+            }
+            assert_eq!(vm.var_get(1), 100);
+        };
+        run(&mut vm, &mut ctx); // threaded: quickens the JCMP_VI
+        assert_eq!(vm.code.bytes()[7], quick_of(OP_JCMP_VI, OP_NE, 0x81));
+        prof::reset();
+        prof::ON.store(true, core::sync::atomic::Ordering::Relaxed);
+        run(&mut vm, &mut ctx);
+        prof::ON.store(false, core::sync::atomic::Ordering::Relaxed);
+        let report = prof::report();
+        let count = |key: &str| -> u32 {
+            report.lines().find_map(|l| l.strip_prefix(key)).map_or(0, |n| n.trim().parse().unwrap())
+        };
+        assert!(count("total ") >= 203, "{report}");
+        assert!(count(&alloc::format!("op 0x{OP_JCMP_VI:02x} ")) >= 100, "{report}");
+        assert!(count(&alloc::format!("sub 0x{OP_JCMP_VI:02x} 0x{OP_NE:02x} ")) >= 100, "{report}");
+        assert!(count(&alloc::format!("slot 0x{OP_ADD_VI:02x} L ")) >= 100, "{report}");
+        assert_eq!(count(&alloc::format!("op 0x{:02x} ", quick_of(OP_JCMP_VI, OP_NE, 0x81))), 0, "{report}");
     }
 
     #[test]

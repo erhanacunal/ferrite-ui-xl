@@ -32,6 +32,7 @@
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
 //! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; `?scene=0\|1` syncs update the render pool's scene / capture it whole (`/api/status` `scene`); counters and the jobs' time breakdown in `/api/status` `rcore` |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
+//! | `POST /api/vmprof?on=0\|1&reset=1` | dynamic opcode profile (`ferrite_core::vm::prof`): counting on (the VM runs through `exec_one` meanwhile, much slower) / off, counters zeroed; `GET /api/vmprof` the counters as text (`scripts/vmprof.py` names and sorts them) |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
 //! | `POST /api/cpu?mhz=N` | wanted CPU clock, one of 200..1400 in steps of 100 (`cpuclock`), applied by CPU0 after the next pass under the thermal cap; without `mhz` the current one |
 //! | `POST /api/idle?sleep=0\|1` | idle sleep between passes off/on (`cpuclock::IDLE_SLEEP`) |
@@ -677,6 +678,26 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
 " } else { "on=0|1 (now off)
 " }).await?;
                 }
+            }
+        }
+        (b"GET", b"/api/vmprof") => {
+            text(socket, "200 OK", &ferrite_core::vm::prof::report()).await?;
+        }
+        (b"POST", b"/api/vmprof") => {
+            use core::sync::atomic::Ordering;
+            let on = query_param(query, b"on");
+            let reset = query_param(query, b"reset");
+            let bit = |v: Option<&[u8]>| matches!(v, None | Some(b"0" | b"1"));
+            if (on.is_some() || reset.is_some()) && bit(on) && bit(reset) {
+                if reset == Some(b"1") {
+                    ferrite_core::vm::prof::reset();
+                }
+                if let Some(v) = on {
+                    ferrite_core::vm::prof::ON.store(v == b"1", Ordering::Relaxed);
+                }
+                text(socket, "200 OK", "vm profile set\n").await?;
+            } else {
+                text(socket, "400 Bad Request", "on=0|1 and/or reset=1\n").await?;
             }
         }
         (b"POST", b"/api/layercache") => {

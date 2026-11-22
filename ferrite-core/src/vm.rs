@@ -82,15 +82,25 @@ const TC_PAD: u8 = 0xFF;
 /// `len` code bytes, then `CODE_PAD` bytes of `TC_PAD`. Shared: a library's
 /// code is one buffer for every task that imports it (`vm/units.rs`); `ptr`
 /// caches its start, so a jump reads one field as before.
+///
+/// The bytes change in one way only: the threaded dispatch rewrites a
+/// superinstruction's opcode to its quickened form (`quicken`, `QUICK`),
+/// which every path runs the same as the original.
 #[derive(Clone)]
 pub struct VmCode {
-    buf: Arc<Vec<u8>>,
-    ptr: *const u8,
+    buf: Arc<CodeBuf>,
+    ptr: *mut u8,
     len: usize,
 }
 
-// SAFETY: `ptr` points into `buf`, which never changes after `new` and lives
-// as long as any clone.
+/// `VmCode`'s buffer: written in place by `VmCode::quicken`.
+struct CodeBuf(core::cell::UnsafeCell<Vec<u8>>);
+
+// SAFETY: `ptr` points into `buf`, whose allocation never changes after
+// `new` and lives as long as any clone. Its bytes change only through
+// `quicken`, from the thread that runs the VMs (the runtime loop runs every
+// task, so no VM sharing the buffer reads it meanwhile), while no slice from
+// `bytes` is alive (those are local to one `exec_one` instruction).
 unsafe impl Send for VmCode {}
 unsafe impl Sync for VmCode {}
 
@@ -105,9 +115,25 @@ impl VmCode {
     pub fn new(mut buf: Vec<u8>) -> Self {
         let len = buf.len();
         buf.resize(len + CODE_PAD, TC_PAD);
-        let buf = Arc::new(buf);
-        let ptr = buf.as_ptr();
+        let buf = Arc::new(CodeBuf(core::cell::UnsafeCell::new(buf)));
+        // SAFETY: nothing else holds the buffer yet.
+        let ptr = unsafe { (*buf.0.get()).as_mut_ptr() };
         Self { buf, ptr, len }
+    }
+
+    /// Replace the opcode at `at` (a superinstruction's, inside the code)
+    /// with its quickened form `q` (`QUICK`): same length and operands, the
+    /// same result on every path.
+    ///
+    /// # Safety
+    /// `at` is `ptr() + i` for an `i < len()`; called as `VmCode`'s Sync note
+    /// says.
+    #[inline(always)]
+    pub(crate) unsafe fn quicken(&self, at: *const u8, q: u8) {
+        debug_assert!((at as usize) >= self.ptr as usize && (at as usize) < self.ptr as usize + self.len);
+        // SAFETY: inside the buffer (caller), `ptr`'s provenance is the
+        // UnsafeCell's (new).
+        unsafe { *self.ptr.add(at as usize - self.ptr as usize) = q };
     }
 
     #[inline]
@@ -125,7 +151,7 @@ impl VmCode {
     /// Start of the buffer (code, then the pad).
     #[inline(always)]
     pub(crate) fn ptr(&self) -> *const u8 {
-        self.ptr
+        self.ptr as *const u8
     }
 
     /// The byte at `pos`, 0 past the end.
@@ -342,6 +368,50 @@ const OP_FN_REF: u8 = 0x50; // + u16 func_id: push it tagged with the running un
 // in reverse field order). Each field does what its W_SET / W_SET_LEN would,
 // in field order, on the target.
 const OP_W_SETALL: u8 = 0x51;
+
+// Quickened superinstructions: VM-internal opcodes 0x60..=0x7F, never
+// emitted by the compiler (ferrite-ui `ferrite_cc.py` keeps the range free;
+// `docs/bytecode.md`). The threaded dispatch (`vm/tc.rs`) rewrites a
+// superinstruction it runs whose cond / op operand has a form here into
+// that form, which has its own handler (no dispatch on the operand). Same
+// length and operands: `QUICK[q - Q_FIRST]` = (the superinstruction, the
+// cond / op), and every path runs `q` as that pair, ignoring the operand
+// byte (so any byte sequence runs the same in `exec_one` and `tc`).
+pub(crate) const Q_FIRST: u8 = 0x60;
+pub(crate) const QUICK: [(u8, u8); 28] = [
+    (OP_JCMP, OP_EQ), (OP_JCMP, OP_NE), (OP_JCMP, OP_LT),
+    (OP_JCMP, OP_LE), (OP_JCMP, OP_GT), (OP_JCMP, OP_GE),
+    (OP_JCMP_VI, OP_EQ), (OP_JCMP_VI, OP_NE), (OP_JCMP_VI, OP_LT),
+    (OP_JCMP_VI, OP_LE), (OP_JCMP_VI, OP_GT), (OP_JCMP_VI, OP_GE),
+    (OP_JCMP_VV, OP_EQ), (OP_JCMP_VV, OP_NE), (OP_JCMP_VV, OP_LT),
+    (OP_JCMP_VV, OP_LE), (OP_JCMP_VV, OP_GT), (OP_JCMP_VV, OP_GE),
+    (OP_BIN_I, OP_ADD), (OP_BIN_I, OP_SUB), (OP_BIN_I, OP_MUL), (OP_BIN_I, OP_AND),
+    (OP_BIN_I, OP_OR), (OP_BIN_I, OP_SHL), (OP_BIN_I, OP_SHR),
+    (OP_BIN_V, OP_ADD), (OP_BIN_V, OP_SUB),
+    (OP_STORE_OP, OP_ADD),
+];
+pub(crate) const Q_LAST: u8 = Q_FIRST + QUICK.len() as u8 - 1;
+const _: () = assert!(Q_LAST <= 0x7F);
+
+/// The quickened form of superinstruction `op` with cond / op operand
+/// `sub`, 0 if it has none.
+#[inline(always)]
+pub(crate) fn quick_of(op: u8, sub: u8) -> u8 {
+    QUICK_OF[(op - OP_JCMP) as usize & 15][sub as usize & 31] * (sub < 32) as u8
+}
+
+/// `quick_of` as a table: [op - OP_JCMP][sub] (superinstructions without a
+/// quickened form: rows of 0).
+static QUICK_OF: [[u8; 32]; 16] = {
+    let mut t = [[0u8; 32]; 16];
+    let mut i = 0;
+    while i < QUICK.len() {
+        let (op, sub) = QUICK[i];
+        t[(op - OP_JCMP) as usize][sub as usize] = Q_FIRST + i as u8;
+        i += 1;
+    }
+    t
+};
 
 /// The integer binary ops (and comparisons, as 0/1) by opcode, as the plain
 /// opcodes compute them. None = not a binary op.
@@ -3014,38 +3084,12 @@ impl Vm {
                 self.push(libm::ceilf(v).to_bits() as i32);
             }
 
-            OP_JCMP => {
-                let cond = self.read_u8();
-                let target = self.read_addr();
-                let (a, b) = self.pop2();
-                self.jump_if(cond, a, b, target);
+            OP_JCMP | OP_JCMP_VI | OP_JCMP_VV | OP_BIN_I | OP_BIN_I32 | OP_BIN_V | OP_STORE_OP => {
+                self.exec_super(op, None)
             }
-            OP_JCMP_VI => {
-                let [cond, raw, lo, hi] = self.fetch();
-                let imm = i16::from_le_bytes([lo, hi]) as i32;
-                let target = self.read_addr();
-                let a = self.var_get(self.resolve_slot(raw));
-                self.jump_if(cond, a, imm, target);
-            }
-            OP_JCMP_VV => {
-                let [cond, ra, rb] = self.fetch();
-                let target = self.read_addr();
-                let a = self.var_get(self.resolve_slot(ra));
-                let b = self.var_get(self.resolve_slot(rb));
-                self.jump_if(cond, a, b, target);
-            }
-            OP_BIN_I => {
-                let [op, lo, hi] = self.fetch();
-                self.top_binop(op, i16::from_le_bytes([lo, hi]) as i32);
-            }
-            OP_BIN_I32 => {
-                let [op, a, b, c, d] = self.fetch();
-                self.top_binop(op, i32::from_le_bytes([a, b, c, d]));
-            }
-            OP_BIN_V => {
-                let [op, raw] = self.fetch();
-                let b = self.var_get(self.resolve_slot(raw));
-                self.top_binop(op, b);
+            Q_FIRST..=Q_LAST => {
+                let (op, sub) = QUICK[(op - Q_FIRST) as usize];
+                self.exec_super(op, Some(sub))
             }
             OP_ADD_VI => {
                 let [raw, lo, hi] = self.fetch();
@@ -3054,17 +3098,6 @@ impl Vm {
                     let slot = self.resolve_slot(raw);
                     let v = self.var_get(slot).wrapping_add(imm);
                     self.var_set(slot, v);
-                }
-            }
-            OP_STORE_OP => {
-                let [op, raw] = self.fetch();
-                let b = self.pop();
-                if self.state != VmState::Error {
-                    let slot = self.resolve_slot(raw);
-                    match int_binop(op, self.var_get(slot), b) {
-                        Some(v) => self.var_set(slot, v),
-                        None => self.fail(fault::BAD_OPCODE),
-                    }
                 }
             }
             OP_CALL_IMP => {
@@ -3145,6 +3178,60 @@ impl Vm {
         match int_binop(op, *top, b) {
             Some(v) => *top = v,
             None => self.fail(fault::BAD_OPCODE),
+        }
+    }
+
+    /// A superinstruction (pc past its opcode), its cond / op operand
+    /// replaced by `sub` when given (a quickened form, `QUICK`: the operand
+    /// byte is still read, then ignored).
+    #[inline(always)]
+    fn exec_super(&mut self, op: u8, sub: Option<u8>) {
+        match op {
+            OP_JCMP => {
+                let cond = sub.unwrap_or(self.read_u8());
+                let target = self.read_addr();
+                let (a, b) = self.pop2();
+                self.jump_if(cond, a, b, target);
+            }
+            OP_JCMP_VI => {
+                let [cond, raw, lo, hi] = self.fetch();
+                let imm = i16::from_le_bytes([lo, hi]) as i32;
+                let target = self.read_addr();
+                let a = self.var_get(self.resolve_slot(raw));
+                self.jump_if(sub.unwrap_or(cond), a, imm, target);
+            }
+            OP_JCMP_VV => {
+                let [cond, ra, rb] = self.fetch();
+                let target = self.read_addr();
+                let a = self.var_get(self.resolve_slot(ra));
+                let b = self.var_get(self.resolve_slot(rb));
+                self.jump_if(sub.unwrap_or(cond), a, b, target);
+            }
+            OP_BIN_I => {
+                let [op, lo, hi] = self.fetch();
+                self.top_binop(sub.unwrap_or(op), i16::from_le_bytes([lo, hi]) as i32);
+            }
+            OP_BIN_I32 => {
+                let [op, a, b, c, d] = self.fetch();
+                self.top_binop(sub.unwrap_or(op), i32::from_le_bytes([a, b, c, d]));
+            }
+            OP_BIN_V => {
+                let [op, raw] = self.fetch();
+                let b = self.var_get(self.resolve_slot(raw));
+                self.top_binop(sub.unwrap_or(op), b);
+            }
+            _ => {
+                // OP_STORE_OP
+                let [op, raw] = self.fetch();
+                let b = self.pop();
+                if self.state != VmState::Error {
+                    let slot = self.resolve_slot(raw);
+                    match int_binop(sub.unwrap_or(op), self.var_get(slot), b) {
+                        Some(v) => self.var_set(slot, v),
+                        None => self.fail(fault::BAD_OPCODE),
+                    }
+                }
+            }
         }
     }
 
@@ -5096,7 +5183,12 @@ mod anim_tests {
             (OP_JCMP, 3), (OP_JCMP_VI, 6), (OP_JCMP_VV, 5), (OP_BIN_I, 3), (OP_BIN_I32, 5),
             (OP_BIN_V, 2), (OP_ADD_VI, 3), (OP_STORE_OP, 2), (OP_RET, 0), (OP_YIELD, 0),
             (OP_HALT, 0), (0xEE, 0), (OP_SYSCALL, 2),
+            // Quickened forms (QUICK), junk in their cond / op byte.
+            (Q_FIRST + 2, 3), (Q_FIRST + 7, 6), (Q_FIRST + 15, 5), (Q_FIRST + 18, 3),
+            (Q_FIRST + 24, 3), (Q_FIRST + 26, 2), (Q_FIRST + 27, 2),
         ];
+        // The quickened jumps (JCMP, JCMP_VI, JCMP_VV forms).
+        let q_jump = |op: u8| (Q_FIRST..Q_FIRST + 18).contains(&op);
         let mut seed = 0x1234_5678u32;
         let mut rnd = move || {
             seed ^= seed << 13;
@@ -5104,7 +5196,10 @@ mod anim_tests {
             seed ^= seed << 5;
             seed
         };
-        for prog in 0..1500 {
+        for prog in 0..2000 {
+            // A quarter in wide-address images (u32 targets).
+            let wide = prog % 4 == 3;
+            let aw = if wide { 4 } else { 2 };
             let len = 4 + rnd() as usize % 60;
             let mut code = alloc::vec::Vec::new();
             // Instruction starts, and where each jump target goes.
@@ -5114,7 +5209,9 @@ mod anim_tests {
                 let (op, nargs) = OPS[rnd() as usize % OPS.len()];
                 starts.push(code.len());
                 code.push(op);
-                let jumpy = matches!(op, OP_JMP | OP_JZ | OP_JNZ | OP_CALL | OP_JCMP | OP_JCMP_VI | OP_JCMP_VV);
+                let jumpy = matches!(op, OP_JMP | OP_JZ | OP_JNZ | OP_CALL | OP_JCMP | OP_JCMP_VI | OP_JCMP_VV)
+                    || q_jump(op);
+                let nargs = if jumpy { nargs + aw - 2 } else { nargs };
                 for k in 0..nargs {
                     let b = match (op, k) {
                         // Mostly valid conditions / operators, a few bad ones.
@@ -5128,13 +5225,22 @@ mod anim_tests {
                     code.push(b);
                 }
                 if jumpy {
-                    targets.push(code.len() - 2);
+                    targets.push(code.len() - aw);
                 }
             }
-            // Jump to an instruction, now and then past the code.
+            // Jump to an instruction, now and then past the code (and, wide,
+            // past 64 K).
             for &at in &targets {
-                let t = if rnd() % 16 == 0 { len + rnd() as usize % 300 } else { starts[rnd() as usize % starts.len()] };
-                code[at..at + 2].copy_from_slice(&(t as u16).to_le_bytes());
+                let t = match rnd() % 16 {
+                    0 => len + rnd() as usize % 300,
+                    1 if wide => 0x1_0000 + starts[rnd() as usize % starts.len()],
+                    _ => starts[rnd() as usize % starts.len()],
+                };
+                if wide {
+                    code[at..at + 4].copy_from_slice(&(t as u32).to_le_bytes());
+                } else {
+                    code[at..at + 2].copy_from_slice(&(t as u16).to_le_bytes());
+                }
             }
             if rnd() % 4 == 0 {
                 code.truncate(code.len() - 1); // an instruction cut off
@@ -5152,6 +5258,7 @@ mod anim_tests {
                     (id != 7).then(|| args.iter().fold(id as i32, |s, &x| s.wrapping_mul(31).wrapping_add(x)))
                 }
                 for v in [&mut a, &mut b] {
+                    v.wide_addr = wide;
                     v.syscall_fn = Some(sys);
                     v.global_count = 8;
                     v.frame_base = 8;
@@ -6033,6 +6140,108 @@ mod anim_tests {
         }
     }
 
+
+    /// Each quickened form (`QUICK`) against its superinstruction, through
+    /// `exec_one` and the threaded dispatch, with a junk cond / op operand
+    /// (ignored); the threaded dispatch rewrites the superinstruction to it.
+    #[test]
+    fn quickened_superops_match() {
+        const VALS: [i32; 6] = [0, 1, -1, 7, -13, i32::MIN];
+        fn push32(c: &mut std::vec::Vec<u8>, v: i32) {
+            c.push(OP_PUSH_I32);
+            c.extend_from_slice(&v.to_le_bytes());
+        }
+        // (code, position of the superinstruction's opcode). Leaves the
+        // result on the stack.
+        fn program(op: u8, sub: u8, a: i32, b: i32) -> (std::vec::Vec<u8>, usize) {
+            let mut c = std::vec::Vec::new();
+            let at;
+            match op {
+                OP_JCMP | OP_JCMP_VI | OP_JCMP_VV => {
+                    push32(&mut c, a);
+                    c.extend_from_slice(&[OP_STORE, 1]);
+                    push32(&mut c, b);
+                    c.extend_from_slice(&[OP_STORE, 2]);
+                    if op == OP_JCMP {
+                        c.extend_from_slice(&[OP_LOAD, 1, OP_LOAD, 2]);
+                    }
+                    at = c.len();
+                    match op {
+                        OP_JCMP => c.extend_from_slice(&[op, sub]),
+                        OP_JCMP_VI => {
+                            c.extend_from_slice(&[op, sub, 1]);
+                            c.extend_from_slice(&(b as i16).to_le_bytes());
+                        }
+                        _ => c.extend_from_slice(&[op, sub, 1, 2]),
+                    }
+                    let t = (c.len() + 2 + 2) as u16;
+                    c.extend_from_slice(&t.to_le_bytes());
+                    c.extend_from_slice(&[OP_PUSH_0, OP_HALT, OP_PUSH_1, OP_HALT]);
+                }
+                OP_BIN_I => {
+                    push32(&mut c, a);
+                    at = c.len();
+                    c.extend_from_slice(&[op, sub]);
+                    c.extend_from_slice(&(b as i16).to_le_bytes());
+                    c.push(OP_HALT);
+                }
+                OP_BIN_V => {
+                    push32(&mut c, b);
+                    c.extend_from_slice(&[OP_STORE, 1]);
+                    push32(&mut c, a);
+                    at = c.len();
+                    c.extend_from_slice(&[op, sub, 1, OP_HALT]);
+                }
+                _ => {
+                    push32(&mut c, a);
+                    c.extend_from_slice(&[OP_STORE, 1]);
+                    push32(&mut c, b);
+                    at = c.len();
+                    c.extend_from_slice(&[op, sub, 1, OP_LOAD, 1, OP_HALT]);
+                }
+            }
+            (c, at)
+        }
+        fn threaded(code: &[u8]) -> Vm {
+            let mut ctx = mock_ctx();
+            let mut vm = Vm::new();
+            vm.code = VmCode::new(code.to_vec());
+            vm.state = VmState::Running;
+            while vm.state == VmState::Running {
+                vm.tick(&mut ctx, 1000);
+            }
+            vm
+        }
+        fn top(vm: &Vm) -> i32 {
+            assert!(vm.state == VmState::Halted);
+            vm.stack[vm.sp as usize - 1]
+        }
+        for (i, &(op, sub)) in QUICK.iter().enumerate() {
+            let q = Q_FIRST + i as u8;
+            for a in VALS {
+                for b in VALS {
+                    let what = alloc::format!("{op:#x} {sub:#x} {a} {b}");
+                    let (plain, at) = program(op, sub, a, b);
+                    let mut quick = plain.clone();
+                    quick[at] = q;
+                    quick[at + 1] = 0xEE;
+                    let want = top(&run_code(&plain));
+                    assert_eq!(top(&run_code(&quick)), want, "exec_one, {what}");
+                    assert_eq!(top(&threaded(&quick)), want, "threaded, {what}");
+                    let vm = threaded(&plain);
+                    assert_eq!(top(&vm), want, "threaded plain, {what}");
+                    assert_eq!(vm.code.bytes()[at], q, "quickened, {what}");
+                    assert_eq!(&vm.code.bytes()[at + 1..], &plain[at + 1..], "operands, {what}");
+                }
+            }
+        }
+        // Without a quickened form (DIV), or a bad op: left as it is.
+        for sub in [OP_DIV, 0x7F] {
+            let (plain, at) = program(OP_BIN_I, sub, 7, 2);
+            let vm = threaded(&plain);
+            assert_eq!(vm.code.bytes()[at], OP_BIN_I);
+        }
+    }
 
     #[test]
     fn fault_bad_opcode() {

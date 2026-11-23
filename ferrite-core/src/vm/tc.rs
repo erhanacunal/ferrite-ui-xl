@@ -14,6 +14,10 @@
 //! the `exec_one` loop (a critical section continues one instruction at a
 //! time past it, `budget_out`).
 //!
+//! Handlers are generic over the platform `P` (one table per platform,
+//! `Table::<P>::T`; a firmware has one): the burst's `Ctx<P>` is at hand
+//! (`ctx`), so a handler may reach any of it, as `exec_one` does.
+//!
 //! Quickening: an instruction with a quickened form (`QUICK`: a
 //! superinstruction by its cond / op and slot kind, LOAD / STORE / ADD_VI /
 //! ARR_LOAD_V by their slot's kind) rewrites its opcode to that form the first time it runs here
@@ -43,11 +47,11 @@ macro_rules! next {
     ($vm:ident, $pc:expr, $sp:expr, $n:ident) => {{
         let pc: *const u8 = $pc;
         if $n == 1 {
-            become budget_out($vm, pc, $sp, 1)
+            become budget_out::<P>($vm, pc, $sp, 1)
         }
         // SAFETY: inside the code buffer (code + pad, see the module docs).
         let op = unsafe { *pc };
-        become TABLE[op as usize]($vm, unsafe { pc.add(1) }, $sp, $n - 1)
+        become tab::<P>()[op as usize]($vm, unsafe { pc.add(1) }, $sp, $n - 1)
     }};
 }
 
@@ -57,7 +61,7 @@ macro_rules! jump {
         let t: usize = $t;
         let sp: *mut i32 = $sp;
         if t >= $vm.code.len() {
-            return jump_out($vm, t, sp, $n);
+            return jump_out::<P>($vm, t, sp, $n);
         }
         next!($vm, unsafe { $vm.code.ptr().add(t) }, sp, $n)
     }};
@@ -102,7 +106,7 @@ macro_rules! quicken {
             // SAFETY: the opcode is inside the code (module docs); one
             // thread runs the VMs (`VmCode`).
             unsafe { $vm.code.quicken($pc.sub(1), q) };
-            become TABLE[q as usize]($vm, $pc, $sp, $n)
+            become tab::<P>()[q as usize]($vm, $pc, $sp, $n)
         }
     };
 }
@@ -111,15 +115,18 @@ macro_rules! quicken {
 /// pointer (next free slot), the budget left (this instruction included).
 type Handler = fn(&mut Vm, *const u8, *mut i32, u32);
 
-/// `exec_one` for the platform of the running burst (`Vm::tc_slow`).
-pub(super) type Slow = fn(&mut Vm, usize);
+/// The running burst's `Ctx` (`Vm::tc_ctx`).
+#[inline(always)]
+fn ctx<'a, P: Platform>(vm: &Vm) -> &'a mut Ctx<P> {
+    // SAFETY: set by `run` from its `&mut Ctx<P>`, which outlives the burst;
+    // nothing else holds it while a handler runs.
+    unsafe { &mut *(vm.tc_ctx as *mut Ctx<P>) }
+}
 
-pub(super) fn no_slow(_: &mut Vm, _: usize) {}
-
-fn slow_exec<P: Platform>(vm: &mut Vm, ctx: usize) {
-    // SAFETY: set by `run` from its `&mut Ctx<P>`, which outlives the burst.
-    let ctx = unsafe { &mut *(ctx as *mut Ctx<P>) };
-    vm.exec_one(ctx);
+/// The instruction at `vm.pc` through `exec_one` (inlined here once).
+#[inline(never)]
+fn exec_slow<P: Platform>(vm: &mut Vm) {
+    vm.exec_one(ctx::<P>(vm));
 }
 
 /// Runs `vm` (state `Running`, `budget` >= 1) until it leaves `Running` or
@@ -127,9 +134,6 @@ fn slow_exec<P: Platform>(vm: &mut Vm, ctx: usize) {
 pub(super) fn run<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, budget: u32) -> u32 {
     let cp = ctx as *mut Ctx<P>;
     vm.tc_ctx = cp as usize;
-    // SAFETY: from the same pointer, valid for the burst.
-    vm.tc_objs = unsafe { &raw mut (*cp).objs };
-    vm.tc_slow = slow_exec::<P>;
     vm.tc_limit = budget;
     vm.tc_base = 0;
     vm.tc_n = 0;
@@ -141,7 +145,7 @@ pub(super) fn run<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, budget: u32) -> u3
     // SAFETY: pc < len; sp <= stack.len() (see `Vm::pop2_raw`).
     let (pc, sp) = unsafe { (vm.code.ptr().add(vm.pc as usize), vm.stack.as_mut_ptr().add(vm.sp as usize)) };
     let op = unsafe { *pc } as usize;
-    TABLE[op](vm, unsafe { pc.add(1) }, sp, budget);
+    tab::<P>()[op](vm, unsafe { pc.add(1) }, sp, budget);
     vm.tc_n
 }
 
@@ -156,13 +160,13 @@ fn ran(vm: &Vm, n: u32) -> u32 {
 /// loop doesn't count its instructions against the budget).
 #[cold]
 #[inline(never)]
-fn budget_out(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn budget_out<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     if vm.critical {
         vm.tc_base = ran(vm, n);
         vm.tc_limit = 1;
         // SAFETY: as in `next!`.
         let op = unsafe { *pc };
-        become TABLE[op as usize](vm, unsafe { pc.add(1) }, sp, 1)
+        become tab::<P>()[op as usize](vm, unsafe { pc.add(1) }, sp, 1)
     }
     vm.pc = off(vm, pc);
     save_sp(vm, sp);
@@ -204,22 +208,22 @@ fn fail_at<const CODE: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 /// A jump or call to a target outside the code: the checked path faults it.
 #[cold]
 #[inline(never)]
-fn jump_out(vm: &mut Vm, target: usize, sp: *mut i32, n: u32) {
+fn jump_out<P: Platform>(vm: &mut Vm, target: usize, sp: *mut i32, n: u32) {
     vm.pc = target as CodeAddr;
     save_sp(vm, sp);
     vm.tc_n = ran(vm, n);
     if n > 1 || vm.critical {
-        (vm.tc_slow)(vm, vm.tc_ctx); // CODE_OOB, as the next instruction
+        exec_slow::<P>(vm); // CODE_OOB, as the next instruction
         vm.tc_n += 1;
     }
 }
 
 /// Any opcode without a handler here: through `exec_one`.
 #[inline(never)]
-fn slow(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn slow<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     vm.pc = off(vm, pc) - 1; // at the opcode: exec_one reads it again
     save_sp(vm, sp);
-    (vm.tc_slow)(vm, vm.tc_ctx);
+    exec_slow::<P>(vm);
     if vm.state != VmState::Running {
         vm.tc_n = ran(vm, n);
         return;
@@ -228,7 +232,7 @@ fn slow(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
         // Out of the code (a RET, say): leave; the checked path faults it.
         vm.tc_n = ran(vm, n);
         if n > 1 || vm.critical {
-            (vm.tc_slow)(vm, vm.tc_ctx); // CODE_OOB, as the next instruction
+            exec_slow::<P>(vm); // CODE_OOB, as the next instruction
             vm.tc_n += 1;
         }
         return;
@@ -242,7 +246,7 @@ fn slow(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 /// a b → a <op> b.
 macro_rules! bin {
     ($name:ident, |$a:ident, $b:ident| $e:expr) => {
-        fn $name(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+        fn $name<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
             need!(vm, pc, sp, n, 2);
             unsafe {
                 let $b = *sp.sub(1);
@@ -273,7 +277,7 @@ bin!(op_ge, |a, b| (a >= b) as i32);
 /// a → <op> a.
 macro_rules! unary {
     ($name:ident, |$a:ident| $e:expr) => {
-        fn $name(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+        fn $name<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
             need!(vm, pc, sp, n, 1);
             unsafe {
                 let $a = *sp.sub(1);
@@ -289,7 +293,7 @@ unary!(op_not, |a| (a == 0) as i32);
 
 macro_rules! push_const {
     ($name:ident, $v:expr) => {
-        fn $name(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+        fn $name<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
             push!(vm, pc, sp, n, $v, pc)
         }
     };
@@ -302,7 +306,7 @@ push_const!(op_push_m1, -1);
 
 macro_rules! load_k {
     ($name:ident, $k:expr) => {
-        fn $name(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+        fn $name<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
             push!(vm, pc, sp, n, vm.var_get(vm.frame_base + $k), pc)
         }
     };
@@ -316,7 +320,7 @@ load_k!(op_load_4, 4);
 
 macro_rules! store_k {
     ($name:ident, $k:expr) => {
-        fn $name(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+        fn $name<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
             need!(vm, pc, sp, n, 1);
             unsafe {
                 let sp = sp.sub(1);
@@ -345,18 +349,18 @@ unsafe fn addr(pc: *const u8) -> (usize, *const u8) {
     unsafe { (u32::from_le_bytes(bytes(pc)) as usize, pc.add(4)) }
 }
 
-fn op_pop(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_pop<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     next!(vm, pc, unsafe { sp.sub(1) }, n)
 }
 
-fn op_dup(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_dup<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     // As `Vm::peek`: an empty stack reads 0.
     let v = if (sp as usize) > vm.tc_lo { unsafe { *sp.sub(1) } } else { 0 };
     push!(vm, pc, sp, n, v, pc)
 }
 
-fn op_swap(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_swap<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 2);
     unsafe {
         core::ptr::swap(sp.sub(1), sp.sub(2));
@@ -364,15 +368,15 @@ fn op_swap(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     next!(vm, pc, sp, n)
 }
 
-fn op_push_i8(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_push_i8<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     push!(vm, pc, sp, n, unsafe { *pc } as i8 as i32, unsafe { pc.add(1) })
 }
 
-fn op_push_i16(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_push_i16<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     push!(vm, pc, sp, n, i16::from_le_bytes(unsafe { bytes(pc) }) as i32, unsafe { pc.add(2) })
 }
 
-fn op_push_i32(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_push_i32<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     push!(vm, pc, sp, n, i32::from_le_bytes(unsafe { bytes(pc) }), unsafe { pc.add(4) })
 }
 
@@ -389,21 +393,21 @@ fn global(vm: &Vm, raw: u8) -> u32 {
 }
 
 /// LOAD / STORE: always quickened (by the slot's kind).
-fn op_load(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_load<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let q = if unsafe { *pc } & 0x80 != 0 { Q_LOAD_L } else { Q_LOAD_G };
     // SAFETY: as in `quicken!`.
     unsafe { vm.code.quicken(pc.sub(1), q) };
-    become TABLE[q as usize](vm, pc, sp, n)
+    become tab::<P>()[q as usize](vm, pc, sp, n)
 }
 
-fn op_store(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_store<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let q = if unsafe { *pc } & 0x80 != 0 { Q_STORE_L } else { Q_STORE_G };
     // SAFETY: as in `quicken!`.
     unsafe { vm.code.quicken(pc.sub(1), q) };
-    become TABLE[q as usize](vm, pc, sp, n)
+    become tab::<P>()[q as usize](vm, pc, sp, n)
 }
 
-fn op_frame(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_frame<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let count = unsafe { *pc };
     if vm.frame_base + count as u32 > vm.var_slots {
         fail!(vm, pc, sp, n, fault::VARS_FULL);
@@ -412,7 +416,7 @@ fn op_frame(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     next!(vm, unsafe { pc.add(1) }, sp, n)
 }
 
-fn op_frame_a(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_frame_a<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
     let [count, nargs] = unsafe { bytes(pc) };
     if vm.frame_base + count as u32 > vm.var_slots {
@@ -444,12 +448,12 @@ fn op_frame_a(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn op_jmp(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_jmp<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let (t, _) = unsafe { addr(pc) };
     jump!(vm, t, sp, n)
 }
 
-fn op_jz(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_jz<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     unsafe {
         let (t, after) = addr(pc);
@@ -461,7 +465,7 @@ fn op_jz(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn op_jnz(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_jnz<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     unsafe {
         let (t, after) = addr(pc);
@@ -473,7 +477,7 @@ fn op_jnz(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn op_call(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_call<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let (t, after) = unsafe { addr(pc) };
     let depth = vm.call_sp as usize;
     if depth >= vm.call_stack.len() {
@@ -494,17 +498,17 @@ fn op_call(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 
 /// A plain return: no callback or modal dialog running (their returns need
 /// `exec_one`'s bookkeeping), a frame to pop.
-fn op_ret(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_ret<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let depth = vm.call_sp as usize;
     if depth == 0 || !vm.cb_frames.is_empty() || !vm.modal_stack.is_empty() {
-        become slow(vm, pc, sp, n)
+        become slow::<P>(vm, pc, sp, n)
     }
     // SAFETY: 0 < depth <= call_stack.len() (op_call / exec_one check).
     let f = unsafe { *vm.call_stack.get_unchecked(depth - 1) };
     // A return into another unit (a library's caller): `exec_one` switches.
     let ret = f.ret_addr ^ vm.utag;
     if ret >> 24 != 0 {
-        become slow(vm, pc, sp, n)
+        become slow::<P>(vm, pc, sp, n)
     }
     vm.call_sp = (depth - 1) as u8;
     vm.frame_base = f.frame_base as u32;
@@ -516,17 +520,17 @@ fn op_ret(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 /// on the stack, or no handler: `exec_one`, which faults). The app syscalls
 /// (`SYS_APP_COUNT..=SYS_APP_SET_BOOT`) are the core's, not the platform's:
 /// `exec_one` answers them.
-fn op_syscall(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_syscall<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let Some(f) = vm.syscall_fn else {
-        become slow(vm, pc, sp, n)
+        become slow::<P>(vm, pc, sp, n)
     };
     let (id, argc) = unsafe { (*pc, *pc.add(1) as usize) };
     if (crate::apps::SYS_APP_COUNT..=crate::apps::SYS_APP_SET_BOOT).contains(&id) {
-        become slow(vm, pc, sp, n)
+        become slow::<P>(vm, pc, sp, n)
     }
     let k = argc.min(MAX_SYSCALL_ARGS);
     if (sp as usize) < vm.tc_lo + 4 * k {
-        become slow(vm, pc, sp, n)
+        become slow::<P>(vm, pc, sp, n)
     }
     let mut args = [0i32; MAX_SYSCALL_ARGS];
     // SAFETY: k values on the stack (checked); `args` holds k.
@@ -535,9 +539,7 @@ fn op_syscall(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
         core::ptr::copy_nonoverlapping(sp, args.as_mut_ptr(), k);
         sp
     };
-    // SAFETY: set by `run` from its `Ctx`, which outlives the burst; nothing
-    // else holds the pool while a handler runs.
-    let objs = unsafe { &mut *vm.tc_objs };
+    let objs = &mut ctx::<P>(vm).objs;
     match f(id, &args[..k], objs) {
         Some(v) => push!(vm, pc, sp, n, v, unsafe { pc.add(2) }),
         None => fail!(vm, pc, sp, n, fault::SYSCALL),
@@ -557,7 +559,7 @@ macro_rules! jump_if {
     };
 }
 
-fn op_jcmp(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_jcmp<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     quicken!(vm, pc, sp, n, quick_of(OP_JCMP, unsafe { *pc }, 0));
     need!(vm, pc, sp, n, 2);
     unsafe {
@@ -569,7 +571,7 @@ fn op_jcmp(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn op_jcmp_vi(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_jcmp_vi<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     quicken!(vm, pc, sp, n, unsafe { quick_of(OP_JCMP_VI, *pc, *pc.add(1)) });
     unsafe {
         let [cond, raw, lo, hi] = bytes(pc);
@@ -579,7 +581,7 @@ fn op_jcmp_vi(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn op_jcmp_vv(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_jcmp_vv<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     quicken!(vm, pc, sp, n, quick_of(OP_JCMP_VV, unsafe { *pc }, 0));
     unsafe {
         let [cond, ra, rb] = bytes(pc);
@@ -605,25 +607,25 @@ macro_rules! top_binop {
     }};
 }
 
-fn op_bin_i(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_bin_i<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     quicken!(vm, pc, sp, n, quick_of(OP_BIN_I, unsafe { *pc }, 0));
     let [op, lo, hi] = unsafe { bytes(pc) };
     top_binop!(vm, pc, sp, n, op, i16::from_le_bytes([lo, hi]) as i32, unsafe { pc.add(3) })
 }
 
-fn op_bin_i32(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_bin_i32<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let [op, a, b, c, d] = unsafe { bytes(pc) };
     top_binop!(vm, pc, sp, n, op, i32::from_le_bytes([a, b, c, d]), unsafe { pc.add(5) })
 }
 
-fn op_bin_v(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_bin_v<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     quicken!(vm, pc, sp, n, unsafe { quick_of(OP_BIN_V, *pc, *pc.add(1)) });
     let [op, raw] = unsafe { bytes(pc) };
     let b = vm.var_get(vm.resolve_slot(raw));
     top_binop!(vm, pc, sp, n, op, b, unsafe { pc.add(2) })
 }
 
-fn op_add_vi(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_add_vi<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     quicken!(vm, pc, sp, n, if unsafe { *pc } & 0x80 != 0 { Q_ADD_VI_L } else { 0 });
     let [raw, lo, hi] = unsafe { bytes(pc) };
     let slot = vm.resolve_slot(raw);
@@ -631,7 +633,7 @@ fn op_add_vi(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     next!(vm, unsafe { pc.add(3) }, sp, n)
 }
 
-fn op_store_op(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_store_op<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     quicken!(vm, pc, sp, n, unsafe { quick_of(OP_STORE_OP, *pc, *pc.add(1)) });
     need!(vm, pc, sp, n, 1);
     unsafe {
@@ -675,7 +677,7 @@ macro_rules! branch {
     }};
 }
 
-fn q_jcmp<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_jcmp<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 2);
     unsafe {
         let (t, after) = addr(pc.add(1));
@@ -685,7 +687,7 @@ fn q_jcmp<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn q_jcmp_vi<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_jcmp_vi<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     unsafe {
         let [_, raw, lo, hi] = bytes(pc);
         let (t, after) = addr(pc.add(4));
@@ -694,7 +696,7 @@ fn q_jcmp_vi<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn q_jcmp_vv<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_jcmp_vv<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     unsafe {
         let [_, ra, rb] = bytes(pc);
         let (t, after) = addr(pc.add(3));
@@ -704,7 +706,7 @@ fn q_jcmp_vv<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn q_bin_i<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_bin_i<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     unsafe {
         let [_, lo, hi] = bytes(pc);
@@ -715,7 +717,7 @@ fn q_bin_i<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 /// BIN_V on a local / global slot.
-fn q_bin_v_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_bin_v_l<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let b = vm.var_get(local(vm, unsafe { *pc.add(1) }));
     need!(vm, pc, sp, n, 1);
     unsafe {
@@ -725,7 +727,7 @@ fn q_bin_v_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn q_bin_v_g<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_bin_v_g<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let b = vm.var_get(global(vm, unsafe { *pc.add(1) }));
     need!(vm, pc, sp, n, 1);
     unsafe {
@@ -735,7 +737,7 @@ fn q_bin_v_g<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn q_store_op<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_store_op<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     unsafe {
         let sp = sp.sub(1);
@@ -746,16 +748,16 @@ fn q_store_op<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 /// LOAD of a local / global slot (`C`: unused).
-fn q_load_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_load_l<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     push!(vm, pc, sp, n, vm.var_get(local(vm, unsafe { *pc })), unsafe { pc.add(1) })
 }
 
-fn q_load_g<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_load_g<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     push!(vm, pc, sp, n, vm.var_get(global(vm, unsafe { *pc })), unsafe { pc.add(1) })
 }
 
 /// STORE to a local / global slot.
-fn q_store_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_store_l<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     unsafe {
         let sp = sp.sub(1);
@@ -764,7 +766,7 @@ fn q_store_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     }
 }
 
-fn q_store_g<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_store_g<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     unsafe {
         let sp = sp.sub(1);
@@ -774,7 +776,7 @@ fn q_store_g<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 /// ADD_VI on a local slot.
-fn q_add_vi_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_add_vi_l<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let [raw, lo, hi] = unsafe { bytes(pc) };
     let slot = local(vm, raw);
     vm.var_set(slot, vm.var_get(slot).wrapping_add(i16::from_le_bytes([lo, hi]) as i32));
@@ -787,8 +789,7 @@ fn q_add_vi_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 macro_rules! arr_load {
     ($vm:ident, $pc:ident, $res:ident, $n:ident, $id:expr, $idx:expr, $after:expr) => {{
         let (id, idx): (i32, i32) = ($id, $idx);
-        // SAFETY: as in `op_syscall`.
-        let objs = unsafe { &*$vm.tc_objs };
+        let objs = &ctx::<P>($vm).objs;
         let Some(arr) = (if id < 0 { None } else { objs.arr(id as ObjPtr) }) else {
             fail!($vm, $pc, $res, $n, fault::BAD_ARRAY)
         };
@@ -802,28 +803,28 @@ macro_rules! arr_load {
     }};
 }
 
-fn op_arr_load(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_arr_load<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 2);
     let res = unsafe { sp.sub(2) };
     arr_load!(vm, pc, res, n, unsafe { *res }, unsafe { *sp.sub(1) }, pc)
 }
 
 /// ARR_LOAD_V: always quickened (by the slot's kind).
-fn op_arr_load_v(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn op_arr_load_v<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let q = if unsafe { *pc } & 0x80 != 0 { Q_ARR_LOAD_V_L } else { Q_ARR_LOAD_V_G };
     // SAFETY: as in `quicken!`.
     unsafe { vm.code.quicken(pc.sub(1), q) };
-    become TABLE[q as usize](vm, pc, sp, n)
+    become tab::<P>()[q as usize](vm, pc, sp, n)
 }
 
 /// ARR_LOAD_V of an array in a local / global slot.
-fn q_arr_load_v_l<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_arr_load_v_l<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     let res = unsafe { sp.sub(1) };
     arr_load!(vm, pc, res, n, vm.var_get(local(vm, unsafe { *pc })), unsafe { *res }, unsafe { pc.add(1) })
 }
 
-fn q_arr_load_v_g<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+fn q_arr_load_v_g<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     need!(vm, pc, sp, n, 1);
     let res = unsafe { sp.sub(1) };
     arr_load!(vm, pc, res, n, vm.var_get(global(vm, unsafe { *pc })), unsafe { *res }, unsafe { pc.add(1) })
@@ -831,67 +832,78 @@ fn q_arr_load_v_g<const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32)
 
 // --- The tables ---
 
-static TABLE: [Handler; 256] = table();
+/// The dispatch table of platform `P` (one per platform: a board's firmware
+/// has one).
+struct Table<P>(core::marker::PhantomData<P>);
 
-const fn table() -> [Handler; 256] {
-    let mut t: [Handler; 256] = [slow as Handler; 256];
-    t[OP_POP as usize] = op_pop;
-    t[OP_DUP as usize] = op_dup;
-    t[OP_SWAP as usize] = op_swap;
-    t[OP_ADD as usize] = op_add;
-    t[OP_SUB as usize] = op_sub;
-    t[OP_MUL as usize] = op_mul;
-    t[OP_DIV as usize] = op_div;
-    t[OP_MOD as usize] = op_mod;
-    t[OP_NEG as usize] = op_neg;
-    t[OP_AND as usize] = op_and;
-    t[OP_OR as usize] = op_or;
-    t[OP_NOT as usize] = op_not;
-    t[OP_EQ as usize] = op_eq;
-    t[OP_NE as usize] = op_ne;
-    t[OP_LT as usize] = op_lt;
-    t[OP_LE as usize] = op_le;
-    t[OP_GT as usize] = op_gt;
-    t[OP_GE as usize] = op_ge;
-    t[OP_SHL as usize] = op_shl;
-    t[OP_SHR as usize] = op_shr;
-    t[OP_FRAME as usize] = op_frame;
-    t[OP_PUSH_0 as usize] = op_push_0;
-    t[OP_PUSH_1 as usize] = op_push_1;
-    t[OP_PUSH_2 as usize] = op_push_2;
-    t[OP_PUSH_M1 as usize] = op_push_m1;
-    t[OP_LOAD_0 as usize] = op_load_0;
-    t[OP_LOAD_1 as usize] = op_load_1;
-    t[OP_LOAD_2 as usize] = op_load_2;
-    t[OP_LOAD_3 as usize] = op_load_3;
-    t[OP_LOAD_4 as usize] = op_load_4;
-    t[OP_STORE_0 as usize] = op_store_0;
-    t[OP_STORE_1 as usize] = op_store_1;
-    t[OP_STORE_2 as usize] = op_store_2;
-    t[OP_STORE_3 as usize] = op_store_3;
-    t[OP_STORE_4 as usize] = op_store_4;
-    t[OP_PUSH_I8 as usize] = op_push_i8;
-    t[OP_PUSH_I16 as usize] = op_push_i16;
-    t[OP_PUSH_I32 as usize] = op_push_i32;
-    t[OP_LOAD as usize] = op_load;
-    t[OP_STORE as usize] = op_store;
-    t[OP_JMP as usize] = op_jmp;
-    t[OP_JZ as usize] = op_jz;
-    t[OP_JNZ as usize] = op_jnz;
-    t[OP_CALL as usize] = op_call;
-    t[OP_JCMP as usize] = op_jcmp;
-    t[OP_JCMP_VI as usize] = op_jcmp_vi;
-    t[OP_JCMP_VV as usize] = op_jcmp_vv;
-    t[OP_BIN_I as usize] = op_bin_i;
-    t[OP_BIN_I32 as usize] = op_bin_i32;
-    t[OP_BIN_V as usize] = op_bin_v;
-    t[OP_ADD_VI as usize] = op_add_vi;
-    t[OP_STORE_OP as usize] = op_store_op;
-    t[OP_FRAME_A as usize] = op_frame_a;
-    t[OP_RET as usize] = op_ret;
-    t[OP_SYSCALL as usize] = op_syscall;
-    t[OP_ARR_LOAD as usize] = op_arr_load;
-    t[OP_ARR_LOAD_V as usize] = op_arr_load_v;
+impl<P: Platform> Table<P> {
+    const T: [Handler; 256] = table::<P>();
+}
+
+#[inline(always)]
+fn tab<P: Platform>() -> &'static [Handler; 256] {
+    &Table::<P>::T
+}
+
+const fn table<P: Platform>() -> [Handler; 256] {
+    let mut t: [Handler; 256] = [slow::<P> as Handler; 256];
+    t[OP_POP as usize] = op_pop::<P>;
+    t[OP_DUP as usize] = op_dup::<P>;
+    t[OP_SWAP as usize] = op_swap::<P>;
+    t[OP_ADD as usize] = op_add::<P>;
+    t[OP_SUB as usize] = op_sub::<P>;
+    t[OP_MUL as usize] = op_mul::<P>;
+    t[OP_DIV as usize] = op_div::<P>;
+    t[OP_MOD as usize] = op_mod::<P>;
+    t[OP_NEG as usize] = op_neg::<P>;
+    t[OP_AND as usize] = op_and::<P>;
+    t[OP_OR as usize] = op_or::<P>;
+    t[OP_NOT as usize] = op_not::<P>;
+    t[OP_EQ as usize] = op_eq::<P>;
+    t[OP_NE as usize] = op_ne::<P>;
+    t[OP_LT as usize] = op_lt::<P>;
+    t[OP_LE as usize] = op_le::<P>;
+    t[OP_GT as usize] = op_gt::<P>;
+    t[OP_GE as usize] = op_ge::<P>;
+    t[OP_SHL as usize] = op_shl::<P>;
+    t[OP_SHR as usize] = op_shr::<P>;
+    t[OP_FRAME as usize] = op_frame::<P>;
+    t[OP_PUSH_0 as usize] = op_push_0::<P>;
+    t[OP_PUSH_1 as usize] = op_push_1::<P>;
+    t[OP_PUSH_2 as usize] = op_push_2::<P>;
+    t[OP_PUSH_M1 as usize] = op_push_m1::<P>;
+    t[OP_LOAD_0 as usize] = op_load_0::<P>;
+    t[OP_LOAD_1 as usize] = op_load_1::<P>;
+    t[OP_LOAD_2 as usize] = op_load_2::<P>;
+    t[OP_LOAD_3 as usize] = op_load_3::<P>;
+    t[OP_LOAD_4 as usize] = op_load_4::<P>;
+    t[OP_STORE_0 as usize] = op_store_0::<P>;
+    t[OP_STORE_1 as usize] = op_store_1::<P>;
+    t[OP_STORE_2 as usize] = op_store_2::<P>;
+    t[OP_STORE_3 as usize] = op_store_3::<P>;
+    t[OP_STORE_4 as usize] = op_store_4::<P>;
+    t[OP_PUSH_I8 as usize] = op_push_i8::<P>;
+    t[OP_PUSH_I16 as usize] = op_push_i16::<P>;
+    t[OP_PUSH_I32 as usize] = op_push_i32::<P>;
+    t[OP_LOAD as usize] = op_load::<P>;
+    t[OP_STORE as usize] = op_store::<P>;
+    t[OP_JMP as usize] = op_jmp::<P>;
+    t[OP_JZ as usize] = op_jz::<P>;
+    t[OP_JNZ as usize] = op_jnz::<P>;
+    t[OP_CALL as usize] = op_call::<P>;
+    t[OP_JCMP as usize] = op_jcmp::<P>;
+    t[OP_JCMP_VI as usize] = op_jcmp_vi::<P>;
+    t[OP_JCMP_VV as usize] = op_jcmp_vv::<P>;
+    t[OP_BIN_I as usize] = op_bin_i::<P>;
+    t[OP_BIN_I32 as usize] = op_bin_i32::<P>;
+    t[OP_BIN_V as usize] = op_bin_v::<P>;
+    t[OP_ADD_VI as usize] = op_add_vi::<P>;
+    t[OP_STORE_OP as usize] = op_store_op::<P>;
+    t[OP_FRAME_A as usize] = op_frame_a::<P>;
+    t[OP_RET as usize] = op_ret::<P>;
+    t[OP_SYSCALL as usize] = op_syscall::<P>;
+    t[OP_ARR_LOAD as usize] = op_arr_load::<P>;
+    t[OP_ARR_LOAD_V as usize] = op_arr_load_v::<P>;
 
     // The quickened forms, in `QUICK`'s order (checked here, at compile
     // time).
@@ -899,7 +911,7 @@ const fn table() -> [Handler; 256] {
     macro_rules! quick {
         ($($h:ident $op:ident $c:tt $k:ident),* $(,)?) => {$(
             assert!(QUICK[i].0 == $op && QUICK[i].1 == $c && QUICK[i].2 == $k, "tc::table and QUICK differ");
-            t[Q_FIRST as usize + i] = $h::<$c>;
+            t[Q_FIRST as usize + i] = $h::<P, $c>;
             i += 1;
         )*};
     }

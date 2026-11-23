@@ -1016,16 +1016,13 @@ pub struct Vm {
     // Threaded dispatch (vm/tc.rs), valid during a burst: the budget the
     // handlers count down from and the instructions run before it, the count
     // when it left, the eval stack's bounds as addresses (sp_floor and end),
-    // and the platform's `exec_one` with its `Ctx` for the instructions it
-    // has no handler for.
+    // and the burst's `Ctx<P>` (the handlers are generic over `P`).
     tc_limit: u32,
     tc_base: u32,
     tc_n: u32,
     tc_lo: usize,
     tc_hi: usize,
     tc_ctx: usize,
-    tc_objs: *mut ObjPool,
-    tc_slow: tc::Slow,
 }
 
 const EMPTY_CB: CbRequest = CbRequest {
@@ -1096,8 +1093,6 @@ impl Vm {
             tc_lo: 0,
             tc_hi: 0,
             tc_ctx: 0,
-            tc_objs: core::ptr::null_mut(),
-            tc_slow: tc::no_slow,
             tree_hint: None,
             open_files: [None, None],
             program: ProgramRef::new(b"main", 0),

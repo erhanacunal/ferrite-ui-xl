@@ -524,7 +524,10 @@ impl ObjPool {
         *cast_mut::<Widget>(self.payload_mut(p, T_WIDGET)?) = Widget::NEW;
         self.dfs_valid = false;
         self.render.shape_changed = true;
-        self.send(crate::view::RenderMsg::Born(p));
+        // A new widget: no record of an old one at this pointer.
+        if let Some(r) = self.render.recs.get_mut(p as usize) {
+            *r = RenderRec::EMPTY;
+        }
         // A new widget starts dirty (Widget::NEW).
         self.render.maybe_dirty = true;
         self.note_changed(WidgetId(p));
@@ -895,14 +898,6 @@ impl ObjPool {
     /// widget that is drawn and has no pending rect yet (an animation changes
     /// x, y, w and h each frame: the first change keeps the drawn rect).
     pub fn will_move(&mut self, id: WidgetId) {
-        if !self.is_view {
-            // The VM pool: the render pool decides (`RenderMsg::Moved`).
-            if self.is_live(id) && !self.is_active_layer_root(id) {
-                let abs = self.absolute_rect(id);
-                self.send(crate::view::RenderMsg::Moved(id, abs));
-            }
-            return;
-        }
         if !self.is_live(id) || !self.rendered(id) {
             return;
         }

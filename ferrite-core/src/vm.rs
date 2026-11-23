@@ -3471,31 +3471,28 @@ mod anim_tests {
         (root, child)
     }
 
+    /// The render works on the tree itself: its records are kept there and
+    /// it clears the dirty bits it drew.
     #[test]
-    fn the_render_pool_gets_the_tree_and_keeps_the_records() {
+    fn the_render_keeps_its_records_in_the_tree() {
         let mut ctx = mock_ctx();
         let (_, child) = rendered_pair(&mut ctx);
-        // Dirty bits handed over and cleared; records only in the render pool.
         assert!(!ctx.objs.get(child).is_dirty());
+        assert!(ctx.objs.rendered(child));
+        // Settle (the pass that drew keeps the hint up).
+        crate::render::render_dirty(&mut ctx);
         assert!(!ctx.objs.render.maybe_dirty);
-        assert!(ctx.view.rendered(child));
-        assert!(!ctx.objs.rendered(child));
-        assert_eq!(ctx.view.get(child).background_color, 0x1234);
-        // Settle (the pass that drew keeps the hint up). Then a change nobody
-        // marked isn't sent; a marked one is.
-        crate::render::render_dirty(&mut ctx);
-        assert!(!ctx.view.render.maybe_dirty);
+        // A change nobody marked draws nothing; a marked one is drawn.
         ctx.objs.get_mut(child).background_color = 0x4321;
-        crate::render::render_dirty(&mut ctx);
-        assert_eq!(ctx.view.get(child).background_color, 0x1234);
+        assert!(!ctx.objs.needs_render());
         ctx.objs.mark_dirty(child);
+        assert!(ctx.objs.needs_render());
         crate::render::render_dirty(&mut ctx);
-        assert_eq!(ctx.view.get(child).background_color, 0x4321);
-        assert!(!ctx.view.get(child).is_dirty());
+        assert!(!ctx.objs.get(child).is_dirty() && ctx.objs.rendered(child));
     }
 
     #[test]
-    fn moves_reach_the_render_pool_as_the_old_on_screen_rect() {
+    fn a_move_keeps_the_old_on_screen_rect() {
         let mut ctx = mock_ctx();
         let (_, child) = rendered_pair(&mut ctx);
         ctx.objs.will_move(child);
@@ -3503,12 +3500,11 @@ mod anim_tests {
         ctx.objs.will_move(child);
         ctx.objs.get_mut(child).location.x = 310;
         ctx.objs.mark_moved(child);
-        assert!(ctx.view.prev_rect(child).is_empty());
-        ctx.objs.sync_view(&mut ctx.view);
         // The first move's rect (where it is drawn), not the second's.
-        assert_eq!(ctx.view.prev_rect(child), crate::types::Rect::new(100, 50, 40, 30));
-        assert!(ctx.view.get(child).is_dirty());
-        assert_eq!(ctx.view.get(child).location.x, 310);
+        assert_eq!(ctx.objs.prev_rect(child), crate::types::Rect::new(100, 50, 40, 30));
+        assert!(ctx.objs.get(child).is_dirty());
+        crate::render::render_dirty(&mut ctx);
+        assert!(ctx.objs.prev_rect(child).is_empty(), "repainted");
     }
 
     #[test]
@@ -3522,9 +3518,7 @@ mod anim_tests {
         crate::render::render_dirty(&mut ctx);
         ctx.objs.add_child(panel, child);
         assert!(ctx.objs.get(child).is_dirty());
-        ctx.objs.sync_view(&mut ctx.view);
-        assert_eq!(ctx.view.prev_rect(child), crate::types::Rect::new(100, 50, 40, 30));
-        assert_eq!(ctx.view.get(child).parent, panel);
+        assert_eq!(ctx.objs.prev_rect(child), crate::types::Rect::new(100, 50, 40, 30));
     }
 
     #[test]
@@ -3539,14 +3533,11 @@ mod anim_tests {
         while again != child {
             again = one_widget(&mut ctx);
         }
-        assert!(ctx.view.rendered(child), "not synced yet");
-        ctx.objs.sync_view(&mut ctx.view);
-        assert!(!ctx.view.rendered(child));
-        assert!(ctx.view.rendered(root));
+        assert!(!ctx.objs.rendered(child));
+        assert!(ctx.objs.rendered(root));
         ctx.objs.clear();
-        ctx.objs.sync_view(&mut ctx.view);
-        assert!(!ctx.view.rendered(root));
-        assert!(ctx.view.root.is_none());
+        assert!(!ctx.objs.rendered(root));
+        assert!(ctx.objs.root.is_none());
     }
 
     /// The render pool's scene is captured once, then updated from what the
@@ -3602,17 +3593,32 @@ mod anim_tests {
         assert!(!ctx.objs.get(child).is_dirty());
     }
 
+    /// A render context in `MODE_AREAS` (the board): renders are recorded on
+    /// the tree and only the list goes to the render side.
+    fn areas_ctx() -> Ctx<MockPlatform> {
+        let mut ctx = mock_ctx();
+        let mut r = mock_ctx();
+        r.objs = ObjPool::view();
+        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        ctx.objs.set_render_mode(crate::render::MODE_AREAS);
+        ctx
+    }
+
+    /// The frame the render side played last.
+    fn played_ops(ctx: &Ctx<MockPlatform>) -> usize {
+        ctx.render_ctx.as_ref().expect("back").objs.render.frame.list().len()
+    }
+
     /// Step 3d: with a render context the drawing builtins record (no wait
     /// for a render running elsewhere); the next render hands the list over.
     #[test]
     fn direct_drawing_is_recorded_for_the_render_side() {
         crate::mock::render_elsewhere(true);
-        let mut ctx = mock_ctx();
-        let mut r = mock_ctx();
-        r.objs = ObjPool::view();
-        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        let mut ctx = areas_ctx();
         let root = one_widget(&mut ctx);
         ctx.objs.root = root;
+        // Something to draw: an empty frame isn't handed over.
+        ctx.objs.get_mut(root).size = crate::types::Size { w: 800, h: 480 };
         crate::render::render_dirty(&mut ctx);
         assert!(ctx.render_away);
         let mut vm = Vm::new();
@@ -3625,24 +3631,21 @@ mod anim_tests {
         assert!(ctx.render_away, "recorded, not waited for");
         assert!(ctx.objs.render.screen_rec.busy());
         assert_eq!(ctx.objs.render.screen_rec.list().len(), 2);
-        assert!(ctx.objs.needs_sync());
+        assert!(ctx.objs.needs_render());
         crate::mock::finish_render();
         crate::render::render_dirty(&mut ctx);
         assert!(!ctx.objs.render.screen_rec.busy() && ctx.objs.render.draws.is_empty());
         assert!(ctx.render_away, "handed over with the next render");
         crate::mock::finish_render();
         crate::render::wait_idle(&mut ctx);
-        assert!(ctx.render_ctx.as_ref().unwrap().objs.render.draws.is_empty(), "replayed by the job");
+        assert!(played_ops(&ctx) >= 2, "in the frame played");
         crate::mock::render_elsewhere(false);
     }
 
     #[test]
-    fn a_render_running_elsewhere_gets_what_changed_meanwhile_next() {
+    fn a_frame_playing_elsewhere_leaves_what_changed_meanwhile_to_the_next() {
         crate::mock::render_elsewhere(true);
-        let mut ctx = mock_ctx();
-        let mut r = mock_ctx();
-        r.objs = ObjPool::view();
-        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        let mut ctx = areas_ctx();
         let root = one_widget(&mut ctx);
         ctx.objs.root = root;
         ctx.objs.get_mut(root).size = crate::types::Size { w: 800, h: 480 };
@@ -3652,35 +3655,30 @@ mod anim_tests {
         crate::render::render_dirty(&mut ctx);
         assert!(ctx.render_away && crate::mock::render_pending());
         assert!(ctx.render_ctx.is_none());
-        // Changed while the job runs: kept in the VM pool, not handed over.
+        // Changed while the frame plays: waits in the tree, still dirty.
         ctx.objs.get_mut(child).background_color = 0x0F0F;
         ctx.objs.mark_dirty(child);
         crate::render::render_dirty(&mut ctx);
         assert!(ctx.objs.get(child).is_dirty(), "waits for the render side");
         crate::mock::finish_render();
-        // Taken back, then handed over.
+        // Taken back, then recorded and handed over.
         crate::render::render_dirty(&mut ctx);
         assert!(!ctx.objs.get(child).is_dirty());
+        assert!(ctx.objs.rendered(child));
         assert!(ctx.render_away);
         crate::mock::finish_render();
         crate::render::wait_idle(&mut ctx);
-        let r = ctx.render_ctx.as_ref().expect("back");
-        assert_eq!(r.objs.get(child).background_color, 0x0F0F);
-        assert!(r.objs.rendered(child) && !r.objs.get(child).is_dirty());
+        assert!(played_ops(&ctx) > 0);
         crate::mock::render_elsewhere(false);
     }
 
-    /// Stage 2: a render handed to the other core gets a commit, data only.
-    /// What the VM pool does to the same objects while the job has not taken
-    /// it in yet (strings edited, freed, widgets written) does not reach
-    /// that job: it shows the tree as it was at the hand-over.
+    /// The frame handed to the other core is a list that needs nothing of
+    /// the tree: what the VM does meanwhile (strings edited and freed,
+    /// widgets written, the whole tree dropped) does not change it.
     #[test]
-    fn a_posted_commit_holds_the_tree_as_it_was_handed_over() {
+    fn a_handed_over_frame_needs_nothing_of_the_tree() {
         crate::mock::render_elsewhere(true);
-        let mut ctx = mock_ctx();
-        let mut r = mock_ctx();
-        r.objs = ObjPool::view();
-        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        let mut ctx = areas_ctx();
         let root = one_widget(&mut ctx);
         ctx.objs.root = root;
         ctx.objs.get_mut(root).size = crate::types::Size { w: 800, h: 480 };
@@ -3694,48 +3692,18 @@ mod anim_tests {
         let samples = ctx.objs.arr_from(&[1, 2, 3]).unwrap();
         ctx.objs.get_mut(graph).kind = crate::widget::KIND_GRAPH;
         ctx.objs.get_mut(graph).value = samples as _;
-        // The first job: the whole tree.
         crate::render::render_dirty(&mut ctx);
         assert!(ctx.render_away && crate::mock::render_pending());
-        crate::mock::finish_render();
-        crate::render::wait_idle(&mut ctx);
-
-        // The second: a delta (a string edited in place, shown by a second
-        // widget from now on; samples written; a colour).
-        let updates = crate::scene::UPDATES.load(core::sync::atomic::Ordering::Relaxed);
-        assert_eq!(ctx.objs.str_delete_byte(text, 0), Some(text));
-        ctx.objs.set_text_id(other, text);
-        ctx.objs.arr_mut(samples).unwrap()[1] = 9;
-        ctx.objs.get_mut(label).background_color = 0x0F0F;
-        ctx.objs.mark_dirty(label);
-        crate::render::render_dirty(&mut ctx);
-        assert!(ctx.render_away && crate::mock::render_pending());
-        assert!(!ctx.objs.get(label).is_dirty(), "handed over");
+        let handed = ctx.render_ctx.is_none();
         // Meanwhile, on the VM's side.
         ctx.objs.str_free(text);
         ctx.objs.arr_mut(samples).unwrap()[1] = 77;
         ctx.objs.get_mut(label).background_color = 0x1111;
         ctx.objs.mark_dirty(label);
+        ctx.objs.clear();
         crate::mock::finish_render();
         crate::render::wait_idle(&mut ctx);
-        {
-            let r = ctx.render_ctx.as_ref().expect("back");
-            assert!(crate::scene::UPDATES.load(core::sync::atomic::Ordering::Relaxed) > updates, "an update");
-            assert_eq!(r.objs.render_scene().text_for(label), Some(&b"bc"[..]));
-            assert_eq!(r.objs.render_scene().text_for(other), Some(&b"bc"[..]));
-            assert_eq!(r.objs.render_scene().graph_for(graph), Some(&[1, 9, 3][..]));
-            assert_eq!(r.objs.get(label).background_color, 0x0F0F);
-            assert!(r.objs.rendered(label) && !r.objs.get(label).is_dirty());
-        }
-        // The next job gets the rest.
-        crate::render::render_dirty(&mut ctx);
-        crate::mock::finish_render();
-        crate::render::wait_idle(&mut ctx);
-        let r = ctx.render_ctx.as_ref().expect("back");
-        assert_eq!(r.objs.render_scene().text_for(label), None);
-        assert_eq!(r.objs.render_scene().text_for(other), None);
-        assert_eq!(r.objs.render_scene().graph_for(graph), Some(&[1, 77, 3][..]));
-        assert_eq!(r.objs.get(label).background_color, 0x1111);
+        assert!(handed && played_ops(&ctx) > 0);
         crate::mock::render_elsewhere(false);
     }
 

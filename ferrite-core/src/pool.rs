@@ -195,6 +195,9 @@ pub(crate) struct RenderState {
     /// VM pool: the tree's shape (links, objects) changed since the last
     /// sync: the render pool's DFS order is stale.
     pub(crate) shape_changed: bool,
+    /// A render runs on this tree (`render::with_view`, `render::submit`):
+    /// it allocates nothing.
+    pub(crate) rendering: bool,
 }
 
 impl RenderState {
@@ -224,6 +227,7 @@ impl RenderState {
             frame: crate::dl::Recorder::new(),
             commit: None,
             shape_changed: true,
+            rendering: false,
             geo: Vec::new(),
             geo_stack: Vec::new(),
             geo_valid: false,
@@ -719,7 +723,7 @@ impl ObjPool {
 
     /// Allocate an object with `words` zeroed payload words.
     pub(crate) fn alloc_obj(&mut self, ty: u8, words: usize) -> Option<ObjPtr> {
-        debug_assert!(!self.is_view, "the render pool allocates nothing");
+        debug_assert!(!self.is_view && !self.render.rendering, "a render allocates nothing");
         if words > MAX_OBJ_WORDS || !self.reserve_top(HDR + words) {
             return None;
         }

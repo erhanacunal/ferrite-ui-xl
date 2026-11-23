@@ -261,8 +261,8 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
         JOB_TICKS[JOB_RENDER].fetch_add(crate::perf::now().wrapping_sub(ta) as u64, core::sync::atomic::Ordering::Relaxed);
         return;
     }
-    // What the VM side packed for this job (`submit`).
-    r.objs.apply_pending();
+    // The VM's direct drawing so far, closed into the queue in order.
+    r.objs.close_screen_rec();
     let t0 = crate::perf::now();
     let draws = core::mem::take(&mut r.objs.render.draws);
     for d in draws {
@@ -333,7 +333,6 @@ pub fn reclaim<P: Platform>(ctx: &mut Ctx<P>) -> bool {
     }
     match P::render_poll() {
         Some(r) => {
-            ctx.objs.mirror_layers(&r.objs);
             ctx.render_ctx = Some(r);
             ctx.render_away = false;
             true
@@ -352,45 +351,47 @@ pub fn wait_idle<P: Platform>(ctx: &mut Ctx<P>) {
     }
 }
 
-/// Start `job` with what changed since the last one: on the render side
-/// (another core) if the board takes it, else here. Only a commit is built
-/// here (`ObjPool::post_commit`); the job takes it in where it runs.
+/// Run `job` on the widget tree itself (`ctx.objs`). With a render context
+/// in `MODE_AREAS` the render is recorded here into one list (`frame`) and
+/// only that list goes to the render side (`RenderJob::Play`, another core
+/// if the board takes it): the render side never sees the tree.
 fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
-    let Some(mut r) = ctx.render_ctx.take() else {
+    if ctx.render_ctx.is_none() || ctx.objs.render.mode != MODE_AREAS {
         with_view(ctx, |c| run_job(c, job));
         return;
-    };
+    }
     let t0 = crate::perf::now();
-    let mode = ctx.objs.render.mode;
-    r.objs.render.areas = mode == MODE_AREAS;
-    let job = if mode == MODE_AREAS {
-        // The whole render here, into a list: the render side plays it.
-        sync_render_ctx(ctx, &mut r, false);
-        r.objs.render.frame.begin(&r.lcd);
-        run_job(&mut r, job);
-        r.objs.render.frame.end();
-        ctx.objs.mirror_layers(&r.objs);
-        let (ops, bytes) = {
-            let list = r.objs.render.frame.list();
-            if crate::dl::OP_STATS.load(core::sync::atomic::Ordering::Relaxed) {
-                list.tally();
-            }
-            (list.len(), list.used_bytes())
-        };
-        if ops == 0 {
-            ctx.render_ctx = Some(r);
-            return;
+    crate::vm::flex_flush(ctx);
+    // Out of `ctx` meanwhile: the render draws as without one (`records`).
+    let mut r = ctx.render_ctx.take().unwrap();
+    ctx.objs.render.areas = true;
+    ctx.objs.render.rendering = true;
+    ctx.objs.render.frame.begin(&ctx.lcd);
+    run_job(ctx, job);
+    ctx.objs.render.frame.end();
+    ctx.objs.render.rendering = false;
+    ctx.objs.layers_rest();
+    let (ops, bytes) = {
+        let list = ctx.objs.render.frame.list();
+        if crate::dl::OP_STATS.load(core::sync::atomic::Ordering::Relaxed) {
+            list.tally();
         }
-        use core::sync::atomic::Ordering::Relaxed;
-        PLAYS[0].fetch_add(1, Relaxed);
-        PLAYS[1].fetch_add(ops as u32, Relaxed);
-        PLAYS[2].fetch_add(bytes as u32, Relaxed);
-        RenderJob::Play
-    } else {
-        sync_render_ctx(ctx, &mut r, true);
-        job
+        (list.len(), list.used_bytes())
     };
-    match P::render_start(r, job) {
+    if ops == 0 {
+        ctx.render_ctx = Some(r);
+        return;
+    }
+    use core::sync::atomic::Ordering::Relaxed;
+    PLAYS[0].fetch_add(1, Relaxed);
+    PLAYS[1].fetch_add(ops as u32, Relaxed);
+    PLAYS[2].fetch_add(bytes as u32, Relaxed);
+    sync_render_ctx(ctx, &mut r);
+    // The list goes over; the render context's last one comes back as the
+    // next frame's buffer.
+    core::mem::swap(&mut ctx.objs.render.frame, &mut r.objs.render.frame);
+    r.objs.render.areas = true;
+    match P::render_start(r, RenderJob::Play) {
         Ok(()) => {
             crate::perf::add_sub(
                 crate::perf::phase::SCENE_HANDOFF,
@@ -403,51 +404,34 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
                 crate::perf::phase::SCENE_HANDOFF,
                 crate::perf::now().wrapping_sub(t0),
             );
-            run_job(&mut r, job);
-            ctx.objs.mirror_layers(&r.objs);
+            run_job(&mut r, RenderJob::Play);
             ctx.render_ctx = Some(r);
         }
     }
 }
 
-/// Run `f` on the render pool (`view.rs`): flush pending layouts, hand the
-/// VM pool's tree and messages over, swap the pools so `ctx.objs` is the
-/// render pool during `f`, swap back, mirror the layers.
+/// Run `f` (a render, a dump) on the widget tree here, after any job running
+/// elsewhere and with pending layouts done. The render context stays out of
+/// `ctx` meanwhile, so the render draws as without one (`records`).
 pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -> R) -> R {
-    debug_assert!(!ctx.objs.is_view(), "nested render");
+    debug_assert!(!ctx.objs.render.rendering, "nested render");
     wait_idle(ctx);
     crate::vm::flex_flush(ctx);
-    if let Some(mut r) = ctx.render_ctx.take() {
-        // The render side's own context (step 3c).
-        let t0 = crate::perf::now();
-        sync_render_ctx(ctx, &mut r, false);
-        crate::perf::add_sub(
-            crate::perf::phase::SCENE_HANDOFF,
-            crate::perf::now().wrapping_sub(t0),
-        );
-        let out = f(&mut r);
-        ctx.objs.mirror_layers(&r.objs);
-        ctx.render_ctx = Some(r);
-        return out;
-    }
-    ctx.objs.sync_view(&mut ctx.view);
-    core::mem::swap(&mut ctx.objs, &mut ctx.view);
-    let r = f(ctx);
-    core::mem::swap(&mut ctx.objs, &mut ctx.view);
-    ctx.objs.mirror_layers(&ctx.view);
-    r
+    let r = ctx.render_ctx.take();
+    ctx.objs.render.rendering = true;
+    let out = f(ctx);
+    ctx.objs.render.rendering = false;
+    ctx.objs.layers_rest();
+    ctx.render_ctx = r;
+    out
 }
 
-/// Hand the VM context's state over to the render context `r`: the pool
-/// (`ObjPool::sync_view`), the fonts and images the VM loaded, the
-/// filesystem, the orientation, the cursor blink. `post` = the pool's part
-/// is only packed here, for `r`'s next job to take in (`run_job`).
-fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>, post: bool) {
-    if post {
-        ctx.objs.post_commit(&mut r.objs);
-    } else {
-        ctx.objs.sync_view(&mut r.objs);
-    }
+/// Hand what a recorded frame's play needs over to the render context `r`:
+/// the fonts and images the VM loaded (the list refers to them), the
+/// filesystem, the orientation, the cursor blink, the overlay (the keyboard:
+/// a board player leaves areas under it to the CPU).
+fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>) {
+    r.objs.overlay = ctx.objs.overlay;
     r.fonts.sync_from(&ctx.fonts);
     r.images.sync_from(&ctx.images);
     if r.fs.is_none() != ctx.fs.is_none() {
@@ -457,6 +441,7 @@ fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>, post: bool) {
             *a = b.clone();
         }
     }
+    r.lcd.sync_layers_from(&ctx.lcd);
     if r.lcd.is_portrait() != ctx.lcd.is_portrait() {
         r.lcd.set_portrait(ctx.lcd.is_portrait());
     }
@@ -556,11 +541,11 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     crate::vm::flex_flush(ctx);
-    if !ctx.objs.needs_sync() && !ctx.render_pool().render.maybe_dirty {
+    if !ctx.objs.needs_render() {
         return;
     }
-    // While the last render still runs on the other core, the messages,
-    // dirty bits and touched objects wait in the VM pool.
+    // While the last frame still plays on the other core, the dirty bits
+    // and the VM's drawing wait in the tree.
     if !reclaim(ctx) {
         return;
     }

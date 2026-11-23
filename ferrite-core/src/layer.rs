@@ -184,6 +184,13 @@ impl ObjPool {
         self.render.maybe_dirty = true;
     }
 
+    /// After a render: outside any pass (the whole tree in scope, no layer
+    /// origin), for the VM's placement decisions.
+    pub(crate) fn layers_rest(&mut self) {
+        self.layers.scope = Scope::All;
+        self.layers.origin = crate::types::Offset { x: 0, y: 0 };
+    }
+
     /// The layer `id` is the root of (1..=MAX_LAYERS), 0 = none.
     pub fn layer_of(&self, id: WidgetId) -> i32 {
         self.layers.slots.iter().position(|s| s.root == id && id.is_some()).map_or(0, |s| s as i32 + 1)

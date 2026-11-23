@@ -120,6 +120,9 @@ fn set_bit(bits: &mut [u32], p: ObjPtr) -> bool {
     }
 }
 
+/// The render pool is no longer synced: `send` queues nothing.
+const SEND: bool = false;
+
 /// What the VM pool did to render-owned state, replayed on the render pool.
 #[derive(Clone, Copy)]
 pub(crate) enum RenderMsg {
@@ -147,17 +150,23 @@ impl ObjPool {
         self.is_view
     }
 
-    /// Queue `m` for the render pool (the render pool applies its own changes
-    /// directly).
+    /// Queue `m` for the render pool. The renderer works on the tree itself
+    /// now, which applies its changes directly: nothing is queued.
     #[inline]
     pub(crate) fn send(&mut self, m: RenderMsg) {
-        if self.is_view {
+        if !SEND || self.is_view {
             return;
         }
         if matches!(m, RenderMsg::Touched) && matches!(self.render.msgs.last(), Some(RenderMsg::Touched)) {
             return;
         }
         self.render.msgs.push(m);
+    }
+
+    /// Something to render: a widget may be dirty, or the VM drew (recorded
+    /// for the render, `render::records`).
+    pub(crate) fn needs_render(&self) -> bool {
+        self.render.maybe_dirty || !self.render.draws.is_empty() || self.render.screen_rec.busy()
     }
 
     /// The VM pool has something for the render pool.

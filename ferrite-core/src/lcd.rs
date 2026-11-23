@@ -301,6 +301,13 @@ impl<B: LcdBackend> LcdImpl<B> {
         self.layers_alloc.get()
     }
 
+    /// Take `other`'s record of the allocated layers (the same surfaces seen
+    /// through another context's `LcdImpl`: a recorded frame allocates on the
+    /// VM's, its play draws through the render context's).
+    pub fn sync_layers_from(&self, other: &Self) {
+        self.layers_alloc.set(other.layers_alloc.get());
+    }
+
     /// Hide and free every layer (error screens).
     pub fn layers_off(&self) {
         for n in 0..crate::layer::MAX_LAYERS {

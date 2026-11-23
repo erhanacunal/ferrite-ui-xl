@@ -3543,16 +3543,15 @@ mod anim_tests {
     /// the tree and only the list goes to the render side.
     fn areas_ctx() -> Ctx<MockPlatform> {
         let mut ctx = mock_ctx();
-        let mut r = mock_ctx();
-        r.objs = ObjPool::without_storage();
-        ctx.render_ctx = Some(alloc::boxed::Box::new(r));
+        let r = mock_ctx();
+        ctx.render_ctx = Some(alloc::boxed::Box::new(crate::player::Player::new(r.lcd, r.flash)));
         ctx.objs.set_render_mode(crate::render::MODE_AREAS);
         ctx
     }
 
     /// The frame the render side played last.
     fn played_ops(ctx: &Ctx<MockPlatform>) -> usize {
-        ctx.render_ctx.as_ref().expect("back").objs.render.frame.list().len()
+        ctx.render_ctx.as_ref().expect("back").frame().len()
     }
 
     /// Step 3d: with a render context the drawing builtins record (no wait

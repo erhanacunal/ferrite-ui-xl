@@ -8,7 +8,6 @@
 //! of the tree, its sprites, picture copies and `on_paint` captures were removed with the
 //! other render modes, 2026-11-17.)
 
-use ferrite_core::ctx::Ctx;
 use ferrite_core::renderer::WidgetRenderer;
 use ferrite_core::types::Rect;
 
@@ -28,7 +27,7 @@ impl WidgetRenderer<P> for ExynosRenderer {
         }
     }
 
-    fn play(ctx: &Ctx<P>, list: &ferrite_core::dl::List) -> bool {
+    fn play(ctx: &ferrite_core::player::Player<P>, list: &ferrite_core::dl::List) -> bool {
         #[cfg(feature = "gpu_compose")]
         {
             crate::compose::play(ctx, list)

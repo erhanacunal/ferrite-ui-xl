@@ -159,20 +159,19 @@ pub trait Platform: Sized {
         false
     }
 
-    /// Run `job` on the render context `r` somewhere else (another core;
-    /// plan step 3c). `Ok` = taken: [`Platform::render_poll`] hands `r` back
-    /// once the job is done, and until then nothing may draw on the screen.
-    /// `Err(r)` = run it here (the default).
+    /// Play the frame handed to `r` somewhere else (another core, plan step
+    /// 3c: `Player::play`). `Ok` = taken: [`Platform::render_poll`] hands
+    /// `r` back once it is played, and until then nothing may draw on the
+    /// screen. `Err(r)` = play it here (the default).
     fn render_start(
-        r: alloc::boxed::Box<crate::ctx::Ctx<Self>>,
-        _job: crate::render::RenderJob,
-    ) -> Result<(), alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+        r: alloc::boxed::Box<crate::player::Player<Self>>,
+    ) -> Result<(), alloc::boxed::Box<crate::player::Player<Self>>> {
         Err(r)
     }
 
-    /// The render context, once the job [`Platform::render_start`] took is
-    /// done; None while it runs.
-    fn render_poll() -> Option<alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+    /// The render side, once the frame [`Platform::render_start`] took is
+    /// played; None while it plays.
+    fn render_poll() -> Option<alloc::boxed::Box<crate::player::Player<Self>>> {
         None
     }
 

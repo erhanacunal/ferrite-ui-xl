@@ -80,9 +80,9 @@ pub trait WidgetRenderer<P: Platform> {
     /// Play a frame recorded in compositor order (`render::MODE_AREAS`):
     /// areas, each after its `dl::Op::Area` marker, repainted whole; an empty
     /// marker = drawing outside them follows. The images and fonts it refers
-    /// to are `ctx`'s (`Ctx::refs`). Return `false`, having drawn nothing,
-    /// to have it replayed on the CPU.
-    fn play(_ctx: &Ctx<P>, _list: &crate::dl::List) -> bool {
+    /// to are the player's (`Player::refs`). Return `false`, having drawn
+    /// nothing, to have it replayed on the CPU.
+    fn play(_p: &crate::player::Player<P>, _list: &crate::dl::List) -> bool {
         false
     }
 
@@ -458,7 +458,8 @@ mod tests {
         use crate::view::Draw;
         use crate::widget::FLAG_HAS_ON_PAINT;
         let mut ctx = paint_ctx(ObjPool::new());
-        ctx.render_ctx = Some(alloc::boxed::Box::new(paint_ctx(ObjPool::without_storage())));
+        let r = paint_ctx(ObjPool::without_storage());
+        ctx.render_ctx = Some(alloc::boxed::Box::new(crate::player::Player::new(r.lcd, r.flash)));
         let root = ctx.objs.alloc_widget().unwrap();
         ctx.objs.root = root;
         ctx.objs.get_mut(root).size = Size { w: 800, h: 480 };

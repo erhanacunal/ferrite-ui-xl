@@ -30,13 +30,10 @@ pub struct Ctx<P: Platform> {
     pub fonts: FontList,
     pub images: ImageList,
     pub objs: ObjPool,
-    /// The render side's own context (plan step 3c), when the board gives
-    /// one: it plays the frames recorded here (`render::submit`); its `objs`
-    /// holds only the frame and the overlay (`ObjPool::without_storage`),
-    /// its `lcd`/`flash` reach the same hardware, its fonts/images are
-    /// shared copies kept up to date at each hand-over. None = everything
-    /// renders here.
-    pub render_ctx: Option<alloc::boxed::Box<Ctx<P>>>,
+    /// The render side (`player.rs`), when the board gives one: it plays
+    /// the frames recorded here in `MODE_AREAS` (`render::submit`). None =
+    /// everything draws here.
+    pub render_ctx: Option<alloc::boxed::Box<crate::player::Player<P>>>,
     /// `render_ctx` is away running a job (`Platform::render_start`): the
     /// screen belongs to the render side until `render::wait_idle`.
     pub render_away: bool,

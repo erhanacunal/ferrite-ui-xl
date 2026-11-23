@@ -117,34 +117,12 @@ fn main() {
         }
     };
 
-    // The render side's own context (plan step 3c): same framebuffer and
-    // flash, everything else idle. `FERRITE_SIM_ONE_CTX=1`: none (the
-    // renderer swaps pools inside the VM's context instead).
+    // The render side (plan step 3c): same framebuffer and flash.
+    // `FERRITE_SIM_ONE_CTX=1`: none (everything draws on the VM's side).
     let render_ctx = if std::env::var("FERRITE_SIM_ONE_CTX").is_ok_and(|v| v == "1") {
         None
     } else {
-        Some(Box::new(Ctx::<SimPlatform> {
-            lcd: lcd::new(fb.clone()),
-            flash: flash.clone(),
-            fonts: FontList::new(),
-            images: ImageList::new(),
-            objs: ferrite_core::pool::ObjPool::without_storage(),
-            render_ctx: None,
-            render_away: false,
-            fs: None,
-            backlight: backlight::new(),
-            rtc: rtc::init(),
-            usart: usart::init(),
-            systick: systick::Systick::handle(),
-            audio: ferrite_core::audio::AudioImpl::with_backend(audio::SimAudio::new(None)),
-            jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
-            gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
-            eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(None)),
-            storage: ferrite_core::storage::StorageImpl::with_backend(storage::SimStorage::new(None)),
-            cursor_visible: false,
-            tasks: ferrite_core::task::TaskTable::new(),
-            domains: ferrite_core::domain::Domains::new(),
-        }))
+        Some(Box::new(ferrite_core::player::Player::<SimPlatform>::new(lcd::new(fb.clone()), flash.clone())))
     };
     let ctx = Box::new(Ctx::<SimPlatform> {
         lcd: lcd::new(fb.clone()),

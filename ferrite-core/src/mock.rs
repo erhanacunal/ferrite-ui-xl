@@ -294,21 +294,20 @@ impl Platform for MockPlatform {
 
     #[cfg(feature = "host")]
     fn render_start(
-        r: alloc::boxed::Box<crate::ctx::Ctx<Self>>,
-        job: crate::render::RenderJob,
-    ) -> Result<(), alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+        r: alloc::boxed::Box<crate::player::Player<Self>>,
+    ) -> Result<(), alloc::boxed::Box<crate::player::Player<Self>>> {
         if !RENDER_ELSEWHERE.with(|e| e.get()) {
             return Err(r);
         }
-        RENDER_SIDE.with(|s| *s.borrow_mut() = Some((r, job, false)));
+        RENDER_SIDE.with(|s| *s.borrow_mut() = Some((r, false)));
         Ok(())
     }
 
     #[cfg(feature = "host")]
-    fn render_poll() -> Option<alloc::boxed::Box<crate::ctx::Ctx<Self>>> {
+    fn render_poll() -> Option<alloc::boxed::Box<crate::player::Player<Self>>> {
         RENDER_SIDE.with(|s| {
             let mut s = s.borrow_mut();
-            if s.as_ref().is_some_and(|(_, _, done)| *done) { s.take().map(|(r, _, _)| r) } else { None }
+            if s.as_ref().is_some_and(|(_, done)| *done) { s.take().map(|(r, _)| r) } else { None }
         })
     }
 
@@ -320,7 +319,7 @@ impl Platform for MockPlatform {
 }
 
 #[cfg(feature = "host")]
-type RenderSide = Option<(alloc::boxed::Box<crate::ctx::Ctx<MockPlatform>>, crate::render::RenderJob, bool)>;
+type RenderSide = Option<(alloc::boxed::Box<crate::player::Player<MockPlatform>>, bool)>;
 
 #[cfg(feature = "host")]
 std::thread_local! {
@@ -339,16 +338,16 @@ pub fn render_elsewhere(on: bool) {
 /// A job is held and not run yet.
 #[cfg(feature = "host")]
 pub fn render_pending() -> bool {
-    RENDER_SIDE.with(|s| s.borrow().as_ref().is_some_and(|(_, _, done)| !*done))
+    RENDER_SIDE.with(|s| s.borrow().as_ref().is_some_and(|(_, done)| !*done))
 }
 
 /// Run the held job ("the other core"); `render_poll` then hands it back.
 #[cfg(feature = "host")]
 pub fn finish_render() {
     RENDER_SIDE.with(|s| {
-        if let Some((r, job, done)) = s.borrow_mut().as_mut() {
+        if let Some((r, done)) = s.borrow_mut().as_mut() {
             if !*done {
-                crate::render::run_job(r, *job);
+                r.play();
                 *done = true;
             }
         }

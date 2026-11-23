@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use exynos_4412_rs::drivers::mali::Filter;
 use exynos_4412_rs::gpu::{self, Area, Blend, Frame, Gpu, Target};
 use ferrite_core::ctx::Ctx;
+use ferrite_core::player::Player;
 use ferrite_core::lcd::tess;
 use ferrite_core::render::RoundPart;
 use ferrite_core::types::{Color, Rect};
@@ -62,7 +63,7 @@ impl Sprite {
     /// What `f` draws inside `r` (screen coordinates, the primitives cut to `r`) in a new
     /// sprite covering `r`, premultiplied, cleaned for the GPU. None if it cannot get the
     /// memory or `r` is larger than the panel.
-    pub(crate) fn draw_at(ctx: &Ctx<P>, r: &Rect, f: impl FnOnce()) -> Option<Self> {
+    pub(crate) fn draw_at(ctx: &Player<P>, r: &Rect, f: impl FnOnce()) -> Option<Self> {
         let (w, h) = (r.w as usize, r.h as usize);
         if w == 0 || h == 0 || w > lcd::PANEL.width || h > lcd::PANEL.height {
             return None;
@@ -439,7 +440,7 @@ const IMAGE_ENTRIES: usize = 64;
 impl Images {
     /// `img` as a texture (decoded now if not held); None without the memory, or larger
     /// than the panel.
-    fn tex(&mut self, ctx: &Ctx<P>, img: &ferrite_core::image::Image) -> Option<Tex> {
+    fn tex(&mut self, ctx: &Player<P>, img: &ferrite_core::image::Image) -> Option<Tex> {
         let (w, h) = (img.width as usize, img.height as usize);
         let generation = crate::flash::generation();
         let found = self
@@ -926,7 +927,7 @@ pub fn service(ctx: &mut Ctx<P>) {
 impl State {
     /// `img` as a texture: a raw opaque RGB565 picture where it is in the flash shadow (its
     /// first texel `shift` texels into the texture; opaque), else decoded ([`Images`]).
-    fn image(&mut self, ctx: &Ctx<P>, img: &ferrite_core::image::Image) -> Option<(Tex, usize, bool)> {
+    fn image(&mut self, ctx: &Player<P>, img: &ferrite_core::image::Image) -> Option<(Tex, usize, bool)> {
         let (pw, ph) = (img.width as i32, img.height as i32);
         if img.is_raw_opaque()
             && let Some(addr) = renderer::picture_addr(img.data_addr(), (pw * ph * 2) as usize)

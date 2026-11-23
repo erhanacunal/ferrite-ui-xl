@@ -29,7 +29,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, 
 
 use exynos_4412_rs::{mmu, smp};
 use ferrite_core::ctx::Ctx;
-use ferrite_core::render::{self, RenderJob};
+use ferrite_core::player::Player;
+use ferrite_core::render;
 
 use crate::platform::Exynos4412Platform as P;
 
@@ -38,8 +39,7 @@ const BUSY: u8 = 1;
 const DONE: u8 = 2;
 
 static STATE: AtomicU8 = AtomicU8::new(IDLE);
-static CTX: AtomicPtr<Ctx<P>> = AtomicPtr::new(null_mut());
-static JOB: AtomicU8 = AtomicU8::new(0);
+static CTX: AtomicPtr<Player<P>> = AtomicPtr::new(null_mut());
 static RUNNING: AtomicBool = AtomicBool::new(false);
 /// Jobs go to CPU2 (`POST /api/rcore?on=`); off = CPU0 runs them.
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -131,12 +131,7 @@ fn render_core(_cpu: usize) -> ! {
         // SAFETY: CPU0 stored a live context before BUSY (Release) and does
         // not touch it until DONE.
         let r = unsafe { &mut *CTX.load(Ordering::Relaxed) };
-        let job = match JOB.load(Ordering::Relaxed) {
-            0 => RenderJob::Dirty,
-            1 => RenderJob::All,
-            _ => RenderJob::Play,
-        };
-        render::run_job(r, job);
+        r.play();
         // What this core drew in cached memory reaches L2/DRAM for the
         // devices CPU0 drives next (layer copies, present cleans).
         let t1 = crate::perf::cycles();
@@ -160,7 +155,7 @@ fn render_core(_cpu: usize) -> ! {
 }
 
 /// `Platform::render_start`.
-pub fn render_start(r: Box<Ctx<P>>, job: RenderJob) -> Result<(), Box<Ctx<P>>> {
+pub fn render_start(r: Box<Player<P>>) -> Result<(), Box<Player<P>>> {
     if !running() || STATE.load(Ordering::Acquire) != IDLE {
         return Err(r);
     }
@@ -169,14 +164,6 @@ pub fn render_start(r: Box<Ctx<P>>, job: RenderJob) -> Result<(), Box<Ctx<P>>> {
     mmu::clean_l1_all();
     START_CLEAN_TICKS.fetch_add(crate::perf::cycles().wrapping_sub(t0) as u64, Ordering::Relaxed);
     CTX.store(Box::into_raw(r), Ordering::Relaxed);
-    JOB.store(
-        match job {
-            RenderJob::Dirty => 0,
-            RenderJob::All => 1,
-            RenderJob::Play => 2,
-        },
-        Ordering::Relaxed,
-    );
     STATE.store(BUSY, Ordering::Release);
     // SAFETY: wakes CPU2 from its `wfe`.
     unsafe { core::arch::asm!("dsb", "sev", options(nostack, preserves_flags)) };
@@ -186,7 +173,7 @@ pub fn render_start(r: Box<Ctx<P>>, job: RenderJob) -> Result<(), Box<Ctx<P>>> {
 /// `Platform::render_poll`: also presents what the job drew at once (the
 /// runtime may hand the next job over before this pass's `frame_end`, and
 /// `lcd::render_due` holds it back only once a present is in flight).
-pub fn render_poll() -> Option<Box<Ctx<P>>> {
+pub fn render_poll() -> Option<Box<Player<P>>> {
     if STATE.load(Ordering::Acquire) != DONE {
         return None;
     }

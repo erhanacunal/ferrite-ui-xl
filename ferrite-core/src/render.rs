@@ -238,29 +238,18 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
 /// A render the render side runs (`Platform::render_start`, `run_job`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderJob {
-    /// Play the frame recorded on the VM's core (`MODE_AREAS`): no render.
-    Play,
     /// `render_dirty`.
     Dirty,
     /// `render_all`.
     All,
 }
 
-/// Runs `job` on `r`: `Play` plays the frame `r` was handed (`submit`, on
-/// whichever core holds the render context); `Dirty` / `All` render the tree
-/// of `r` (the VM's context, `with_view`). The VM's recorded drawing
+/// Runs `job` on the tree of `r` (the VM's context, `with_view`, `submit`;
+/// a recorded frame is played by `Player::play`). The VM's recorded drawing
 /// (`view::Draw`): direct drawing is replayed before the render, `on_paint`
 /// lists are kept and drawn with their widgets by it (`draw_paint`).
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let ta = crate::perf::now();
-    if job == RenderJob::Play {
-        let list = r.objs.render.frame.list();
-        if !(r.objs.render.areas && <P::Renderer as WidgetRenderer<P>>::play(r, &list)) {
-            list.replay(&r.lcd, &r.refs());
-        }
-        JOB_TICKS[JOB_RENDER].fetch_add(crate::perf::now().wrapping_sub(ta) as u64, core::sync::atomic::Ordering::Relaxed);
-        return;
-    }
     // The VM's direct drawing so far, closed into the queue in order.
     r.objs.close_screen_rec();
     let t0 = crate::perf::now();
@@ -275,7 +264,6 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     match job {
         RenderJob::Dirty => render_dirty_view(r),
         RenderJob::All => render_all_view(r),
-        RenderJob::Play => {}
     }
     let t2 = crate::perf::now();
     use core::sync::atomic::Ordering::Relaxed;
@@ -354,8 +342,8 @@ pub fn wait_idle<P: Platform>(ctx: &mut Ctx<P>) {
 
 /// Run `job` on the widget tree itself (`ctx.objs`). With a render context
 /// in `MODE_AREAS` the render is recorded here into one list (`frame`) and
-/// only that list goes to the render side (`RenderJob::Play`, another core
-/// if the board takes it): the render side never sees the tree.
+/// only that list goes to the render side (`Player::play`, another core if
+/// the board takes it): the render side never sees the tree.
 fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
     if ctx.render_ctx.is_none() || ctx.objs.render.mode != MODE_AREAS {
         with_view(ctx, |c| run_job(c, job));
@@ -390,9 +378,8 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
     sync_render_ctx(ctx, &mut r);
     // The list goes over; the render context's last one comes back as the
     // next frame's buffer.
-    core::mem::swap(&mut ctx.objs.render.frame, &mut r.objs.render.frame);
-    r.objs.render.areas = true;
-    match P::render_start(r, RenderJob::Play) {
+    core::mem::swap(&mut ctx.objs.render.frame, &mut r.frame);
+    match P::render_start(r) {
         Ok(()) => {
             crate::perf::add_sub(
                 crate::perf::phase::FRAME_HANDOFF,
@@ -405,7 +392,7 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
                 crate::perf::phase::FRAME_HANDOFF,
                 crate::perf::now().wrapping_sub(t0),
             );
-            run_job(&mut r, RenderJob::Play);
+            r.play();
             ctx.render_ctx = Some(r);
         }
     }
@@ -431,22 +418,14 @@ pub fn with_view<P: Platform, R>(ctx: &mut Ctx<P>, f: impl FnOnce(&mut Ctx<P>) -
 /// the fonts and images the VM loaded (the list refers to them), the
 /// filesystem, the orientation, the cursor blink, the overlay (the keyboard:
 /// a board player leaves areas under it to the CPU).
-fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut Ctx<P>) {
-    r.objs.overlay = ctx.objs.overlay;
+fn sync_render_ctx<P: Platform>(ctx: &mut Ctx<P>, r: &mut crate::player::Player<P>) {
+    r.overlay = ctx.objs.overlay;
     r.fonts.sync_from(&ctx.fonts);
     r.images.sync_from(&ctx.images);
-    if r.fs.is_none() != ctx.fs.is_none() {
-        r.fs = ctx.fs.clone();
-    } else if let (Some(a), Some(b)) = (&mut r.fs, &ctx.fs) {
-        if a.checksum != b.checksum {
-            *a = b.clone();
-        }
-    }
     r.lcd.sync_layers_from(&ctx.lcd);
     if r.lcd.is_portrait() != ctx.lcd.is_portrait() {
         r.lcd.set_portrait(ctx.lcd.is_portrait());
     }
-    r.cursor_visible = ctx.cursor_visible;
 }
 
 fn render_all_view<P: Platform>(ctx: &mut Ctx<P>) {

@@ -66,6 +66,7 @@ pub mod storage;
 pub mod task;
 pub mod types;
 pub mod view;
+pub mod player;
 pub mod vm;
 pub mod widget;
 

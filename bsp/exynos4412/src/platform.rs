@@ -104,13 +104,12 @@ impl Platform for Exynos4412Platform {
     const VERIFY_FS_ON_BOOT: bool = true;
 
     fn render_start(
-        r: alloc::boxed::Box<Ctx<Self>>,
-        job: ferrite_core::render::RenderJob,
-    ) -> Result<(), alloc::boxed::Box<Ctx<Self>>> {
-        crate::rcore::render_start(r, job)
+        r: alloc::boxed::Box<ferrite_core::player::Player<Self>>,
+    ) -> Result<(), alloc::boxed::Box<ferrite_core::player::Player<Self>>> {
+        crate::rcore::render_start(r)
     }
 
-    fn render_poll() -> Option<alloc::boxed::Box<Ctx<Self>>> {
+    fn render_poll() -> Option<alloc::boxed::Box<ferrite_core::player::Player<Self>>> {
         crate::rcore::render_poll()
     }
 

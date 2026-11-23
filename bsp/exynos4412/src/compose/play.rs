@@ -57,7 +57,7 @@ fn rect(x: i32, y: i32, w: i32, h: i32) -> R {
 }
 
 /// Plays `list` on the GPU; false (nothing drawn) to have it replayed on the CPU.
-pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
+pub fn play(ctx: &Player<P>, list: &List) -> bool {
     if !ENABLED.load(Relaxed) || ctx.lcd.is_portrait() {
         return verdict(OTHER);
     }
@@ -95,7 +95,7 @@ pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
     if frames > FREE_FRAMES.load(Relaxed) as i32 && kpx < MIN_FRAME_KPX.load(Relaxed) as i32 * frames {
         return verdict(SMALL_AREAS);
     }
-    if let Some(o) = ctx.objs.overlay
+    if let Some(o) = ctx.overlay
         && groups.iter().any(|g| g.0.is_none() && g.1.iter().any(|a| a.intersects(&o)))
     {
         return verdict(OTHER);
@@ -170,7 +170,7 @@ pub fn play(ctx: &Ctx<P>, list: &List) -> bool {
 impl State {
     /// The list's calls drawn on `want` (None = the screen) as pieces. Err(the opcode) for a
     /// call it can't draw.
-    fn calls(&mut self, ctx: &Ctx<P>, list: &List, want: Option<Layer>) -> Result<(), u8> {
+    fn calls(&mut self, ctx: &Player<P>, list: &List, want: Option<Layer>) -> Result<(), u8> {
         let mut on: Option<Layer> = None;
         let mut area = R { x0: 0, y0: 0, x1: 0, y1: 0 };
         let mut clip = area;
@@ -405,7 +405,7 @@ impl State {
 
     /// What `f` draws on the CPU inside `r`, from a sprite drawn for this frame only. False
     /// without the memory.
-    fn cpu(&mut self, ctx: &Ctx<P>, r: R, f: impl FnOnce()) -> bool {
+    fn cpu(&mut self, ctx: &Player<P>, r: R, f: impl FnOnce()) -> bool {
         if r.is_empty() {
             return true;
         }
@@ -486,7 +486,7 @@ impl State {
     /// `draw_text`: a quad per glyph from the atlas (over an opaque cell of `bg`), cut to
     /// `clip`. False if a glyph doesn't fit in the atlas.
     #[allow(clippy::too_many_arguments)]
-    fn text(&mut self, ctx: &Ctx<P>, font: &ferrite_core::font::Font, text: &[u8], x: i16, y: i16, fg: u16, bg: Option<u16>, clip: &R) -> bool {
+    fn text(&mut self, ctx: &Player<P>, font: &ferrite_core::font::Font, text: &[u8], x: i16, y: i16, fg: u16, bg: Option<u16>, clip: &R) -> bool {
         let color = Lin::flat(rgb(fg, 1.0));
         let tex = self.atlas.tex();
         let a = ATLAS as f32;

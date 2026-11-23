@@ -203,30 +203,12 @@ fn main(_args: BootArgs) -> ! {
     net::start(pmic, mct, setup::active());
     println!("ferrite: up, entering runtime");
 
-    // The render side's own context (plan step 3c): same LCD and flash
-    // (statics behind zero-sized backends), everything else idle.
-    let render_ctx = Some(Box::new(Ctx::<Exynos4412Platform> {
-        lcd: LcdImpl::with_backend(lcd::FimdLcd),
-        flash: FlashImpl::with_backend(flash::RamFlash),
-        fonts: FontList::new(),
-        images: ImageList::new(),
-        objs: ferrite_core::pool::ObjPool::without_storage(),
-        render_ctx: None,
-        render_away: false,
-        fs: None,
-        backlight: BacklightImpl::with_backend(backlight::GpioBacklight),
-        rtc: RtcImpl::with_backend(rtc::new()),
-        usart: UsartImpl::with_backend(usart::HwUart),
-        systick: SystickImpl::init(),
-        gpio: ferrite_core::gpio::GpioImpl::none(),
-        eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::FileEeprom),
-        storage: ferrite_core::storage::StorageImpl::with_backend(storage::BoardStorage),
-        audio: ferrite_core::audio::AudioImpl::with_backend(audio::new(pmic)),
-        jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
-        cursor_visible: false,
-        tasks: ferrite_core::task::TaskTable::new(),
-        domains: ferrite_core::domain::Domains::new(),
-    }));
+    // The render side (plan step 3c): same LCD and flash (statics behind
+    // zero-sized backends).
+    let render_ctx = Some(Box::new(ferrite_core::player::Player::<Exynos4412Platform>::new(
+        LcdImpl::with_backend(lcd::FimdLcd),
+        FlashImpl::with_backend(flash::RamFlash),
+    )));
     let ctx = Box::new(Ctx::<Exynos4412Platform> {
         lcd: LcdImpl::with_backend(lcd),
         flash: FlashImpl::with_backend(flash::RamFlash),

@@ -375,8 +375,9 @@ const OP_W_SETALL: u8 = 0x51;
 // compiler (ferrite-ui `ferrite_cc.py` keeps the range free;
 // `docs/bytecode.md`). The threaded dispatch (`vm/tc.rs`) rewrites an
 // instruction it runs into its form here, which has its own handler: a
-// superinstruction by its cond / op operand (no dispatch on it), LOAD /
-// STORE / ADD_VI by the kind of their slot (no local-or-global choice). Same
+// superinstruction by its cond / op operand (no dispatch on it), and by the
+// kind of its slot where it has one (BIN_V, JCMP_VI, STORE_OP), LOAD / STORE /
+// ADD_VI / ARR_LOAD_V by the kind of their slot (no local-or-global choice). Same
 // length and operands. `QUICK[q - Q_FIRST]` = (the instruction, the cond /
 // op, the slot kind), and every path runs `q` as that instruction with that
 // cond / op (the operand byte ignored) and the slot operand forced to that
@@ -388,7 +389,7 @@ pub(crate) const Q_FIRST: u8 = 0x58;
 pub(crate) const SLOT_ANY: u8 = 0;
 pub(crate) const SLOT_L: u8 = 1;
 pub(crate) const SLOT_G: u8 = 2;
-pub(crate) const QUICK: [(u8, u8, u8); 35] = [
+pub(crate) const QUICK: [(u8, u8, u8); 39] = [
     (OP_JCMP, OP_EQ, SLOT_ANY), (OP_JCMP, OP_NE, SLOT_ANY), (OP_JCMP, OP_LT, SLOT_ANY),
     (OP_JCMP, OP_LE, SLOT_ANY), (OP_JCMP, OP_GT, SLOT_ANY), (OP_JCMP, OP_GE, SLOT_ANY),
     (OP_JCMP_VI, OP_EQ, SLOT_L), (OP_JCMP_VI, OP_NE, SLOT_L), (OP_JCMP_VI, OP_LT, SLOT_L),
@@ -398,10 +399,12 @@ pub(crate) const QUICK: [(u8, u8, u8); 35] = [
     (OP_BIN_I, OP_ADD, SLOT_ANY), (OP_BIN_I, OP_SUB, SLOT_ANY), (OP_BIN_I, OP_MUL, SLOT_ANY),
     (OP_BIN_I, OP_DIV, SLOT_ANY), (OP_BIN_I, OP_MOD, SLOT_ANY), (OP_BIN_I, OP_AND, SLOT_ANY),
     (OP_BIN_I, OP_OR, SLOT_ANY), (OP_BIN_I, OP_SHL, SLOT_ANY), (OP_BIN_I, OP_SHR, SLOT_ANY),
-    (OP_BIN_V, OP_ADD, SLOT_ANY), (OP_BIN_V, OP_SUB, SLOT_ANY),
+    (OP_BIN_V, OP_ADD, SLOT_L), (OP_BIN_V, OP_ADD, SLOT_G),
+    (OP_BIN_V, OP_SUB, SLOT_L), (OP_BIN_V, OP_SUB, SLOT_G),
     (OP_STORE_OP, OP_ADD, SLOT_L),
     (OP_LOAD, 0, SLOT_L), (OP_LOAD, 0, SLOT_G), (OP_STORE, 0, SLOT_L), (OP_STORE, 0, SLOT_G),
     (OP_ADD_VI, 0, SLOT_L),
+    (OP_ARR_LOAD_V, 0, SLOT_L), (OP_ARR_LOAD_V, 0, SLOT_G),
 ];
 pub(crate) const Q_LAST: u8 = Q_FIRST + QUICK.len() as u8 - 1;
 const _: () = assert!(Q_LAST <= 0x7F);
@@ -423,6 +426,8 @@ pub(crate) const Q_LOAD_G: u8 = q_find(OP_LOAD, 0, SLOT_G);
 pub(crate) const Q_STORE_L: u8 = q_find(OP_STORE, 0, SLOT_L);
 pub(crate) const Q_STORE_G: u8 = q_find(OP_STORE, 0, SLOT_G);
 pub(crate) const Q_ADD_VI_L: u8 = q_find(OP_ADD_VI, 0, SLOT_L);
+pub(crate) const Q_ARR_LOAD_V_L: u8 = q_find(OP_ARR_LOAD_V, 0, SLOT_L);
+pub(crate) const Q_ARR_LOAD_V_G: u8 = q_find(OP_ARR_LOAD_V, 0, SLOT_G);
 
 /// A slot operand as a form of slot kind `kind` takes it.
 #[inline(always)]
@@ -439,23 +444,25 @@ pub(crate) fn force_slot(raw: u8, kind: u8) -> u8 {
 /// has none (or only one for the other slot kind).
 #[inline(always)]
 pub(crate) fn quick_of(op: u8, sub: u8, slot: u8) -> u8 {
-    let q = QUICK_OF[op.wrapping_sub(OP_JCMP) as usize & 15][sub as usize & 31] * (sub < 32) as u8;
-    // A superinstruction's forms are SLOT_ANY or SLOT_L.
-    if q != 0 && QUICK[(q - Q_FIRST) as usize].2 == SLOT_L && slot & 0x80 == 0 {
-        return 0;
-    }
-    q
+    QUICK_OF[op.wrapping_sub(OP_JCMP) as usize & 15][sub as usize & 31][(slot >> 7) as usize] * (sub < 32) as u8
 }
 
-/// `quick_of` as a table: [op - OP_JCMP][sub] (superinstructions without a
-/// quickened form: rows of 0).
-static QUICK_OF: [[u8; 32]; 16] = {
-    let mut t = [[0u8; 32]; 16];
+/// `quick_of` as a table: [op - OP_JCMP][sub][slot bit 7] (a SLOT_ANY form
+/// in both kinds; superinstructions without a quickened form: rows of 0).
+static QUICK_OF: [[[u8; 2]; 32]; 16] = {
+    let mut t = [[[0u8; 2]; 32]; 16];
     let mut i = 0;
     while i < QUICK.len() {
-        let (op, sub, _) = QUICK[i];
-        if op >= OP_JCMP && op <= OP_STORE_OP && op != OP_ADD_VI {
-            t[(op - OP_JCMP) as usize][sub as usize] = Q_FIRST + i as u8;
+        let (op, sub, kind) = QUICK[i];
+        if op >= OP_JCMP && op <= OP_STORE_OP && op != OP_ADD_VI && op != OP_ARR_LOAD_V {
+            let q = Q_FIRST + i as u8;
+            let e = &mut t[(op - OP_JCMP) as usize][sub as usize];
+            if kind != SLOT_L {
+                e[0] = q;
+            }
+            if kind != SLOT_G {
+                e[1] = q;
+            }
         }
         i += 1;
     }
@@ -3141,7 +3148,7 @@ impl Vm {
             OP_JCMP | OP_JCMP_VI | OP_JCMP_VV | OP_BIN_I | OP_BIN_I32 | OP_BIN_V | OP_STORE_OP => {
                 self.exec_super(op, None, SLOT_ANY)
             }
-            Q_FIRST..=Q_LAST => self.exec_quick(op),
+            Q_FIRST..=Q_LAST => self.exec_quick(ctx, op),
             OP_ADD_VI => {
                 let [raw, lo, hi] = self.fetch();
                 let imm = i16::from_le_bytes([lo, hi]) as i32;
@@ -3235,7 +3242,7 @@ impl Vm {
     /// A quickened form (`QUICK`; pc past its opcode): its instruction with
     /// the form's cond / op and slot kind.
     #[inline(never)]
-    fn exec_quick(&mut self, q: u8) {
+    fn exec_quick<P: Platform>(&mut self, ctx: &Ctx<P>, q: u8) {
         let (op, sub, kind) = QUICK[(q - Q_FIRST) as usize];
         match op {
             // As the plain LOAD / STORE / ADD_VI in `exec_one`.
@@ -3258,6 +3265,14 @@ impl Vm {
                     let slot = self.resolve_slot(force_slot(raw, kind));
                     let v = self.var_get(slot).wrapping_add(imm);
                     self.var_set(slot, v);
+                }
+            }
+            OP_ARR_LOAD_V => {
+                let raw = force_slot(self.read_u8(), kind);
+                let idx = self.pop();
+                if self.state != VmState::Error {
+                    let arr_id = self.var_get(self.resolve_slot(raw));
+                    self.arr_load(ctx, arr_id, idx);
                 }
             }
             _ => self.exec_super(op, Some(sub), kind),
@@ -3300,7 +3315,7 @@ impl Vm {
             }
             OP_BIN_V => {
                 let [op, raw] = self.fetch();
-                let b = self.var_get(self.resolve_slot(raw));
+                let b = self.var_get(self.resolve_slot(force_slot(raw, kind)));
                 self.top_binop(sub.unwrap_or(op), b);
             }
             _ => {
@@ -5269,8 +5284,11 @@ mod anim_tests {
             // Quickened forms (QUICK), junk in their cond / op byte, slots of
             // either kind.
             (Q_FIRST + 2, 3), (Q_FIRST + 7, 6), (Q_FIRST + 15, 5), (Q_FIRST + 18, 3),
-            (Q_FIRST + 22, 3), (Q_FIRST + 26, 3), (Q_FIRST + 28, 2), (Q_FIRST + 29, 2),
-            (Q_LOAD_L, 1), (Q_LOAD_G, 1), (Q_STORE_L, 1), (Q_STORE_G, 1), (Q_ADD_VI_L, 3),
+            (Q_FIRST + 22, 3), (Q_FIRST + 26, 3), (Q_FIRST + 27, 2), (Q_FIRST + 30, 2),
+            (Q_FIRST + 31, 2), (Q_LOAD_L, 1), (Q_LOAD_G, 1), (Q_STORE_L, 1), (Q_STORE_G, 1),
+            (Q_ADD_VI_L, 3), (Q_ARR_LOAD_V_L, 1), (Q_ARR_LOAD_V_G, 1),
+            // Arrays: global 1 / local 1 hold one, other variables mostly not.
+            (OP_ARR_LOAD, 0), (OP_ARR_LOAD_V, 1), (OP_ARR_LOAD_V, 1),
         ];
         // The quickened jumps (JCMP, JCMP_VI, JCMP_VV forms).
         let q_jump = |op: u8| (Q_FIRST..Q_FIRST + 18).contains(&op);
@@ -5299,6 +5317,7 @@ mod anim_tests {
                 let nargs = if jumpy { nargs + aw - 2 } else { nargs };
                 for k in 0..nargs {
                     let b = match (op, k) {
+                        (OP_ARR_LOAD_V | Q_ARR_LOAD_V_L | Q_ARR_LOAD_V_G, 0) if rnd() % 4 != 0 => [1, 0x81][rnd() as usize % 2],
                         // Mostly valid conditions / operators, a few bad ones.
                         (OP_JCMP | OP_JCMP_VI | OP_JCMP_VV, 0) if rnd() % 8 != 0 => OP_EQ + (rnd() % 6) as u8,
                         (OP_BIN_I | OP_BIN_I32 | OP_BIN_V | OP_STORE_OP, 0) if rnd() % 8 != 0 => OP_ADD + (rnd() % 7) as u8,
@@ -5353,6 +5372,18 @@ mod anim_tests {
                     for (i, &x) in fill[12..].iter().enumerate() {
                         v.vars[i * 11] = x;
                     }
+                }
+                // An array of 32 in global 1 and local 1 (the same id in
+                // both pools), now and then on the stack as ARR_LOAD's.
+                for (v, c) in [(&mut a, &mut ca), (&mut b, &mut cb)] {
+                    let id = c.objs.arr_alloc(32).unwrap();
+                    for (i, e) in c.objs.arr_mut(id).unwrap().iter_mut().enumerate() {
+                        *e = i as i32 * 7 - 50;
+                    }
+                    v.vars[1] = id as i32;
+                    v.vars[9] = id as i32;
+                    v.stack[3] = id as i32;
+                    v.stack[7] = id as i32;
                 }
                 for _ in 0..4 {
                     if a.state != VmState::Running {
@@ -6280,7 +6311,15 @@ mod anim_tests {
                     c.extend_from_slice(&[OP_STORE, 1]);
                     push32(&mut c, a);
                     at = c.len();
-                    c.extend_from_slice(&[op, sub, 1, OP_HALT]);
+                    slot_at = Some(at + 2);
+                    c.extend_from_slice(&[op, sub, slot, OP_HALT]);
+                }
+                OP_ARR_LOAD_V => {
+                    // Variable 1 = the array (built by `arr_ctx`), index a & 3.
+                    push32(&mut c, a & 3);
+                    at = c.len();
+                    slot_at = Some(at + 1);
+                    c.extend_from_slice(&[op, slot, OP_HALT]);
                 }
                 OP_STORE_OP => {
                     push32(&mut c, a);
@@ -6316,13 +6355,28 @@ mod anim_tests {
             }
             (c, at, slot_at)
         }
-        fn threaded(code: &[u8]) -> Vm {
+        // Variable 1 holds an array [10, 20, 30, 40].
+        fn arr_vm(code: &[u8]) -> (Vm, Ctx<MockPlatform>) {
             let mut ctx = mock_ctx();
+            let id = ctx.objs.arr_alloc(4).unwrap();
+            ctx.objs.arr_mut(id).unwrap().copy_from_slice(&[10, 20, 30, 40]);
             let mut vm = Vm::new();
             vm.code = VmCode::new(code.to_vec());
+            vm.var_set(1, id as i32);
             vm.state = VmState::Running;
+            (vm, ctx)
+        }
+        fn threaded(code: &[u8]) -> Vm {
+            let (mut vm, mut ctx) = arr_vm(code);
             while vm.state == VmState::Running {
                 vm.tick(&mut ctx, 1000);
+            }
+            vm
+        }
+        fn stepped(code: &[u8]) -> Vm {
+            let (mut vm, mut ctx) = arr_vm(code);
+            while vm.state == VmState::Running {
+                vm.exec_one(&mut ctx);
             }
             vm
         }
@@ -6330,7 +6384,7 @@ mod anim_tests {
             assert!(vm.state == VmState::Halted);
             vm.stack[vm.sp as usize - 1]
         }
-        let has_sub = |op: u8| (OP_JCMP..=OP_STORE_OP).contains(&op) && op != OP_ADD_VI;
+        let has_sub = |op: u8| (OP_JCMP..=OP_STORE_OP).contains(&op) && op != OP_ADD_VI && op != OP_ARR_LOAD_V;
         for (i, &(op, sub, kind)) in QUICK.iter().enumerate() {
             let q = Q_FIRST + i as u8;
             let slot = if kind == SLOT_L { 0x81 } else { 0x01 };
@@ -6346,8 +6400,8 @@ mod anim_tests {
                     if let Some(k) = slot_at.filter(|_| kind != SLOT_ANY) {
                         quick[k] ^= 0x80;
                     }
-                    let want = top(&run_code(&plain));
-                    assert_eq!(top(&run_code(&quick)), want, "exec_one, {what}");
+                    let want = top(&stepped(&plain));
+                    assert_eq!(top(&stepped(&quick)), want, "exec_one, {what}");
                     assert_eq!(top(&threaded(&quick)), want, "threaded, {what}");
                     let vm = threaded(&plain);
                     assert_eq!(top(&vm), want, "threaded plain, {what}");
@@ -6374,13 +6428,15 @@ mod anim_tests {
     fn quickened_slot_kind_is_forced() {
         // (code, the variable it reads / writes as its result): frame_base 4,
         // so local 1 = variable 5 (42) and global 1 = variable 1 (7).
-        let cases: [(std::vec::Vec<u8>, i32); 6] = [
+        let cases: [(std::vec::Vec<u8>, i32); 8] = [
             (std::vec![Q_LOAD_L, 0x01, OP_HALT], 42),
             (std::vec![Q_LOAD_G, 0x81, OP_HALT], 7),
             (std::vec![OP_PUSH_2, Q_STORE_L, 0x01, OP_LOAD, 0x81, OP_HALT], 2),
             (std::vec![OP_PUSH_2, Q_STORE_G, 0x81, OP_LOAD, 0x01, OP_HALT], 2),
             (std::vec![Q_ADD_VI_L, 0x01, 3, 0, OP_LOAD, 0x81, OP_HALT], 45),
             (std::vec![OP_PUSH_1, quick_of(OP_STORE_OP, OP_ADD, 0x80), OP_ADD, 0x01, OP_LOAD, 0x81, OP_HALT], 43),
+            (std::vec![OP_PUSH_1, quick_of(OP_BIN_V, OP_ADD, 0x80), OP_SUB, 0x01, OP_HALT], 43),
+            (std::vec![OP_PUSH_1, quick_of(OP_BIN_V, OP_SUB, 0x00), OP_ADD, 0x81, OP_HALT], -6),
         ];
         for (code, want) in cases {
             for threaded in [false, true] {

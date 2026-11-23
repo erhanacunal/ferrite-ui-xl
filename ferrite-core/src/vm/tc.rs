@@ -19,8 +19,8 @@
 //! switch may change it) pick one.
 //!
 //! Quickening: an instruction with a quickened form (`QUICK`: a
-//! superinstruction by its cond / op, LOAD / STORE / ADD_VI by their slot's
-//! kind) rewrites its opcode to that form the first time it runs here
+//! superinstruction by its cond / op and slot kind, LOAD / STORE / ADD_VI /
+//! ARR_LOAD_V by their slot's kind) rewrites its opcode to that form the first time it runs here
 //! (`quicken!`); the form's handler has the operation / slot kind built in,
 //! with no dispatch on the operand (`q_*`). `exec_one` runs both the same.
 //!
@@ -638,7 +638,7 @@ fn op_bin_i32<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 fn op_bin_v<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    quicken!(vm, pc, sp, n, quick_of(OP_BIN_V, unsafe { *pc }, 0));
+    quicken!(vm, pc, sp, n, unsafe { quick_of(OP_BIN_V, *pc, *pc.add(1)) });
     let [op, raw] = unsafe { bytes(pc) };
     let b = vm.var_get(vm.resolve_slot(raw));
     top_binop!(vm, pc, sp, n, op, b, unsafe { pc.add(2) })
@@ -735,8 +735,19 @@ fn q_bin_i<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32,
     }
 }
 
-fn q_bin_v<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    let b = vm.var_get(vm.resolve_slot(unsafe { *pc.add(1) }));
+/// BIN_V on a local / global slot.
+fn q_bin_v_l<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    let b = vm.var_get(local(vm, unsafe { *pc.add(1) }));
+    need!(vm, pc, sp, n, 1);
+    unsafe {
+        let top = sp.sub(1);
+        *top = binop::<C>(*top, b);
+        next!(vm, pc.add(2), sp, n)
+    }
+}
+
+fn q_bin_v_g<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    let b = vm.var_get(global(vm, unsafe { *pc.add(1) }));
     need!(vm, pc, sp, n, 1);
     unsafe {
         let top = sp.sub(1);
@@ -789,6 +800,54 @@ fn q_add_vi_l<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i
     let slot = local(vm, raw);
     vm.var_set(slot, vm.var_get(slot).wrapping_add(i16::from_le_bytes([lo, hi]) as i32));
     next!(vm, unsafe { pc.add(3) }, sp, n)
+}
+
+/// `*$res` = element `$idx` of the array `$id`, the stack ending past it
+/// (ARR_LOAD, ARR_LOAD_V); a fault (BAD_ARRAY / ARRAY_INDEX) with the
+/// operands popped (the stack ending at `$res`), as `exec_one`.
+macro_rules! arr_load {
+    ($vm:ident, $pc:ident, $res:ident, $n:ident, $id:expr, $idx:expr, $after:expr) => {{
+        let (id, idx): (i32, i32) = ($id, $idx);
+        // SAFETY: as in `op_syscall`.
+        let objs = unsafe { &*$vm.tc_objs };
+        let Some(arr) = (if id < 0 { None } else { objs.arr(id as ObjPtr) }) else {
+            fail!($vm, $pc, $res, $n, fault::BAD_ARRAY)
+        };
+        let Some(&v) = arr.get(idx as usize) else {
+            fail!($vm, $pc, $res, $n, fault::ARRAY_INDEX)
+        };
+        unsafe {
+            *$res = v;
+            next!($vm, $after, $res.add(1), $n)
+        }
+    }};
+}
+
+fn op_arr_load<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    need!(vm, pc, sp, n, 2);
+    let res = unsafe { sp.sub(2) };
+    arr_load!(vm, pc, res, n, unsafe { *res }, unsafe { *sp.sub(1) }, pc)
+}
+
+/// ARR_LOAD_V: always quickened (by the slot's kind).
+fn op_arr_load_v<const W: bool>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    let q = if unsafe { *pc } & 0x80 != 0 { Q_ARR_LOAD_V_L } else { Q_ARR_LOAD_V_G };
+    // SAFETY: as in `quicken!`.
+    unsafe { vm.code.quicken(pc.sub(1), q) };
+    become tab::<W>()[q as usize](vm, pc, sp, n)
+}
+
+/// ARR_LOAD_V of an array in a local / global slot.
+fn q_arr_load_v_l<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    need!(vm, pc, sp, n, 1);
+    let res = unsafe { sp.sub(1) };
+    arr_load!(vm, pc, res, n, vm.var_get(local(vm, unsafe { *pc })), unsafe { *res }, unsafe { pc.add(1) })
+}
+
+fn q_arr_load_v_g<const W: bool, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    need!(vm, pc, sp, n, 1);
+    let res = unsafe { sp.sub(1) };
+    arr_load!(vm, pc, res, n, vm.var_get(global(vm, unsafe { *pc })), unsafe { *res }, unsafe { pc.add(1) })
 }
 
 // --- The tables ---
@@ -859,6 +918,8 @@ const fn table<const W: bool>() -> [Handler; 256] {
     t[OP_FRAME_A as usize] = op_frame_a::<W>;
     t[OP_RET as usize] = op_ret::<W>;
     t[OP_SYSCALL as usize] = op_syscall::<W>;
+    t[OP_ARR_LOAD as usize] = op_arr_load::<W>;
+    t[OP_ARR_LOAD_V as usize] = op_arr_load_v::<W>;
 
     // The quickened forms, in `QUICK`'s order (checked here, at compile
     // time).
@@ -882,11 +943,13 @@ const fn table<const W: bool>() -> [Handler; 256] {
         q_bin_i OP_BIN_I OP_ADD SLOT_ANY, q_bin_i OP_BIN_I OP_SUB SLOT_ANY, q_bin_i OP_BIN_I OP_MUL SLOT_ANY,
         q_bin_i OP_BIN_I OP_DIV SLOT_ANY, q_bin_i OP_BIN_I OP_MOD SLOT_ANY, q_bin_i OP_BIN_I OP_AND SLOT_ANY,
         q_bin_i OP_BIN_I OP_OR SLOT_ANY, q_bin_i OP_BIN_I OP_SHL SLOT_ANY, q_bin_i OP_BIN_I OP_SHR SLOT_ANY,
-        q_bin_v OP_BIN_V OP_ADD SLOT_ANY, q_bin_v OP_BIN_V OP_SUB SLOT_ANY,
+        q_bin_v_l OP_BIN_V OP_ADD SLOT_L, q_bin_v_g OP_BIN_V OP_ADD SLOT_G,
+        q_bin_v_l OP_BIN_V OP_SUB SLOT_L, q_bin_v_g OP_BIN_V OP_SUB SLOT_G,
         q_store_op OP_STORE_OP OP_ADD SLOT_L,
         q_load_l OP_LOAD 0 SLOT_L, q_load_g OP_LOAD 0 SLOT_G,
         q_store_l OP_STORE 0 SLOT_L, q_store_g OP_STORE 0 SLOT_G,
         q_add_vi_l OP_ADD_VI 0 SLOT_L,
+        q_arr_load_v_l OP_ARR_LOAD_V 0 SLOT_L, q_arr_load_v_g OP_ARR_LOAD_V 0 SLOT_G,
     );
     assert!(i == QUICK.len(), "tc::table and QUICK differ");
     t

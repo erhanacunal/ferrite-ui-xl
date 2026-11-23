@@ -3276,6 +3276,35 @@ mod call_tests {
 }
 
 #[cfg(all(test, feature = "mock"))]
+mod cond_tests {
+    //! Conditions with && / || / !: `testdata/conds/conds.fl`, compiled by
+    //! `testdata/conds/gen.py` without superops (`&&` / `||` as values, then
+    //! a test) and with them (as branches); the same results.
+    use super::*;
+    use crate::pool::ObjPtr;
+
+    fn run(code: &[u8]) -> alloc::vec::Vec<i32> {
+        let mut rt = super::multi_tests::boot(&[(b"main", code.to_vec())]);
+        for _ in 0..3 {
+            rt.step();
+        }
+        assert_eq!(rt.error_code, 0);
+        assert!(rt.tasks.main.fault() == 0, "VM fault {}", rt.tasks.main.fault());
+        let r = rt.ctx.objs.arr(rt.tasks.main.var(0) as ObjPtr).expect("r[]").to_vec();
+        assert_eq!(r[4], 216, "every case ran");
+        r[..5].to_vec()
+    }
+
+    #[test]
+    fn branches_match_values() {
+        let plain = run(include_bytes!("../testdata/conds/conds.prg"));
+        let sup = run(include_bytes!("../testdata/conds/conds_super.prg"));
+        assert_eq!(plain, sup);
+        assert!(plain[..4].iter().all(|&h| h != 0), "{plain:?}");
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
 mod lib_tests {
     //! Libraries (docs/apps.md "Step 3"): `testdata/libs`, built by
     //! `testdata/libs/gen.py`. app.prg calls library com.test.util 1.x.

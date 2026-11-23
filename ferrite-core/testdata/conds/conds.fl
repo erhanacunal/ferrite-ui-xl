@@ -1,0 +1,107 @@
+// Conditions with && / || / ! (runtime::cond_tests): compiled with and
+// without superops (with them `&&` / `||` / `!` become branches, see
+// ferrite_lang `_gen_cond_jump`), both must give the same `r`, the first
+// global. Every shape runs over a grid of values, in if / if-else / while /
+// for / ternary; `t` records the order of the side effects it sees (short
+// circuit) in `trace`.
+
+var r[16];
+var trace = 0;
+var ga = 0;
+var gb = 0;
+
+fn t(k, v) {
+    trace = (trace * 7 + k) & 0xFFFFFF;
+    return v;
+}
+
+fn mix(h, x) {
+    return (h * 31 + x) & 0xFFFFFF;
+}
+
+fn shapes(a, b, c) {
+    var h = 0;
+    if (a && b) { h = mix(h, 1); }
+    if (a || b) { h = mix(h, 2); }
+    if (!a) { h = mix(h, 3); }
+    if (!(a && b)) { h = mix(h, 4); }
+    if (!(a || b) && c) { h = mix(h, 5); }
+    if (a > 0 && b < 2) { h = mix(h, 6); }
+    if (a == 1 || b == c) { h = mix(h, 7); }
+    if (a > 0 && b > 0 && c > 0) { h = mix(h, 8); }
+    if (a > 0 || b > 0 || c > 0) { h = mix(h, 9); }
+    if ((a > 0 && b > 0) || c == 5) { h = mix(h, 10); }
+    if (a < 0 || (b >= 1 && !(c != 2))) { h = mix(h, 11); }
+    if (!(!a)) { h = mix(h, 12); }
+    if (a + b > c && a - b < c) { h = mix(h, 13); }
+    if (a & b || c) { h = mix(h, 14); }
+    if (a && b) { h = mix(h, 15); } else { h = mix(h, 16); }
+    if (a || !c) { h = mix(h, 17); } else if (b && c) { h = mix(h, 18); } else { h = mix(h, 19); }
+    h = mix(h, a && b ? 20 : 21);
+    h = mix(h, (a > 1 || b > 1) ? 22 : 23);
+    h = mix(h, !(a < b) ? 24 : 25);
+    // As values: 0 or the deciding side's value (not used as conditions).
+    h = mix(h, a && b);
+    h = mix(h, a || b);
+    h = mix(h, !b);
+    return h;
+}
+
+fn effects(a, b, c) {
+    var h = 0;
+    trace = 0;
+    if (t(1, a) && t(2, b)) { h = mix(h, 1); }
+    if (t(3, a) || t(4, b)) { h = mix(h, 2); }
+    if (!t(5, a) && (t(6, b) || t(7, c))) { h = mix(h, 3); }
+    if ((t(1, a) > 0 || t(2, b) > 1) && t(3, c) != 2) { h = mix(h, 4); }
+    h = mix(h, t(4, b) && t(5, c) ? 5 : 6);
+    return mix(h, trace);
+}
+
+fn loops(a, b, c) {
+    var h = 0;
+    var i = 0;
+    while (i < 6 && (a || i < 3)) { h = mix(h, i); i += 1; }
+    i = 0;
+    while (!(i >= 4) || (b > 0 && i < 7)) { h = mix(h, 40 + i); i += 1; }
+    for (var j = 0; j < 8 && !(j == c && j > 0); j++) { h = mix(h, 80 + j); }
+    for (var k = 5; k > 0 && (k != a || k > 3); k -= 1) { h = mix(h, 120 + k); }
+    return h;
+}
+
+fn globals(a, b, c) {
+    ga = a;
+    gb = b;
+    var h = 0;
+    if (ga && gb || c == 2) { h = mix(h, 1); }
+    if (!ga || gb > 1) { h = mix(h, 2); }
+    if (ga < gb && gb < c) { h = mix(h, 3); }
+    return h;
+}
+
+fn setup() {
+    var vals[6] = [-1, 0, 1, 2, 5, 3];
+    var i = 0;
+    while (i < 6) {
+        var j = 0;
+        while (j < 6) {
+            var k = 0;
+            while (k < 6) {
+                var a = vals[i];
+                var b = vals[j];
+                var c = vals[k];
+                r[0] = mix(r[0], shapes(a, b, c));
+                r[1] = mix(r[1], effects(a, b, c));
+                r[2] = mix(r[2], loops(a, b, c));
+                r[3] = mix(r[3], globals(a, b, c));
+                r[4] += 1;
+                k += 1;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+fn loop() {
+}

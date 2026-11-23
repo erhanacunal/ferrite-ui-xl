@@ -62,6 +62,8 @@ macro_rules! canvas {
 pub mod prof;
 /// Threaded dispatch of `tick`'s bursts (vm/tc.rs).
 mod ops;
+#[cfg(test)]
+mod oracle;
 mod tc;
 /// Code units: a program's libraries (vm/units.rs).
 mod units;
@@ -3994,12 +3996,13 @@ mod anim_tests {
         vm
     }
 
-    /// `tick`'s burst without `tc::run`'s budget: one `step` at a time, the
-    /// budget counted here (a critical section runs past it).
-    fn burst_steps<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, mut budget: u32) -> u64 {
+    /// `tick`'s burst on the reference interpreter (`oracle.rs`): one
+    /// instruction at a time, the budget counted here (a critical section
+    /// runs past it).
+    fn burst_ref<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, mut budget: u32) -> u64 {
         let mut n: u64 = 0;
         loop {
-            vm.step(ctx);
+            vm.step_ref(ctx);
             n += 1;
             if vm.state != VmState::Running {
                 break;
@@ -4015,14 +4018,15 @@ mod anim_tests {
         n
     }
 
-    /// A burst (`tc::run`) against single steps on random programs: the
+    /// A burst (`tc::run`) against the reference interpreter (`oracle.rs`,
+    /// the old `exec_one`) on random programs: the
     /// hot opcodes with random operands, out-of-line ones (calls, returns,
     /// syscalls, yields, halts), jumps in and out of the code, cut-off
     /// instructions, each run with a few budgets. Same state, stack,
     /// variables, pc and instruction count; on a fault the same fault and
     /// fault pc (CODE_OOB not compared, see `tc`'s docs).
     #[test]
-    fn bursts_match_single_steps() {
+    fn threaded_dispatch_matches_reference() {
         const OPS: &[(u8, usize)] = &[
             (OP_POP, 0), (OP_DUP, 0), (OP_SWAP, 0), (OP_ADD, 0), (OP_SUB, 0), (OP_MUL, 0),
             (OP_DIV, 0), (OP_MOD, 0), (OP_NEG, 0), (OP_AND, 0), (OP_OR, 0), (OP_NOT, 0),
@@ -4136,7 +4140,7 @@ mod anim_tests {
                     if a.state != VmState::Running {
                         break;
                     }
-                    let na = burst_steps(&mut a, &mut ca, budget);
+                    let na = burst_ref(&mut a, &mut ca, budget);
                     let nb = tc::run(&mut b, &mut cb, budget, 0, false) as u64;
                     let what = alloc::format!("program {prog} budget {budget}: {code:02x?}");
                     if a.state == VmState::Error && a.fault == fault::CODE_OOB {
@@ -4177,7 +4181,7 @@ mod anim_tests {
             a.state = VmState::Running;
             b.state = VmState::Running;
             loop {
-                let na = burst_steps(&mut a, &mut ca, budget);
+                let na = burst_ref(&mut a, &mut ca, budget);
                 let nb = tc::run(&mut b, &mut cb, budget, 0, false) as u64;
                 assert_eq!((na, a.pc, a.var_get(0)), (nb, b.pc, b.var_get(0)), "budget {budget}");
                 assert!(a.state == b.state);
@@ -5127,6 +5131,13 @@ mod anim_tests {
             }
             vm
         }
+        fn reference(code: &[u8]) -> Vm {
+            let (mut vm, mut ctx) = arr_vm(code);
+            while vm.state == VmState::Running {
+                vm.step_ref(&mut ctx);
+            }
+            vm
+        }
         fn top(vm: &Vm) -> i32 {
             assert!(vm.state == VmState::Halted);
             vm.stack[vm.sp as usize - 1]
@@ -5147,7 +5158,8 @@ mod anim_tests {
                     if let Some(k) = slot_at.filter(|_| kind != SLOT_ANY) {
                         quick[k] ^= 0x80;
                     }
-                    let want = top(&stepped(&plain));
+                    let want = top(&reference(&plain));
+                    assert_eq!(top(&reference(&quick)), want, "reference, {what}");
                     assert_eq!(top(&stepped(&quick)), want, "stepped, {what}");
                     assert_eq!(top(&threaded(&quick)), want, "threaded, {what}");
                     let vm = threaded(&plain);
@@ -5186,7 +5198,7 @@ mod anim_tests {
             (std::vec![OP_PUSH_1, quick_of(OP_BIN_V, OP_SUB, 0x00), OP_ADD, 0x81, OP_HALT], -6),
         ];
         for (code, want) in cases {
-            for threaded in [false, true] {
+            for mode in ["reference", "stepped", "threaded"] {
                 let mut ctx = mock_ctx();
                 let mut vm = Vm::new();
                 vm.code = VmCode::new(code.clone());
@@ -5195,14 +5207,14 @@ mod anim_tests {
                 vm.var_set(1, 7);
                 vm.state = VmState::Running;
                 while vm.state == VmState::Running {
-                    if threaded {
-                        vm.tick(&mut ctx, 1000);
-                    } else {
-                        vm.step(&mut ctx);
+                    match mode {
+                        "reference" => vm.step_ref(&mut ctx),
+                        "stepped" => vm.step(&mut ctx),
+                        _ => vm.tick(&mut ctx, 1000),
                     }
                 }
                 assert!(vm.state == VmState::Halted, "{code:x?}");
-                assert_eq!(vm.stack[vm.sp as usize - 1], want, "{code:x?} threaded {threaded}");
+                assert_eq!(vm.stack[vm.sp as usize - 1], want, "{code:x?} {mode}");
             }
         }
     }

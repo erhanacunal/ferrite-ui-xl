@@ -523,7 +523,6 @@ impl ObjPool {
         let p = self.alloc_obj(T_WIDGET, HDR_WORDS)?;
         *cast_mut::<Widget>(self.payload_mut(p, T_WIDGET)?) = Widget::NEW;
         self.dfs_valid = false;
-        self.render.shape_changed = true;
         // A new widget: no record of an old one at this pointer.
         if let Some(r) = self.render.recs.get_mut(p as usize) {
             *r = RenderRec::EMPTY;
@@ -542,13 +541,6 @@ impl ObjPool {
     /// Widget header. An id that names no live widget reads as a destroyed,
     /// invisible placeholder.
     pub fn get(&self, id: WidgetId) -> &Widget {
-        if self.is_view {
-            return self
-                .render
-                .scene
-                .widget(id)
-                .map_or(&DEAD_WIDGET, |entry| &entry.widget);
-        }
         match self.payload(id.0, T_WIDGET) {
             Some(w) => cast(w),
             None => &DEAD_WIDGET,
@@ -558,13 +550,6 @@ impl ObjPool {
     /// Mutable widget header. Writes through an id that names no live widget
     /// go to a scratch placeholder and are lost.
     pub fn get_mut(&mut self, id: WidgetId) -> &mut Widget {
-        if self.is_view {
-            if let Some(entry) = self.render.scene.widget_mut(id) {
-                return &mut entry.widget;
-            }
-            self.dead = Widget::DEAD;
-            return &mut self.dead;
-        }
         if self.block(id.0, T_WIDGET).is_some() {
             return cast_mut(self.payload_mut(id.0, T_WIDGET).unwrap());
         }
@@ -580,9 +565,6 @@ impl ObjPool {
 
     /// Live widgets.
     pub fn widget_count(&self) -> usize {
-        if self.is_view {
-            return self.render.scene.len();
-        }
         self.live_objects(T_WIDGET)
     }
 
@@ -670,13 +652,6 @@ impl ObjPool {
 
     /// All optional fields of `id` (defaults for missing sections or ids).
     pub fn ext(&self, id: WidgetId) -> WidgetExt {
-        if self.is_view {
-            return self
-                .render
-                .scene
-                .widget(id)
-                .map_or(WidgetExt::DEFAULT, |entry| entry.ext);
-        }
         let mut e = WidgetExt::DEFAULT;
         if self.block(id.0, T_WIDGET).is_none() {
             return e;
@@ -702,18 +677,6 @@ impl ObjPool {
     /// of space (fields that fit are still written).
     #[inline(never)]
     pub fn put_ext(&mut self, id: WidgetId, e: &WidgetExt) -> bool {
-        if self.is_view {
-            let Some(entry) = self.render.scene.widget_mut(id) else {
-                return false;
-            };
-            entry.widget.value = if entry.widget.kind == KIND_GRAPH { 0 } else { e.value };
-            entry.ext = *e;
-            entry.ext.text_id = PTR_NONE;
-            if entry.widget.kind == KIND_GRAPH {
-                entry.ext.value = 0;
-            }
-            return true;
-        }
         if self.block(id.0, T_WIDGET).is_none() {
             return false;
         }
@@ -736,38 +699,31 @@ impl ObjPool {
     // --- Convenience accessors (defaults when the section is missing) ---
 
     pub fn border(&self, id: WidgetId) -> Edges {
-        if self.is_view { return self.ext(id).border; }
         self.sec::<SecBox>(id).map_or(Edges::ZERO, |s| s.border)
     }
 
     pub fn padding(&self, id: WidgetId) -> Edges {
-        if self.is_view { return self.ext(id).padding; }
         self.sec::<SecBox>(id).map_or(Edges::ZERO, |s| s.padding)
     }
 
     pub fn text_color(&self, id: WidgetId) -> Color {
-        if self.is_view { return self.ext(id).text_color; }
         self.sec::<SecText>(id).map_or(0xFFFF, |s| s.text_color)
     }
 
     pub fn font_id(&self, id: WidgetId) -> u8 {
-        if self.is_view { return self.ext(id).font_id; }
         self.sec::<SecText>(id).map_or(0, |s| s.font_id)
     }
 
     pub fn text_align(&self, id: WidgetId) -> u8 {
-        if self.is_view { return self.ext(id).text_align; }
         self.sec::<SecText>(id).map_or(ALIGN_LEFT, |s| s.text_align)
     }
 
     pub fn text_id(&self, id: WidgetId) -> ObjPtr {
-        if self.is_view { return PTR_NONE; }
         self.sec::<SecText>(id).map_or(PTR_NONE, |s| s.text_id)
     }
 
     /// Set the widget's text string (no-op when `id` is no widget).
     pub fn set_text_id(&mut self, id: WidgetId, text: ObjPtr) -> bool {
-        if self.is_view { return false; }
         match self.sec_mut::<SecText>(id) {
             Some(s) => {
                 s.text_id = text;
@@ -778,22 +734,18 @@ impl ObjPool {
     }
 
     pub fn border_radius(&self, id: WidgetId) -> u16 {
-        if self.is_view { return self.ext(id).border_radius; }
         self.sec::<SecStyle>(id).map_or(0, |s| s.border_radius)
     }
 
     pub fn press_color(&self, id: WidgetId) -> Color {
-        if self.is_view { return self.ext(id).press_color; }
         self.sec::<SecStyle>(id).map_or(0, |s| s.press_color)
     }
 
     pub fn image_id(&self, id: WidgetId) -> u8 {
-        if self.is_view { return self.ext(id).image_id; }
         self.sec::<SecExtra>(id).map_or(0, |s| s.image_id)
     }
 
     pub fn max_length(&self, id: WidgetId) -> u8 {
-        if self.is_view { return self.ext(id).max_length; }
         self.sec::<SecText>(id).map_or(0, |s| s.max_length)
     }
 
@@ -802,23 +754,19 @@ impl ObjPool {
     }
 
     pub fn gradient_color(&self, id: WidgetId) -> Color {
-        if self.is_view { return self.ext(id).gradient_color; }
         self.sec::<SecStyle>(id).map_or(0, |s| s.gradient_color)
     }
 
     pub fn gradient_dir(&self, id: WidgetId) -> u8 {
-        if self.is_view { return self.ext(id).gradient_dir; }
         self.sec::<SecStyle>(id).map_or(0, |s| s.gradient_dir)
     }
 
     pub fn alpha(&self, id: WidgetId) -> u8 {
-        if self.is_view { return self.ext(id).alpha; }
         self.sec::<SecStyle>(id).map_or(255, |s| s.alpha)
     }
 
     /// Selection group of a KIND_BUTTON_GROUP / KIND_RADIO widget.
     pub fn group_id(&self, id: WidgetId) -> u8 {
-        if self.is_view { return self.ext(id).group_id; }
         self.sec::<SecExtra>(id).map_or(0, |s| s.group_id)
     }
 
@@ -944,7 +892,6 @@ impl ObjPool {
     /// Something drew over the screen outside the widget renderer: no
     /// incrementally drawn widget may trust its pixels any more.
     pub fn screen_touched(&mut self) {
-        self.send(crate::view::RenderMsg::Touched);
         self.render.draw_epoch = self.render.draw_epoch.wrapping_add(1);
     }
 
@@ -1037,7 +984,6 @@ impl ObjPool {
         }
         self.get_mut(child).next_sibling = WidgetId::NONE;
         self.dfs_valid = false;
-        self.render.shape_changed = true;
         true
     }
 
@@ -1063,7 +1009,6 @@ impl ObjPool {
             self.get_mut(last).next_sibling = child;
         }
         self.dfs_valid = false;
-        self.render.shape_changed = true;
         self.flex_mark(parent);
     }
 
@@ -1235,9 +1180,6 @@ impl ObjPool {
 
     /// Does `id` name a live widget?
     pub fn is_live(&self, id: WidgetId) -> bool {
-        if self.is_view {
-            return self.render.scene.widget(id).is_some();
-        }
         self.block(id.0, T_WIDGET).is_some()
     }
 
@@ -1275,7 +1217,6 @@ impl ObjPool {
             self.free_obj(id.0, T_WIDGET);
         }
         self.dfs_valid = false;
-        self.render.shape_changed = true;
     }
 
     /// Check `id` (a KIND_BUTTON_GROUP or KIND_RADIO widget) and uncheck every
@@ -1390,11 +1331,6 @@ impl ObjPool {
         }
 
         self.dfs_cache.clear();
-        if self.is_view {
-            self.dfs_cache.extend(self.render.scene.ids());
-            self.dfs_valid = true;
-            return;
-        }
         let max = self.count();
 
         if self.root.is_none() {

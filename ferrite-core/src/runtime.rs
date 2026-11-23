@@ -3121,7 +3121,6 @@ mod mem_detail_tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
-            view: ObjPool::view(),
             render_ctx: None,
             render_away: false,
             fs: None,

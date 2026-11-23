@@ -61,16 +61,6 @@ fn main() {
         ferrite_core::snapshot::STALE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
-    // `FERRITE_SIM_SCENE_VERIFY=1`: every incremental update of the render pool's scene is
-    // compared with a full capture (`scene.rs`), panicking on a difference;
-    // `FERRITE_SIM_SCENE_FULL=1`: a full capture every sync, as before.
-    if std::env::var_os("FERRITE_SIM_SCENE_VERIFY").is_some() {
-        ferrite_core::scene::VERIFY.store(true, core::sync::atomic::Ordering::Relaxed);
-    }
-    if std::env::var_os("FERRITE_SIM_SCENE_FULL").is_some() {
-        ferrite_core::scene::INCREMENTAL.store(false, core::sync::atomic::Ordering::Relaxed);
-    }
-
     systick::init();
     if let Some(d) = &dump {
         systick::sim::set_virtual();
@@ -104,6 +94,9 @@ fn main() {
     let mut touch = touch::new(mouse.clone());
     touch.cal = identity_cal();
 
+    // A dump run (golden, vmprof) is not watched: its window is hidden and the
+    // focus given back, so test runs don't pull the sim in front of other work.
+    let foreground = if dump.is_some() { background::foreground() } else { core::ptr::null_mut() };
     let window = match Window::new(
         "ferrite-ui sim",
         WIDTH as usize,
@@ -113,6 +106,9 @@ fn main() {
         Ok(mut w) => {
             // A dump run is not paced (virtual clock).
             w.set_target_fps(if dump.is_some() { 0 } else { 60 });
+            if dump.is_some() {
+                background::hide(w.get_window_handle(), foreground);
+            }
             w
         }
         Err(e) => {
@@ -132,8 +128,7 @@ fn main() {
             flash: flash.clone(),
             fonts: FontList::new(),
             images: ImageList::new(),
-            objs: ferrite_core::pool::ObjPool::view(),
-            view: ferrite_core::pool::ObjPool::view(),
+            objs: ferrite_core::pool::ObjPool::without_storage(),
             render_ctx: None,
             render_away: false,
             fs: None,
@@ -157,7 +152,6 @@ fn main() {
         fonts: FontList::new(),
         images: ImageList::new(),
         objs: ObjPool::new(),
-        view: ferrite_core::pool::ObjPool::view(),
         render_ctx,
         render_away: false,
         fs: None,
@@ -346,5 +340,44 @@ fn identity_cal() -> CalParams {
         x_max: WIDTH - 1,
         y_min: 0,
         y_max: HEIGHT - 1,
+    }
+}
+
+/// Keeping an unwatched sim window out of the way (Windows: minifb shows and
+/// activates its window on creation).
+mod background {
+    use core::ffi::c_void;
+
+    #[cfg(windows)]
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetForegroundWindow() -> *mut c_void;
+        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+        fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
+    }
+
+    /// The window that has the focus now (before the sim's opens).
+    pub fn foreground() -> *mut c_void {
+        #[cfg(windows)]
+        // SAFETY: no arguments; returns null when no window has the focus.
+        return unsafe { GetForegroundWindow() };
+        #[cfg(not(windows))]
+        core::ptr::null_mut()
+    }
+
+    /// Hides the sim's window `hwnd` and gives the focus back to `prev`.
+    pub fn hide(hwnd: *mut c_void, prev: *mut c_void) {
+        #[cfg(windows)]
+        // SAFETY: `hwnd` is the live window minifb just created; `prev` is a
+        // window handle or null (both calls fail harmlessly on a stale one).
+        unsafe {
+            const SW_HIDE: i32 = 0;
+            ShowWindow(hwnd, SW_HIDE);
+            if !prev.is_null() {
+                SetForegroundWindow(prev);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (hwnd, prev);
     }
 }

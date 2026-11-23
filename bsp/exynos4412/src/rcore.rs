@@ -212,9 +212,10 @@ pub struct Stats {
     pub jobs: u32,
     pub busy_us: u32,
     pub max_us: u32,
-    /// Inside the jobs (`render::run_job`, on whichever core): taking in the
-    /// commit the VM core packed (`view::Commit`), the VM's lists before the
-    /// render, the render, the `on_paint` lists after it.
+    /// Inside the jobs (`render::run_job`, on whichever core): closing the
+    /// VM's direct-drawing recording (a commit was applied here until
+    /// 2026-11-23), the VM's lists before the render, the render (or the
+    /// frame's play), the `on_paint` lists after it (0 since 2026-11-18).
     pub apply_us: u32,
     pub lists_us: u32,
     pub render_us: u32,

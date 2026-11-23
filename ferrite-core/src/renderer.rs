@@ -186,7 +186,6 @@ mod tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
-            view: ObjPool::view(),
             render_ctx: None,
             render_away: false,
             fs: None,
@@ -255,7 +254,6 @@ mod tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
-            view: ObjPool::view(),
             render_ctx: None,
             render_away: false,
             fs: None,
@@ -422,7 +420,6 @@ mod tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs,
-            view: ObjPool::view(),
             render_ctx: None,
             render_away: false,
             fs: None,
@@ -461,7 +458,7 @@ mod tests {
         use crate::view::Draw;
         use crate::widget::FLAG_HAS_ON_PAINT;
         let mut ctx = paint_ctx(ObjPool::new());
-        ctx.render_ctx = Some(alloc::boxed::Box::new(paint_ctx(ObjPool::view())));
+        ctx.render_ctx = Some(alloc::boxed::Box::new(paint_ctx(ObjPool::without_storage())));
         let root = ctx.objs.alloc_widget().unwrap();
         ctx.objs.root = root;
         ctx.objs.get_mut(root).size = Size { w: 800, h: 480 };

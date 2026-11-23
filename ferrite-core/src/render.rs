@@ -246,11 +246,11 @@ pub enum RenderJob {
     All,
 }
 
-/// Runs `job` on the render context `r` (already synced): the render side's
-/// whole work, on whichever core holds `r`. The VM's drawing handed over
-/// with the sync (`view::Draw`): direct drawing is replayed before the
-/// render, `on_paint` lists are kept and drawn with their widgets by it
-/// (`draw_paint`).
+/// Runs `job` on `r`: `Play` plays the frame `r` was handed (`submit`, on
+/// whichever core holds the render context); `Dirty` / `All` render the tree
+/// of `r` (the VM's context, `with_view`). The VM's recorded drawing
+/// (`view::Draw`): direct drawing is replayed before the render, `on_paint`
+/// lists are kept and drawn with their widgets by it (`draw_paint`).
 pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
     let ta = crate::perf::now();
     if job == RenderJob::Play {
@@ -288,7 +288,8 @@ pub fn run_job<P: Platform>(r: &mut Ctx<P>, job: RenderJob) {
 /// boot, whichever core ran them): the VM's recorded drawing replayed or kept
 /// before the render (screen lists, `on_paint` lists), the render itself
 /// (with the `on_paint` lists, drawn with their widgets); and before all of
-/// them, taking in the commit the VM side posted (`view::Commit`).
+/// them, closing the VM's open direct-drawing recording (`JOB_APPLY`: the
+/// render pool's commit was applied there until 2026-11-23).
 /// `JOB_PAINTS` (the `on_paint` lists replayed after the render until
 /// 2026-11-18) stays 0, kept for `/api/status`'s layout.
 pub static JOB_TICKS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
@@ -394,14 +395,14 @@ fn submit<P: Platform>(ctx: &mut Ctx<P>, job: RenderJob) {
     match P::render_start(r, RenderJob::Play) {
         Ok(()) => {
             crate::perf::add_sub(
-                crate::perf::phase::SCENE_HANDOFF,
+                crate::perf::phase::FRAME_HANDOFF,
                 crate::perf::now().wrapping_sub(t0),
             );
             ctx.render_away = true;
         }
         Err(mut r) => {
             crate::perf::add_sub(
-                crate::perf::phase::SCENE_HANDOFF,
+                crate::perf::phase::FRAME_HANDOFF,
                 crate::perf::now().wrapping_sub(t0),
             );
             run_job(&mut r, RenderJob::Play);
@@ -2127,10 +2128,8 @@ fn draw_widget_body<P: Platform, C: Canvas>(
     abs: &Rect,
     clip: &ClipRegion,
 ) {
-    let scene_widget = ctx.objs.render_scene().widget(id);
-    let widget_value = scene_widget.map(|w| w.widget).unwrap_or(*ctx.objs.get(id));
-    let widget = &widget_value;
-    let ext_value = scene_widget.map(|w| w.ext).unwrap_or_else(|| ctx.objs.ext(id));
+    let widget = ctx.objs.get(id);
+    let ext_value = ctx.objs.ext(id);
     let ext = &ext_value;
     let b = ext.border;
     let r = ext.border_radius;
@@ -4593,7 +4592,6 @@ mod shift_tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
-            view: ObjPool::view(),
             render_ctx: None,
             render_away: false,
             fs: None,

@@ -30,7 +30,7 @@
 //! | `POST /api/storage/stress?on=0\|1` | power-loss test load on USERDATA (`storage::stress`), off again after a restart; `?cut=1`: in 1 s `cut.bin` is committed to the journal only and the board resets, so the next mount must replay it |
 //! | `GET /api/storage/check` | `Ext4::check` of USERDATA plus the stress files' contents; 409 when something is wrong |
 //! | `GET /api/dl[?id=N]` | display-list dump: one line per widget (key, cached list, `on_paint` list), or widget N's lists op by op (`render::dl_dump`, by CPU0 between passes) |
-//! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; `?scene=0\|1` syncs update the render pool's scene / capture it whole (`/api/status` `scene`); counters and the jobs' time breakdown in `/api/status` `rcore` |
+//! | `POST /api/rcore?on=0\|1` | render jobs on CPU2 (`rcore.rs`) or CPU0, for A/B measurements; `?fence=0\|1` GPU frames wait for their own rows of a present copy / the whole copy; counters and the jobs' time breakdown in `/api/status` `rcore` |
 //! | `POST /api/dl?on=0\|1` | widget drawing through cached display lists (`ferrite_core::dl::ENABLED`; counters in `/api/status` `dl`), for A/B measurements |
 //! | `POST /api/vmprof?on=0\|1&reset=1` | dynamic opcode profile (`ferrite_core::vm::prof`): counting on (the VM runs one instruction at a time meanwhile, much slower) / off, counters zeroed; `GET /api/vmprof` the counters as text (`scripts/vmprof.py` names and sorts them) |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
@@ -627,18 +627,14 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             // (`lcd::GPU_FENCE_ROWS`).
             let on = query_param(query, b"on");
             let fence = query_param(query, b"fence");
-            // `scene`: syncs update the render pool's scene, or capture it whole each time
-            // (`ferrite_core::scene::INCREMENTAL`).
-            let scene = query_param(query, b"scene");
             // `ops`: count the played frames' calls by opcode (`dl::OP_STATS`).
             let ops = query_param(query, b"ops");
             // `wake`: CPU2 wakes CPU0's UI task when a job ends (`rcore::WAKE`).
             let wake = query_param(query, b"wake");
             let bit = |v: Option<&[u8]>| matches!(v, None | Some(b"0" | b"1"));
-            if (on.is_some() || fence.is_some() || scene.is_some() || ops.is_some() || wake.is_some())
+            if (on.is_some() || fence.is_some() || ops.is_some() || wake.is_some())
                 && bit(on)
                 && bit(fence)
-                && bit(scene)
                 && bit(ops)
                 && bit(wake)
             {
@@ -648,9 +644,6 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 if let Some(v) = wake {
                     crate::rcore::WAKE.store(v == b"1", Ordering::Relaxed);
                 }
-                if let Some(v) = scene {
-                    ferrite_core::scene::INCREMENTAL.store(v == b"1", Ordering::Relaxed);
-                }
                 if let Some(v) = on {
                     crate::rcore::ENABLED.store(v == b"1", Ordering::Relaxed);
                 }
@@ -659,7 +652,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 text(socket, "200 OK", "render core set\n").await?;
             } else {
-                text(socket, "400 Bad Request", "on=0|1, fence=0|1, scene=0|1, ops=0|1 and/or wake=0|1\n").await?;
+                text(socket, "400 Bad Request", "on=0|1, fence=0|1, ops=0|1 and/or wake=0|1\n").await?;
             }
         }
         (b"POST", b"/api/dl") => {
@@ -967,8 +960,7 @@ fn phase_name(id: u8) -> &'static str {
         14 => "timer reads",
         15 => "G2D/GPU drawing",
         16 => "sprite drawing",
-        17 => "scene capture",
-        18 => "scene handoff",
+        18 => "frame handoff",
         0x81 => "draw_widget calls",
         0x82 => "pixel primitive calls",
         0x83 => "presents",
@@ -1340,19 +1332,6 @@ fn status_json() -> String {
                 crate::lcd::G2D_BANDS[0].load(core::sync::atomic::Ordering::Relaxed),
                 crate::lcd::G2D_BANDS[1].load(core::sync::atomic::Ordering::Relaxed),
                 crate::rcore::WAKE.load(core::sync::atomic::Ordering::Relaxed)
-            );
-        }
-        {
-            // The render pool's scene (`scene.rs`): syncs since boot.
-            use core::sync::atomic::Ordering::Relaxed;
-            use ferrite_core::scene;
-            let _ = write!(
-                s,
-                ",\"scene\":{{\"incremental\":{},\"full\":{},\"updates\":{},\"repacked\":{}}}",
-                scene::INCREMENTAL.load(Relaxed),
-                scene::FULLS.load(Relaxed),
-                scene::UPDATES.load(Relaxed),
-                scene::UPDATED.load(Relaxed)
             );
         }
         let _ = write!(

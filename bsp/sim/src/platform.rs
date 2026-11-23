@@ -481,14 +481,6 @@ fn print_snapshot_stats() {
             eprintln!("sim: dl ref misses {misses}");
         }
     }
-    use ferrite_core::scene;
-    eprintln!(
-        "sim: scene syncs: {} full, {} updates ({} widgets repacked){}",
-        scene::FULLS.load(Relaxed),
-        scene::UPDATES.load(Relaxed),
-        scene::UPDATED.load(Relaxed),
-        if scene::VERIFY.load(Relaxed) { " (verified)" } else { "" }
-    );
 }
 
 /// The dynamic opcode profile (`FERRITE_SIM_VMPROF=1`), between marker lines.

@@ -59,10 +59,11 @@ pub mod phase {
     /// Time drawing new sprites (exynos4412 renderer: a widget drawn into
     /// its sprite, plus the cache clean), inside `DRAW`.
     pub const SPRITE: u8 = 16;
-    /// CPU0 time packing the renderer-facing scene before handoff.
-    pub const SCENE_CAPTURE: u8 = 17;
-    /// CPU0 time syncing messages/resources and transferring scene ownership.
-    pub const SCENE_HANDOFF: u8 = 18;
+    // 17: CPU0 packing the render pool's scene (until 2026-11-23, when the
+    // render pool went: the id stays free, ids are shared with the tools).
+    /// CPU0 time recording a frame (`MODE_AREAS` with a render context) and
+    /// handing it to the render side, inside `RENDER`.
+    pub const FRAME_HANDOFF: u8 = 18;
     /// Number of slots (ids 1..COUNT).
     pub const COUNT: usize = 18;
 }
@@ -134,7 +135,7 @@ fn no_clock() -> u32 {
 }
 
 static CLOCK: Local<fn() -> u32> = Local(core::cell::UnsafeCell::new(no_clock));
-/// Number of sub-phases (`DRAW` ..= `SCENE_HANDOFF`).
+/// Number of sub-phases (`DRAW` ..= `FRAME_HANDOFF`).
 pub const SUBS: usize = 8;
 
 type Sub = ([u64; SUBS], [u32; count::COUNT]);

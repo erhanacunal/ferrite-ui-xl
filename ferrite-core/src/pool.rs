@@ -154,12 +154,12 @@ pub(crate) struct RenderState {
     /// drawing builtins go to `paint_rec` while `painting` is up.
     pub(crate) paint_rec: crate::dl::Recorder,
     pub(crate) painting: core::cell::Cell<bool>,
-    /// VM pool, with a render context (`render::records`): the VM's drawing
-    /// outside `on_paint` goes to `screen_rec` (`Vm::draw_op`), closed into
-    /// a `Draw::Screen` at the next `on_paint` recording or sync.
+    /// With a render context (`render::records`): the VM's drawing outside
+    /// `on_paint` goes to `screen_rec` (`Vm::draw_op`), closed into a
+    /// `Draw::Screen` at the next `on_paint` recording or render job.
     pub(crate) screen_rec: crate::dl::Recorder,
-    /// VM pool: drawing for the render side, in order (`view::Draw`), handed
-    /// over at the next sync; render pool: what the next job replays.
+    /// The VM's drawing for the render, in order (`view::Draw`): what the
+    /// next render job replays or keeps.
     pub(crate) draws: Vec<crate::view::Draw>,
     /// Each `on_paint` widget's last paint list, by widget id.
     pub(crate) paints: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, crate::dl::List>>,
@@ -168,33 +168,20 @@ pub(crate) struct RenderState {
     pub(crate) drawn_keys: core::cell::RefCell<alloc::collections::BTreeMap<WidgetId, u64>>,
     /// Render-owned values as of the last render pass (`snapshot.rs`).
     pub(crate) snapshot: crate::snapshot::Snapshot,
-    /// Render pool: the packed renderer input (`scene.rs`), captured at the
-    /// first sync and updated by the later ones. Empty in the VM pool.
-    pub(crate) scene: crate::scene::RenderSnapshot,
     /// What the renderer knows of each widget, by object pointer
     /// (`widget::RenderRec`).
     pub(crate) recs: Vec<crate::widget::RenderRec>,
-    /// VM pool: what the render pool must hear at the next sync, in order
-    /// (`view.rs`). Empty in the render pool.
-    pub(crate) msgs: Vec<crate::view::RenderMsg>,
-    /// VM pool: how the render side draws (`render::MODE_*`,
+    /// How the render side draws (`render::MODE_*`,
     /// `ObjPool::set_render_mode`).
     pub(crate) mode: u8,
-    /// Render pool, `MODE_AREAS`: dirty renders repaint whole areas, back to
+    /// `MODE_AREAS` with a render context: dirty renders repaint whole areas, back to
     /// front (`render::paint_areas`), not through the passes, with the core's
     /// own drawing only (no board renderer or pixel moves).
     pub(crate) areas: bool,
-    /// Render pool, `MODE_AREAS`: the frame being recorded (everything the
+    /// `MODE_AREAS`: the frame being recorded (everything the
     /// render draws goes here while it is busy, `render::screen!`), then the
     /// list the render side plays.
     pub(crate) frame: crate::dl::Recorder,
-    /// A sync's data (`view::Commit`). Render pool: the one its next job
-    /// applies (`Commit::pending`), then the applied one, kept for its
-    /// buffers; VM pool: a spare one to build the next sync in.
-    pub(crate) commit: Option<alloc::boxed::Box<crate::view::Commit>>,
-    /// VM pool: the tree's shape (links, objects) changed since the last
-    /// sync: the render pool's DFS order is stale.
-    pub(crate) shape_changed: bool,
     /// A render runs on this tree (`render::with_view`, `render::submit`):
     /// it allocates nothing.
     pub(crate) rendering: bool,
@@ -219,14 +206,10 @@ impl RenderState {
             paints: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             drawn_keys: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
             snapshot: crate::snapshot::Snapshot::new(),
-            scene: crate::scene::RenderSnapshot::new(),
             recs: Vec::new(),
-            msgs: Vec::new(),
             mode: 0,
             areas: false,
             frame: crate::dl::Recorder::new(),
-            commit: None,
-            shape_changed: true,
             rendering: false,
             geo: Vec::new(),
             geo_stack: Vec::new(),
@@ -298,60 +281,19 @@ pub struct ObjPool {
     pub gestures: crate::gesture::Registry,
     /// A layout is running: its own writes queue nothing.
     pub(crate) flex_busy: bool,
-    /// The render pool (`Ctx::view`, `view.rs`): a copy of the VM pool's
-    /// tree, synced before each render. Render-owned state (`render`,
-    /// `layers`) is kept here; the VM pool's `layers` is a mirror.
-    pub(crate) is_view: bool,
-    /// VM pool: the objects given out for writing, allocated or freed since
-    /// the last sync (`touch`): a bit per pointer, and the pointers in the
-    /// order they were first touched (at most `TOUCHED_MAX`, else
-    /// `touched_over`). The sync repacks only these in the render pool's
-    /// scene (`scene.rs`).
-    touched_bits: Vec<u32>,
-    touched: Vec<ObjPtr>,
-    touched_over: bool,
-    /// VM pool: the strings / arrays the render pool's scene holds a packed
-    /// copy of (a bit per pointer): a sync sends their data again when they
-    /// were touched, and that of the others when a widget first shows them.
-    pub(crate) text_sent: Vec<u32>,
-    pub(crate) graph_sent: Vec<u32>,
-    /// VM pool: syncs so far. A render pool's scene can be updated only if
-    /// it took the last one (`RenderSnapshot::generation`).
-    pub(crate) sync_gen: u32,
 }
 
-/// Most objects noted between two syncs; more = the next sync captures the
-/// whole tree.
-const TOUCHED_MAX: usize = 1024;
-
 impl ObjPool {
-    /// Renderer-only snapshot for this pool. On the render pool this is the
-    /// compact scene captured at the latest VM-to-render synchronization.
-    pub fn render_scene(&self) -> &crate::scene::RenderSnapshot {
-        &self.render.scene
-    }
-
-    /// Read a widget's text from the render snapshot. On the VM pool, fall
-    /// back to its object id for single-core utilities and pre-sync callers.
-    pub fn render_text(&self, id: WidgetId, source_id: ObjPtr) -> Option<&[u8]> {
-        if let Some(widget) = self.render.scene.widget(id) {
-            return self.render.scene.text_for(widget.id);
-        }
-        if self.is_view || source_id == PTR_NONE {
+    /// The text a widget shows (its string `source_id`).
+    pub fn render_text(&self, _id: WidgetId, source_id: ObjPtr) -> Option<&[u8]> {
+        if source_id == PTR_NONE {
             return None;
         }
         Some(self.str_get(source_id))
     }
 
-    /// Read a widget's graph samples from the render snapshot. The VM pool
-    /// fallback supports single-core utilities and pre-sync callers.
-    pub fn render_graph(&self, id: WidgetId, source_id: ObjPtr) -> Option<&[i32]> {
-        if let Some(widget) = self.render.scene.widget(id) {
-            return self.render.scene.graph_for(widget.id);
-        }
-        if self.is_view {
-            return None;
-        }
+    /// The samples a graph widget shows (its array `source_id`).
+    pub fn render_graph(&self, _id: WidgetId, source_id: ObjPtr) -> Option<&[i32]> {
         self.arr(source_id)
     }
 
@@ -386,13 +328,6 @@ impl ObjPool {
             flex_pending: Vec::new(),
             gestures: crate::gesture::Registry::new(),
             flex_busy: false,
-            is_view: false,
-            touched_bits: Vec::new(),
-            touched: Vec::new(),
-            touched_over: false,
-            text_sent: Vec::new(),
-            graph_sent: Vec::new(),
-            sync_gen: 0,
         }
     }
 
@@ -403,7 +338,6 @@ impl ObjPool {
             return;
         }
         self.render.mode = mode;
-        self.send(crate::view::RenderMsg::Touched);
         if self.root.is_some() {
             self.mark_dirty(self.root);
         }
@@ -413,76 +347,10 @@ impl ObjPool {
         self.render.mode
     }
 
-    /// Notes that object `p` may differ from what the render pool was last
-    /// given: it is handed out for writing, was allocated or freed.
-    #[inline]
-    fn touch(&mut self, p: ObjPtr) {
-        let Some(word) = self.touched_bits.get_mut(p as usize >> 5) else {
-            return;
-        };
-        let bit = 1u32 << (p & 31);
-        if *word & bit == 0 {
-            *word |= bit;
-            if self.touched.len() < TOUCHED_MAX {
-                self.touched.push(p);
-            } else {
-                self.touched_over = true;
-            }
-        }
-    }
-
-    /// The objects touched since the last sync, each once (not all of them
-    /// if `touched_over`).
-    pub(crate) fn touched(&self) -> &[ObjPtr] {
-        &self.touched
-    }
-
-    /// More objects were touched than `touched` holds.
-    pub(crate) fn touched_over(&self) -> bool {
-        self.touched_over
-    }
-
-    /// `p` was touched since the last sync.
-    #[inline]
-    pub(crate) fn is_touched(&self, p: ObjPtr) -> bool {
-        self.touched_bits.get(p as usize >> 5).is_some_and(|w| w & (1 << (p & 31)) != 0)
-    }
-
-    /// Forget what was touched (the render pool has it now).
-    pub(crate) fn clear_touched(&mut self) {
-        if self.touched_over {
-            self.touched_bits.fill(0);
-        } else {
-            for &p in &self.touched {
-                self.touched_bits[p as usize >> 5] = 0;
-            }
-        }
-        self.touched.clear();
-        self.touched_over = false;
-    }
-
-    /// An empty render pool (`Ctx::view`): storage grows to the VM pool's
-    /// used part at the first sync.
-    pub fn view() -> Self {
-        let mut p = Self::empty();
-        p.is_view = true;
-        p
-    }
-
-    /// Copy live widget blocks into `view`. Text and graph data live in the
-    /// renderer snapshot; unrelated VM strings/arrays and arena holes are
-    /// omitted while widget pointer ids remain stable.
-    pub(crate) fn set_view_metadata(&mut self, hwm: usize, root: WidgetId, overlay: Option<crate::types::Rect>) {
-        // Widget data now lives in `RenderSnapshot`; this context keeps only
-        // render-owned state and stable widget ID bounds.
-        self.top = 0;
-        self.hwm = hwm as ObjPtr;
-        self.free_head = PTR_NONE;
-        self.free_tail = PTR_NONE;
-        self.garbage = 0;
-        self.live = [0; 4];
-        self.root = root;
-        self.overlay = overlay;
+    /// A pool without storage: a render context's (`Ctx::render_ctx`), which
+    /// holds only the frame it plays and the overlay (`render::submit`).
+    pub fn without_storage() -> Self {
+        Self::empty()
     }
 
     /// Resize to `arena_bytes` / `max_objects` (0 = compile-time default),
@@ -532,11 +400,6 @@ impl ObjPool {
         self.arena = arena;
         self.table = table;
         self.dfs_cache = dfs;
-        self.touched_bits = alloc::vec![0; objects / 32 + 1];
-        self.text_sent = alloc::vec![0; objects / 32 + 1];
-        self.graph_sent = alloc::vec![0; objects / 32 + 1];
-        self.touched = Vec::with_capacity(TOUCHED_MAX);
-        self.touched_over = false;
         true
     }
 
@@ -556,11 +419,6 @@ impl ObjPool {
         self.dfs_valid = false;
         self.gestures.clear();
         self.render.reset();
-        self.render.msgs.clear();
-        self.render.shape_changed = true;
-        self.touched_over = true;
-        self.clear_touched();
-        self.send(crate::view::RenderMsg::Clear);
         {
             // The surfaces stay shown until the next render hides them.
             self.layers = crate::layer::Layers::new();
@@ -587,9 +445,6 @@ impl ObjPool {
     }
     /// Live objects of type `ty`, or all types for `T_FREE`.
     pub fn live_objects(&self, ty: u8) -> usize {
-        if self.is_view {
-            return if ty == T_WIDGET || ty == T_FREE { self.render.scene.len() } else { 0 };
-        }
         if ty == T_FREE {
             self.live.iter().map(|&n| n as usize).sum()
         } else {
@@ -619,7 +474,6 @@ impl ObjPool {
             + self.dfs_cache.capacity() * size_of::<WidgetId>()
             + tasks
             + geo
-            + self.render.scene.heap_bytes()
     }
     /// Pointers handed out so far: every live pointer is below this. Used as
     /// the iteration bound and as a loop guard for tree walks.
@@ -648,19 +502,9 @@ impl ObjPool {
         Some(&self.arena[at + HDR..at + HDR + n])
     }
 
-    /// Payload words of a live object of type `ty`, for writing: the object
-    /// is noted as touched (`touch`). Every write to an object's payload
-    /// comes through here.
+    /// Payload words of a live object of type `ty`, for writing.
     #[inline]
     pub(crate) fn payload_mut(&mut self, ptr: ObjPtr, ty: u8) -> Option<&mut [u32]> {
-        self.touch(ptr);
-        self.payload_mut_quiet(ptr, ty)
-    }
-
-    /// [`Self::payload_mut`] without the note: for writes the render pool
-    /// need not hear of (the sync's own).
-    #[inline]
-    pub(crate) fn payload_mut_quiet(&mut self, ptr: ObjPtr, ty: u8) -> Option<&mut [u32]> {
         let at = self.block(ptr, ty)?;
         let n = hdr_words(self.arena[at]);
         Some(&mut self.arena[at + HDR..at + HDR + n])
@@ -668,9 +512,6 @@ impl ObjPool {
 
     /// Type of the object `ptr` names, or `T_FREE` for none.
     pub fn type_of(&self, ptr: ObjPtr) -> u8 {
-        if self.is_view {
-            return if self.render.scene.widget(WidgetId(ptr)).is_some() { T_WIDGET } else { T_FREE };
-        }
         match self.table.get(ptr as usize) {
             Some(&e) if (ptr as usize) < self.hwm as usize && e & FREE_TAG == 0 => {
                 hdr_type(self.arena[e as usize])
@@ -723,7 +564,7 @@ impl ObjPool {
 
     /// Allocate an object with `words` zeroed payload words.
     pub(crate) fn alloc_obj(&mut self, ty: u8, words: usize) -> Option<ObjPtr> {
-        debug_assert!(!self.is_view && !self.render.rendering, "a render allocates nothing");
+        debug_assert!(!self.render.rendering, "a render allocates nothing");
         if words > MAX_OBJ_WORDS || !self.reserve_top(HDR + words) {
             return None;
         }
@@ -738,7 +579,6 @@ impl ObjPool {
         self.top += HDR + words;
         self.table[p as usize] = at as Off;
         self.live[ty as usize] += 1;
-        self.touch(p);
         Some(p)
     }
 
@@ -751,7 +591,6 @@ impl ObjPool {
         self.release_block(at, len);
         self.live[ty as usize] -= 1;
         self.put_ptr(ptr);
-        self.touch(ptr);
     }
 
     /// Turn the `len` words at `at` into a hole, or drop them when they end
@@ -779,7 +618,6 @@ impl ObjPool {
         if words == old {
             return true;
         }
-        self.touch(ptr);
         if words > MAX_OBJ_WORDS {
             return false;
         }

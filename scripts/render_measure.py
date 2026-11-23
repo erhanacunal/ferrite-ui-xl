@@ -9,9 +9,10 @@ scenario and measures `--windows` windows of `--secs` seconds each:
     home            the system image restarted, home screen idle (the clock ticks)
     monitor-stress  Monitor opened, "Start stress test" tapped (tiles bouncing)
 
-Per window: CPU0's render phase and its `scene capture` / `scene handoff`
-sub-phases (`GET /api/perf`), the scene syncs (`/api/status` `scene`,
-cumulative), the render jobs (`rcore`, zeroed by each status read: busy,
+Per window: CPU0's render phase and its `frame handoff` sub-phase (recording
+the frame and handing it over, `GET /api/perf`; `scene capture` / `scene
+handoff` before 2026-11-23, with the scene syncs of `/api/status` `scene`), the
+render jobs (`rcore`, zeroed by each status read: busy,
 apply, longest, pickup, the GPU work; `play_*` since boot), presents and passes per second. Written to
 perf/<tag>/render-<scenario>.json (a list, one object per window) and printed.
 """
@@ -64,22 +65,13 @@ def window(host, secs):
     dt = time.time() - t0
     ph = {p["name"]: p["us"] for p in perf["phases"]}
     win_s = perf["window_us"] / 1e6
-    sc0, sc1 = s0["scene"], s1["scene"]
-    full = sc1["full"] - sc0["full"]
-    updates = sc1["updates"] - sc0["updates"]
-    syncs = full + updates
     rc = s1["rcore"]
     r0 = s0["rcore"]  # play_* count since boot; the rest since the last read
     jobs = rc["jobs"]
     per = lambda v, n: round(v / n, 1) if n else 0.0
     return {
-        "syncs": syncs,
-        "full": full,
-        "repacked_per_update": per(sc1["repacked"] - sc0["repacked"], updates),
-        "capture_us_per_sync": per(ph.get("scene capture", 0) * secs / win_s, syncs),
-        "handoff_us_per_sync": per(ph.get("scene handoff", 0) * secs / win_s, syncs),
-        "capture_ms_per_s": round(ph.get("scene capture", 0) / 1000 / win_s, 3),
-        "handoff_ms_per_s": round(ph.get("scene handoff", 0) / 1000 / win_s, 3),
+        "handoff_ms_per_s": round(ph.get("frame handoff", 0) / 1000 / win_s, 3),
+        "handoff_us_per_job": per(ph.get("frame handoff", 0) * secs / win_s, jobs),
         "render_phase_ms_per_s": round(ph["render"] / 1000 / win_s, 3),
         "vm_phase_ms_per_s": round(ph["vm"] / 1000 / win_s, 3),
         "passes_s": round(perf["passes"] / win_s, 1),

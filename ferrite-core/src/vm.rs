@@ -3410,7 +3410,6 @@ mod anim_tests {
             fonts: FontList::new(),
             images: ImageList::new(),
             objs: ObjPool::new(),
-            view: ObjPool::view(),
             render_ctx: None,
             render_away: false,
             fs: None,
@@ -3540,65 +3539,12 @@ mod anim_tests {
         assert!(ctx.objs.root.is_none());
     }
 
-    /// The render pool's scene is captured once, then updated from what the
-    /// VM pool touched: a string edited in place, graph samples written and
-    /// a string pointer reused reach the widgets that show them, though the
-    /// widgets themselves were not written.
-    #[test]
-    fn the_scene_update_follows_the_strings_and_arrays_widgets_show() {
-        use core::sync::atomic::Ordering::Relaxed;
-        let mut ctx = mock_ctx();
-        let (root, child) = rendered_pair(&mut ctx);
-        let graph = one_widget(&mut ctx);
-        ctx.objs.add_child(root, graph);
-        let text = ctx.objs.str_alloc(b"abc").unwrap();
-        ctx.objs.set_text_id(child, text);
-        let samples = ctx.objs.arr_from(&[1, 2, 3]).unwrap();
-        ctx.objs.get_mut(graph).kind = crate::widget::KIND_GRAPH;
-        ctx.objs.get_mut(graph).value = samples as _;
-        ctx.objs.sync_view(&mut ctx.view);
-        assert_eq!(ctx.view.render_scene().text_for(child), Some(&b"abc"[..]));
-        assert_eq!(ctx.view.render_scene().graph_for(graph), Some(&[1, 2, 3][..]));
-
-        // In place: no widget is written.
-        let (fulls, updates) = (crate::scene::FULLS.load(Relaxed), crate::scene::UPDATES.load(Relaxed));
-        assert_eq!(ctx.objs.str_delete_byte(text, 0), Some(text));
-        ctx.objs.arr_mut(samples).unwrap()[1] = 9;
-        ctx.objs.sync_view(&mut ctx.view);
-        assert_eq!(ctx.view.render_scene().text_for(child), Some(&b"bc"[..]));
-        assert_eq!(ctx.view.render_scene().graph_for(graph), Some(&[1, 9, 3][..]));
-        assert!(crate::scene::UPDATES.load(Relaxed) > updates, "an update, not a capture");
-        let _ = fulls;
-
-        // The string freed: the widget shows none; its pointer reused by
-        // another string (FIFO): the widget shows that one.
-        ctx.objs.str_free(text);
-        ctx.objs.sync_view(&mut ctx.view);
-        assert_eq!(ctx.view.render_scene().text_for(child), None);
-        let mut again = ctx.objs.str_alloc(b"reused").unwrap();
-        while again != text {
-            again = ctx.objs.str_alloc(b"reused").unwrap();
-        }
-        ctx.objs.sync_view(&mut ctx.view);
-        assert_eq!(ctx.view.render_scene().text_for(child), Some(&b"reused"[..]));
-
-        // A widget written without a dirty mark is repacked too, and keeps
-        // the dirty bit the render pool still holds for it.
-        ctx.objs.mark_dirty(child);
-        ctx.objs.sync_view(&mut ctx.view);
-        ctx.objs.get_mut(child).background_color = 0x0F0F;
-        ctx.objs.sync_view(&mut ctx.view);
-        assert_eq!(ctx.view.get(child).background_color, 0x0F0F);
-        assert!(ctx.view.get(child).is_dirty());
-        assert!(!ctx.objs.get(child).is_dirty());
-    }
-
     /// A render context in `MODE_AREAS` (the board): renders are recorded on
     /// the tree and only the list goes to the render side.
     fn areas_ctx() -> Ctx<MockPlatform> {
         let mut ctx = mock_ctx();
         let mut r = mock_ctx();
-        r.objs = ObjPool::view();
+        r.objs = ObjPool::without_storage();
         ctx.render_ctx = Some(alloc::boxed::Box::new(r));
         ctx.objs.set_render_mode(crate::render::MODE_AREAS);
         ctx

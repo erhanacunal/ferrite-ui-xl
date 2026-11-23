@@ -6,7 +6,7 @@ Working branch: `main` (commit and push there).
 
 ## Detailed notes (read the relevant part before changing a subsystem)
 
-- `docs/notes/xl.md` — XL-specific subsystems, dated, with board measurements: display lists (`dl.rs`), GPU player / render modes, render pool / scene / commits, render context and render core (CPU2), JPEG, storage, gestures, interrupt-driven touch, G2D, graphs, RAM layout, toolchain.
+- `docs/notes/xl.md` — XL-specific subsystems, dated, with board measurements: display lists (`dl.rs`), GPU player / render modes, render context (one tree since 2026-11-23) and render core (CPU2), JPEG, storage, gestures, interrupt-driven touch, G2D, graphs, RAM layout, toolchain.
 - `docs/notes/inherited.md` — ferrite-ui architecture: widgets, dirty rendering, layers, GPU compositor, VM, object pool, FS, syscfg, profiler, exynos BSP (LCD/G2D/present, WiFi, HTTP API, standby, CPU clock), audio, EEPROM, fonts. Parts about Nextion/epaper/N32903/SD boot/buffered mode are obsolete here.
 - `../ferrite-ui/docs/bytecode.md`, `../ferrite-ui/docs/ferrite-lang.md`.
 
@@ -38,8 +38,7 @@ Working branch: `main` (commit and push there).
 
 - **Pixel-identical:** golden hashes are shared by all modes (default, `--dl`, `--areas`, play/plain). A change that alters pixels in one mode only is a bug.
 - **Display lists:** anything new that `render::draw_widget_body` reads must go into `render::dl_key`. `dl::VERIFY` panics on stale lists.
-- **Scene:** every write to an object goes through `ObjPool::payload_mut` (so `scene::VERIFY` sees it); anything new the scene packs must be reached that way.
-- **Render pool never allocates** (debug assert). Render-owned state lives in `ctx.view` / the render context, not in the widget blocks.
+- **A render allocates nothing** (`RenderState::rendering`, debug assert). It runs on the VM's tree (`render::with_view` / `submit`); in areas mode only the recorded frame goes to the render context, so what its play needs must be in the list (or shared and immutable: fonts, images) or synced in `render::sync_render_ctx`.
 - Draw through `canvas::Canvas`, not the LCD directly (keyboard/error/boot screens excepted). Code that draws outside the renderer on CPU0 calls `render::wait_idle` first.
 - **License:** don't link the GPL-2.0 `exynos_4412_jpeg` crate (or other GPL code) into the firmware.
 - **Toolchain** is pinned in `rust-toolchain.toml`; changing it means re-running `perf_baseline.py` and `golden.py`.
@@ -58,4 +57,4 @@ Working branch: `main` (commit and push there).
 
 ## Debug switches (sim env vars)
 
-`FERRITE_SIM_DL=1`, `FERRITE_SIM_DL_VERIFY=1`, `FERRITE_SIM_AREAS=1` (the board's render mode), `FERRITE_SIM_SCENE_VERIFY=1`, `FERRITE_SIM_SCENE_FULL=1`, `FERRITE_SIM_ONE_CTX=1`, `FERRITE_SIM_STALE_READS=1`, `FERRITE_SIM_NO_MOVE=1`, `FERRITE_SIM_CLOCK=HH:MM`, `FERRITE_SIM_BATTERY=P,C`, `FERRITE_SIM_GPS=LAT,LON[,ALT_M]` (a fix once a program powers the GPS), `FERRITE_SIM_VMPROF=1` (opcode profile to stderr at exit). Sim flags: `--dl-dump`, `--storage DIR`, `--eeprom FILE`, `--pinch …`, `--swipe …`, `--tap`, `--prof SECS`. exynos equivalents are under `/api/rcore`, `/api/dl`, `/api/compose`, `/api/snapshot` (see the notes).
+`FERRITE_SIM_DL=1`, `FERRITE_SIM_DL_VERIFY=1`, `FERRITE_SIM_AREAS=1` (the board's render mode), `FERRITE_SIM_ONE_CTX=1`, `FERRITE_SIM_STALE_READS=1`, `FERRITE_SIM_NO_MOVE=1`, `FERRITE_SIM_CLOCK=HH:MM`, `FERRITE_SIM_BATTERY=P,C`, `FERRITE_SIM_GPS=LAT,LON[,ALT_M]` (a fix once a program powers the GPS), `FERRITE_SIM_VMPROF=1` (opcode profile to stderr at exit). Sim flags (a `--dump` run hides its window): `--dl-dump`, `--storage DIR`, `--eeprom FILE`, `--pinch …`, `--swipe …`, `--tap`, `--prof SECS`. exynos equivalents are under `/api/rcore`, `/api/dl`, `/api/compose`, `/api/snapshot` (see the notes).

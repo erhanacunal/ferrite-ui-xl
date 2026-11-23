@@ -55,7 +55,6 @@ pub mod rich;
 pub mod snapshot;
 pub mod renderer;
 pub mod runtime;
-pub mod scene;
 pub mod settings;
 pub mod setup;
 pub mod pool;

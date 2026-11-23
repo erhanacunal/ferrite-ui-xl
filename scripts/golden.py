@@ -133,8 +133,6 @@ def main():
             skipped.append(name)
             continue
         env = dict(os.environ)
-        # Every incremental scene update is checked against a full capture (scene.rs).
-        env.update(FERRITE_SIM_SCENE_VERIFY="1")
         if a.dl:
             env.update(FERRITE_SIM_DL="1", FERRITE_SIM_DL_VERIFY="1")
         if a.stale:

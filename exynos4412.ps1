@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     Compiles the `bsp-exynos4412` crate from its own directory (its
-    .cargo/config.toml selects armv7a-none-eabihf; building from the root
+    .cargo/config.toml selects armv7a-ferrite-eabihf.json; building from the root
     would pick the workspace's default target), then converts the ELF to a
     raw image with rust-objcopy. The .bin is what uart_boot loads — the ELF
     alone is not, so a cargo build without objcopy leaves the old firmware
@@ -18,7 +18,7 @@
     By default the image is saved on CACHE (FERRITE/FERRITE.BIN) as the
     firmware uart_boot boots; -RamOnly runs it once from RAM instead.
 
-    Needs: rustup target add armv7a-none-eabihf; cargo install cargo-binutils;
+    Needs: rustup component add rust-src (build-std); cargo install cargo-binutils;
     rustup component add llvm-tools; Python 3 + pyserial (uart).
 
 .PARAMETER Action
@@ -72,7 +72,7 @@ $ErrorActionPreference = 'Stop'
 # ── Paths ────────────────────────────────────────────────────────────────────
 $Root    = $PSScriptRoot
 $BspDir  = Join-Path $Root 'bsp\exynos4412'
-$Target  = 'armv7a-none-eabihf'
+$Target  = 'armv7a-ferrite-eabihf'   # bsp/exynos4412/armv7a-ferrite-eabihf.json
 $Bin     = 'ferrite-ui'
 $Elf     = Join-Path $Root "target\$Target\release\$Bin"
 $ImgBin  = Join-Path $Root "target\$Target\release\$Bin.bin"

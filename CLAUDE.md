@@ -24,7 +24,7 @@ Working branch: `main` (commit and push there).
 - Pixel regression: `python scripts/golden.py` (`--dl`, `--areas`, `--stale`; `--update` only after an intended visual change)
 - Device perf: `python scripts/perf_baseline.py`
 - VM opcode profile: `python scripts/vmprof.py --sim` (golden scenarios) or `--host H --secs N` (the board, `/api/vmprof`)
-- Firmware: `cd bsp/exynos4412 && cargo build --release` (or `./exynos4412.ps1` from the repo root)
+- Firmware: `cd bsp/exynos4412 && cargo build --release` (custom target `armv7a-ferrite-eabihf.json` + build-std; output `target/armv7a-ferrite-eabihf/release/`) (or `./exynos4412.ps1` from the repo root)
 - After changing `lib/flex.fl`: `python ferrite-core/testdata/flex/gen.py`
 - After changing the compiler's class support: `python ferrite-core/testdata/classes/gen.py`
 - After changing the compiler's calling convention (void functions, call/return codegen): `python ferrite-core/testdata/calls/gen.py`

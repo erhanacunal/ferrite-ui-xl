@@ -60,7 +60,7 @@ Other examples in [`examples/exynos4412`](examples/exynos4412): `launcher` (prog
 
 ## Building
 
-Clone with submodules, and clone [ferrite-ui](https://github.com/erhanacunal/ferrite-ui) next to this repo (`../ferrite-ui`): the commands below use its tools. The firmware needs the `armv7a-none-eabihf` target (`rustup target add armv7a-none-eabihf`) and `rust-objcopy` (`cargo install cargo-binutils`, `rustup component add llvm-tools`). The toolchain is pinned in `rust-toolchain.toml`. The tablet must already run the HAL's `uart_boot` from its boot partition (see the [HAL README](https://github.com/erhanacunal/exynos-4412-rs)).
+Clone with submodules, and clone [ferrite-ui](https://github.com/erhanacunal/ferrite-ui) next to this repo (`../ferrite-ui`): the commands below use its tools. The firmware builds for a custom target, `bsp/exynos4412/armv7a-ferrite-eabihf.json` (armv7a-none-eabihf without forced frame pointers), with `-Zbuild-std`: it needs `rust-src` (`rustup component add rust-src`) and `rust-objcopy` (`cargo install cargo-binutils`, `rustup component add llvm-tools`). The toolchain is pinned in `rust-toolchain.toml`. The tablet must already run the HAL's `uart_boot` from its boot partition (see the [HAL README](https://github.com/erhanacunal/exynos-4412-rs)).
 
 ### Firmware
 
@@ -79,11 +79,11 @@ Clone with submodules, and clone [ferrite-ui](https://github.com/erhanacunal/fer
 cd bsp\exynos4412
 cargo build --release
 cd ..\..
-rust-objcopy -O binary target\armv7a-none-eabihf\release\ferrite-ui target\armv7a-none-eabihf\release\ferrite-ui.bin
+rust-objcopy -O binary target\armv7a-ferrite-eabihf\release\ferrite-ui target\armv7a-ferrite-eabihf\release\ferrite-ui.bin
 
 # Save it on CACHE as the firmware to boot, then restart into it
-python ..\ferrite-ui\tools\ferrite_cli.py --host 192.168.88.120 savefw target\armv7a-none-eabihf\release\ferrite-ui.bin   # over Wi-Fi
-python vendor\exynos_4412_rs\tools\uartboot.py --port COMx --reset --save target\armv7a-none-eabihf\release\ferrite-ui.bin   # over UART
+python ..\ferrite-ui\tools\ferrite_cli.py --host 192.168.88.120 savefw target\armv7a-ferrite-eabihf\release\ferrite-ui.bin   # over Wi-Fi
+python vendor\exynos_4412_rs\tools\uartboot.py --port COMx --reset --save target\armv7a-ferrite-eabihf\release\ferrite-ui.bin   # over UART
 ```
 
 Without `--save`, `uartboot.py` runs the image from RAM only, until the next restart.

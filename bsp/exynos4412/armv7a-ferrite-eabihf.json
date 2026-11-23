@@ -1,0 +1,25 @@
+{
+  "abi": "eabihf",
+  "arch": "arm",
+  "c-enum-min-bits": 8,
+  "crt-objects-fallback": "false",
+  "data-layout": "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
+  "emit-debug-gdb-scripts": false,
+  "features": "+vfp3d16,-neon,+strict-align",
+  "frame-pointer": "non-leaf",
+  "has-thumb-interworking": true,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-floatabi": "hard",
+  "llvm-target": "armv7a-none-eabihf",
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "Bare Armv7-A, hardfloat, frame pointer may be omitted (ferrite-ui-xl)",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "target-pointer-width": 32
+}

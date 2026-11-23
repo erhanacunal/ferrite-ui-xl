@@ -72,6 +72,7 @@ mod compose;
 // The CPU clock at run time (HTTP `POST /api/cpu?mhz=N`), thermal throttling, idle sleep.
 #[cfg_attr(not(feature = "wifi"), allow(dead_code))]
 mod cpuclock;
+mod divide;
 mod eeprom;
 mod gps;
 mod gpu;

@@ -5,5 +5,5 @@
 [toolchain]
 channel = "nightly-2026-06-04"
 targets = ["armv7a-none-eabihf"]
-components = ["llvm-tools", "rustfmt", "clippy"]
+components = ["llvm-tools", "rustfmt", "clippy", "rust-src"]
 profile = "minimal"

@@ -61,21 +61,19 @@ macro_rules! canvas {
 /// Dynamic opcode profile (vm/prof.rs).
 pub mod prof;
 /// Threaded dispatch of `tick`'s bursts (vm/tc.rs).
+mod ops;
 mod tc;
 /// Code units: a program's libraries (vm/units.rs).
 mod units;
 pub use units::{LibExport, LibImage, LibImport, LibTables, MAX_LIBS};
-
-/// `tick` runs through `tc` (false: the `exec_one` loop, the reference).
-const THREADED: bool = true;
 
 // === Code source — owned by VM ===
 
 /// Bytes after the code: the threaded dispatch (`tc`) reads an instruction's
 /// operands and the next opcode without a bounds check, so an instruction
 /// cut off by the end of the code (at most 9 bytes) stays in the buffer.
-/// They are `TC_PAD`, an undefined opcode, so running into them takes the
-/// checked path (`exec_one`: CODE_OOB).
+/// They are `TC_PAD`, an undefined opcode, so running into them faults
+/// (`tc::bad_op`: CODE_OOB).
 pub(crate) const CODE_PAD: usize = 16;
 const TC_PAD: u8 = 0xFF;
 
@@ -102,7 +100,8 @@ struct CodeBuf(core::cell::UnsafeCell<Vec<u8>>);
 // `new` and lives as long as any clone. Its bytes change only through
 // `quicken`, from the thread that runs the VMs (the runtime loop runs every
 // task, so no VM sharing the buffer reads it meanwhile), while no slice from
-// `bytes` is alive (those are local to one `exec_one` instruction).
+// `bytes` is alive (those are local to one out-of-line instruction,
+// `vm/ops.rs`).
 unsafe impl Send for VmCode {}
 unsafe impl Sync for VmCode {}
 
@@ -377,10 +376,10 @@ const OP_W_SETALL: u8 = 0x51;
 // kind of its slot where it has one (BIN_V, JCMP_VI, STORE_OP), LOAD / STORE /
 // ADD_VI / ARR_LOAD_V by the kind of their slot (no local-or-global choice). Same
 // length and operands. `QUICK[q - Q_FIRST]` = (the instruction, the cond /
-// op, the slot kind), and every path runs `q` as that instruction with that
+// op, the slot kind), and `tc` runs `q` as that instruction with that
 // cond / op (the operand byte ignored) and the slot operand forced to that
-// kind (`force_slot`), so any byte sequence runs the same in `exec_one` and
-// `tc`. Picked by the dynamic profile (`vm/prof.rs`, `scripts/vmprof.py`).
+// kind (`force_slot`), so any byte sequence runs the same quickened or not.
+// Picked by the dynamic profile (`vm/prof.rs`, `scripts/vmprof.py`).
 pub(crate) const Q_FIRST: u8 = 0x58;
 /// Slot kinds of a quickened form: the operand as it is, forced local,
 /// forced global.
@@ -1016,13 +1015,17 @@ pub struct Vm {
     // Threaded dispatch (vm/tc.rs), valid during a burst: the budget the
     // handlers count down from and the instructions run before it, the count
     // when it left, the eval stack's bounds as addresses (sp_floor and end),
-    // and the burst's `Ctx<P>` (the handlers are generic over `P`).
+    // the burst's `Ctx<P>` (the handlers are generic over `P`), the callback
+    // depth it runs to (`tc::run`'s floor) and whether it runs one
+    // instruction (`step`).
     tc_limit: u32,
     tc_base: u32,
     tc_n: u32,
     tc_lo: usize,
     tc_hi: usize,
     tc_ctx: usize,
+    tc_floor: usize,
+    tc_one: bool,
 }
 
 const EMPTY_CB: CbRequest = CbRequest {
@@ -1093,6 +1096,8 @@ impl Vm {
             tc_lo: 0,
             tc_hi: 0,
             tc_ctx: 0,
+            tc_floor: 0,
+            tc_one: false,
             tree_hint: None,
             open_files: [None, None],
             program: ProgramRef::new(b"main", 0),
@@ -1379,23 +1384,25 @@ impl Vm {
             self.run_active_callback(ctx);
             return;
         }
-        let budget = budget.max(1);
-        // The profile counts in `exec_one`: the burst goes there while it's on.
-        let threaded = THREADED && !prof::ON.load(core::sync::atomic::Ordering::Relaxed);
-        let n = if threaded { tc::run(self, ctx, budget) as u64 } else { self.burst_ref(ctx, budget) };
+        let n = self.burst(ctx, budget.max(1), 0);
         self.instructions = self.instructions.wrapping_add(n);
     }
 
-    /// `tick`'s burst through `exec_one` (the reference for `tc::run`): until
-    /// the VM leaves `Running` or `budget` (>= 1) instructions outside a
-    /// critical section ran; the count run. The instruction body is inlined,
-    /// so the burst pays the large prologue of `step` once.
-    fn burst_ref<P: Platform>(&mut self, ctx: &mut Ctx<P>, mut budget: u32) -> u64 {
+    /// A burst (`tc::run`): until the VM leaves `Running`, `budget` (>= 1)
+    /// instructions outside a critical section ran, or the running callbacks
+    /// drop below `floor` (0: never); the count run. While the opcode profile
+    /// is on, one instruction at a time, each counted first (`prof`).
+    fn burst<P: Platform>(&mut self, ctx: &mut Ctx<P>, budget: u32, floor: usize) -> u64 {
+        if !prof::ON.load(core::sync::atomic::Ordering::Relaxed) {
+            return tc::run(self, ctx, budget, floor, false) as u64;
+        }
+        let mut budget = budget;
         let mut n: u64 = 0;
         loop {
-            self.exec_one(ctx);
+            prof::count(&self.code, self.pc as usize);
+            tc::run(self, ctx, 1, floor, true);
             n += 1;
-            if self.state != VmState::Running {
+            if self.state != VmState::Running || self.cb_frames.len() < floor {
                 break;
             }
             if self.critical {
@@ -1421,7 +1428,10 @@ impl Vm {
         let depth = self.cb_frames.len();
         while self.cb_frames.len() >= depth {
             match self.state {
-                VmState::Running => self.step(ctx),
+                VmState::Running => {
+                    let n = self.burst(ctx, u32::MAX, depth);
+                    self.instructions = self.instructions.wrapping_add(n);
+                }
                 VmState::Yielded => self.state = VmState::Running,
                 VmState::Waiting => {
                     if self.wait_expired(ctx) {
@@ -1540,8 +1550,8 @@ impl Vm {
 
     /// The VM's drawing builtins. They draw on the screen, or into the
     /// `on_paint` recorder while `run_paint` records a widget's paint list
-    /// (display lists, `ObjPool::render.painting`). Out of line: kept out of
-    /// `exec_one`'s body (one copy per canvas type).
+    /// (display lists, `ObjPool::render.painting`). Out of line (one copy
+    /// per canvas type).
     #[inline(never)]
     fn draw_op<P: Platform>(&mut self, ctx: &mut Ctx<P>, op: u8) {
         // `on_paint` drawing being recorded touches the screen when its list
@@ -1858,7 +1868,8 @@ impl Vm {
     fn run_active_callback<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         let depth = self.cb_frames.len();
         while self.state == VmState::Running && self.cb_frames.len() >= depth {
-            self.step(ctx);
+            let n = self.burst(ctx, u32::MAX, depth);
+            self.instructions = self.instructions.wrapping_add(n);
         }
     }
 
@@ -2019,11 +2030,6 @@ impl Vm {
         }
     }
 
-    #[inline(always)]
-    fn read_i8(&mut self) -> i8 {
-        self.read_u8() as i8
-    }
-
     /// The next `N` code bytes, with one bounds check; the out-of-range fault
     /// goes byte by byte through `read_u8_slow` (first fault wins, as before).
     #[inline(always)]
@@ -2054,11 +2060,6 @@ impl Vm {
         u16::from_le_bytes(self.fetch())
     }
 
-    #[inline(always)]
-    fn read_i16(&mut self) -> i16 {
-        self.read_u16() as i16
-    }
-
 
     #[inline(always)]
     fn read_i32(&mut self) -> i32 {
@@ -2070,1249 +2071,15 @@ impl Vm {
         self.read_i32() as u32
     }
 
-    /// JMP/JZ/JNZ/CALL target: u32 (XL reads wide-address images only).
-    #[inline]
-    fn read_addr(&mut self) -> CodeAddr {
-        self.read_u32() as CodeAddr
-    }
-
     // --- Execute a single instruction ---
 
+    /// Run the instruction at `pc` (state `Running`).
     pub fn step<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
-        {
-            self.instructions = self.instructions.wrapping_add(1);
-        }
-        self.exec_one(ctx);
-    }
-
-    /// The instruction body of `step`. `fast_vm` inlines it into the burst
-    /// loop in `tick` as well.
-    #[inline(always)]
-    fn exec_one<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
-        self.op_pc = self.pc;
+        self.instructions = self.instructions.wrapping_add(1);
         if prof::ON.load(core::sync::atomic::Ordering::Relaxed) {
             prof::count(&self.code, self.pc as usize);
         }
-        let op = self.read_u8();
-        if self.state == VmState::Error {
-            return;
-        }
-
-        match op {
-            // --- No-arg: stack, arithmetic, logic, comparison ---
-            // HALT inside a callback ends just that callback.
-            OP_HALT if !self.cb_frames.is_empty() => self.leave_callback(),
-            OP_HALT => self.state = VmState::Halted,
-            OP_POP => {
-                self.pop();
-            }
-            OP_DUP => {
-                let v = self.peek();
-                self.push(v);
-            }
-            OP_SWAP => {
-                if self.sp - self.sp_floor >= 2 {
-                    let i = (self.sp - 1) as usize;
-                    let j = (self.sp - 2) as usize;
-                    self.stack.swap(i, j);
-                } else {
-                    self.fail(fault::STACK_UNDERFLOW);
-                }
-            }
-            OP_ADD => {
-                let (a, b) = self.pop2();
-                self.push(a.wrapping_add(b));
-            }
-            OP_SUB => {
-                let (a, b) = self.pop2();
-                self.push(a.wrapping_sub(b));
-            }
-            OP_MUL => {
-                let (a, b) = self.pop2();
-                self.push(a.wrapping_mul(b));
-            }
-            OP_DIV => {
-                let (a, b) = self.pop2();
-                self.push(if b != 0 { a.wrapping_div(b) } else { 0 });
-            }
-            OP_MOD => {
-                let (a, b) = self.pop2();
-                self.push(if b != 0 { a.wrapping_rem(b) } else { 0 });
-            }
-            OP_NEG => {
-                let a = self.pop();
-                self.push(a.wrapping_neg());
-            }
-            OP_AND => {
-                let (a, b) = self.pop2();
-                self.push(a & b);
-            }
-            OP_OR => {
-                let (a, b) = self.pop2();
-                self.push(a | b);
-            }
-            OP_SHL => {
-                let (a, b) = self.pop2();
-                self.push(a << (b as u32 & 31));
-            }
-            OP_SHR => {
-                let (a, b) = self.pop2();
-                self.push(a >> (b as u32 & 31));
-            }
-            OP_NOT => {
-                let a = self.pop();
-                self.push(if a == 0 { 1 } else { 0 });
-            }
-            OP_EQ => {
-                let (a, b) = self.pop2();
-                self.push(if a == b { 1 } else { 0 });
-            }
-            OP_NE => {
-                let (a, b) = self.pop2();
-                self.push(if a != b { 1 } else { 0 });
-            }
-            OP_LT => {
-                let (a, b) = self.pop2();
-                self.push(if a < b { 1 } else { 0 });
-            }
-            OP_LE => {
-                let (a, b) = self.pop2();
-                self.push(if a <= b { 1 } else { 0 });
-            }
-            OP_GT => {
-                let (a, b) = self.pop2();
-                self.push(if a > b { 1 } else { 0 });
-            }
-            OP_GE => {
-                let (a, b) = self.pop2();
-                self.push(if a >= b { 1 } else { 0 });
-            }
-            OP_RET => {
-                if self.cb_frames.last().is_some_and(|f| f.call_sp == self.call_sp) {
-                    // Return from the callback's own entry function.
-                    self.leave_callback();
-                } else if self.call_sp > 0 {
-                    self.call_sp -= 1;
-                    let frame = self.call_stack[self.call_sp as usize];
-                    self.goto(frame.ret_addr);
-                    self.frame_base = frame.frame_base as u32;
-                    self.frame_size = frame.frame_size;
-
-                    // Modal builder return interception: if we just popped the
-                    // call frame for a modal dialog's builder, capture its
-                    // returned overlay id and suspend the VM until
-                    // setDialogResult fires.
-                    let intercept = match self.modal_stack.last() {
-                        Some(top) => {
-                            top.state == ModalState::AwaitingBuilderReturn
-                                && self.call_sp < top.builder_call_depth
-                        }
-                        None => false,
-                    };
-                    if intercept {
-                        self.handle_builder_return(ctx);
-                    }
-                } else {
-                    self.fail(fault::RET_EMPTY);
-                }
-            }
-            OP_YIELD => {
-                self.critical = false;
-                self.state = VmState::Yielded;
-            }
-            OP_W_DIRTY => {
-                if self.target.is_some() {
-                    ctx.objs.mark_dirty(self.target);
-                }
-            }
-            OP_W_RENDER => {
-                // render() from inside on_paint: the render that runs it is
-                // already going on.
-                if !self.in_paint {
-                    let mut paint = render::PaintList::new();
-                    render::collect_dirty_paint(ctx, &mut paint);
-                    self.run_paint(ctx, &paint);
-                    render::render_dirty(ctx);
-                }
-            }
-            OP_ARR_LOAD => {
-                let (arr_id, idx) = self.pop2();
-                self.arr_load(ctx, arr_id, idx);
-            }
-            OP_ARR_STORE => {
-                let (idx, val) = self.pop2();
-                let arr_id = self.pop();
-                self.arr_store(ctx, arr_id, idx, val);
-            }
-            OP_ARR_LEN => {
-                let arr_id = self.pop();
-                self.arr_len(ctx, arr_id);
-            }
-            OP_W_ALLOC => {
-                if let Some(id) = ctx.objs.alloc_widget() {
-                    self.push(id.0 as i32);
-                } else {
-                    self.fail(fault::WIDGET_ALLOC);
-                }
-            }
-            OP_W_ALLTAR => {
-                let raw = self.read_u8();
-                self.w_alltar(ctx, raw);
-            }
-            OP_FRAME => {
-                // Function prologue: set frame_size for this function
-                let count = self.read_u8();
-                if self.frame_base + count as u32 > self.var_slots {
-                    self.fail(fault::VARS_FULL);
-                } else {
-                    self.frame_size = count;
-                }
-            }
-            OP_ARR_FREE => {
-                let arr_id = self.pop();
-                if arr_id >= 0 {
-                    ctx.objs.arr_free(arr_id as ObjPtr);
-                }
-            }
-
-            // --- Specialized short forms ---
-            OP_PUSH_0 => self.push(0),
-            OP_PUSH_1 => self.push(1),
-            OP_PUSH_2 => self.push(2),
-            OP_PUSH_M1 => self.push(-1),
-            // Short forms: LOAD/STORE local slots 0-4
-            OP_LOAD_0 => {
-                let s = self.frame_base;
-                let v = self.var_get(s);
-                self.push(v);
-            }
-            OP_LOAD_1 => {
-                let s = self.frame_base + 1;
-                let v = self.var_get(s);
-                self.push(v);
-            }
-            OP_LOAD_2 => {
-                let s = self.frame_base + 2;
-                let v = self.var_get(s);
-                self.push(v);
-            }
-            OP_LOAD_3 => {
-                let s = self.frame_base + 3;
-                let v = self.var_get(s);
-                self.push(v);
-            }
-            OP_LOAD_4 => {
-                let s = self.frame_base + 4;
-                let v = self.var_get(s);
-                self.push(v);
-            }
-            OP_STORE_0 => {
-                let s = self.frame_base;
-                let v = self.pop();
-                self.var_set(s, v);
-            }
-            OP_STORE_1 => {
-                let s = self.frame_base + 1;
-                let v = self.pop();
-                self.var_set(s, v);
-            }
-            OP_STORE_2 => {
-                let s = self.frame_base + 2;
-                let v = self.pop();
-                self.var_set(s, v);
-            }
-            OP_STORE_3 => {
-                let s = self.frame_base + 3;
-                let v = self.pop();
-                self.var_set(s, v);
-            }
-            OP_STORE_4 => {
-                let s = self.frame_base + 4;
-                let v = self.pop();
-                self.var_set(s, v);
-            }
-
-            // --- With arguments ---
-            OP_PUSH_I8 => {
-                let val = self.read_i8() as i32;
-                self.push(val);
-            }
-            OP_PUSH_I16 => {
-                let val = self.read_i16() as i32;
-                self.push(val);
-            }
-            OP_PUSH_I32 => {
-                let val = self.read_i32();
-                self.push(val);
-            }
-            OP_LOAD => {
-                let raw = self.read_u8();
-                let slot = self.resolve_slot(raw);
-                let v = self.var_get(slot);
-                self.push(v);
-            }
-            OP_STORE => {
-                let raw = self.read_u8();
-                let slot = self.resolve_slot(raw);
-                let v = self.pop();
-                self.var_set(slot, v);
-            }
-            OP_JMP => {
-                let target = self.read_addr();
-                self.pc = target;
-            }
-            OP_JZ => {
-                let target = self.read_addr();
-                if self.pop() == 0 {
-                    self.pc = target;
-                }
-            }
-            OP_JNZ => {
-                let target = self.read_addr();
-                if self.pop() != 0 {
-                    self.pc = target;
-                }
-            }
-            OP_CALL => {
-                let target = self.read_addr();
-                if (self.call_sp as usize) < self.call_stack.len() {
-                    self.call_stack[self.call_sp as usize] = CallFrame {
-                        ret_addr: self.pc | self.utag,
-                        frame_base: self.frame_base as u16,
-                        frame_size: self.frame_size,
-                    };
-                    self.call_sp += 1;
-                    // Advance frame_base past caller's locals
-                    self.frame_base += self.frame_size as u32;
-                    self.frame_size = 0; // callee's FRAME will set this
-                    self.pc = target;
-                } else {
-                    self.fail(fault::CALL_OVERFLOW);
-                }
-            }
-            OP_W_TARGET => {
-                // Static target with u8-encoded id (0..254). Used for widgets
-                // allocated at fixed positions (e.g. root). Dynamically
-                // allocated widgets use W_TARGET_S, which takes a u16 id from
-                // the stack.
-                let wid = self.read_u8();
-                self.target = self.widget_ref(ctx, wid as ObjPtr);
-            }
-            OP_W_TARGET_S => {
-                let wid = self.pop() as ObjPtr;
-                self.target = self.widget_ref(ctx, wid);
-            }
-            OP_W_SET => {
-                let prop_id = self.read_u8();
-                let val = self.pop();
-                self.w_set(ctx, prop_id, val);
-            }
-            OP_W_GET => {
-                let prop_id = self.read_u8();
-                // FLEX_AUTO: a position or size reads the laid-out value.
-                if matches!(prop_id, PROP_LOC_X | PROP_LOC_Y | PROP_SIZE_W | PROP_SIZE_H) {
-                    flex::flush(ctx);
-                }
-                if self.target.is_some() {
-                    let v = self.get_scalar_prop(ctx, prop_id);
-                    // A render-owned value (an animated prop, a scroll offset):
-                    // counted, and answered from the last render's snapshot when
-                    // `snapshot::STALE` models the render core (`snapshot.rs`).
-                    let v = ctx.objs.render.snapshot.read(self.target, prop_id, v);
-                    // Font / image ids as this program's image numbers them (`domain.rs`).
-                    let v = match prop_id {
-                        PROP_FONT_ID => i32::from(ctx.domains.font_local(self.domain, v as u8)),
-                        PROP_IMAGE_ID => i32::from(ctx.domains.image_local(self.domain, v as u8)),
-                        _ => v,
-                    };
-                    self.push(v);
-                } else {
-                    self.push(0);
-                }
-            }
-            OP_W_PARENT => {
-                // Static parent id (u8). Used for parent(0) and other literal
-                // widget references that fit in u8.
-                let parent = self.read_u8();
-                self.w_parent(ctx, parent as ObjPtr);
-            }
-            OP_W_PARENT_S => {
-                // Dynamic parent — id from stack. Used when the parent is a
-                // widget variable (its slot stores the runtime id from alloc).
-                let parent = self.pop() as ObjPtr;
-                self.w_parent(ctx, parent);
-            }
-            OP_W_LOAD => {
-                let off = self.read_u16();
-                self.load_page_block(ctx, off as u32);
-            }
-            OP_W_SETALL => self.w_setall(ctx),
-            OP_W_SET_LEN => {
-                let prop_id = self.read_u8();
-                let len = self.read_u8() as usize;
-                let start = self.pc as usize;
-                let end = start + len;
-                if end <= self.code.len() {
-                    // Compound values fit the stack buffer; longer payloads
-                    // (text literals up to 255 bytes) go through the heap.
-                    let mut small = [0u8; 32];
-                    let mut big = Vec::new();
-                    let buf: Option<&mut [u8]> = if len <= small.len() {
-                        Some(&mut small[..len])
-                    } else if big.try_reserve_exact(len).is_ok() {
-                        big.resize(len, 0);
-                        Some(&mut big)
-                    } else {
-                        None
-                    };
-                    self.pc = end as CodeAddr;
-                    if let Some(buf) = buf {
-                        self.code.read_bytes(start, buf);
-                        self.w_set_len(ctx, prop_id, buf);
-                    } else {
-                        self.fail(fault::STR_ALLOC);
-                    }
-                } else {
-                    self.fail(fault::CODE_OOB);
-                }
-            }
-            OP_ARR_ALLOC => {
-                let size = self.read_u8() as usize;
-                match ctx.objs.arr_alloc(size) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::ARR_ALLOC),
-                }
-            }
-            OP_ARR_ALLOC_S => {
-                let size = self.pop();
-                match usize::try_from(size).ok().and_then(|n| ctx.objs.arr_alloc(n)) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::ARR_ALLOC),
-                }
-            }
-            OP_ARR_INIT => {
-                let count = self.read_u8() as usize;
-                let start = self.pc as usize;
-                let byte_len = count * 4;
-                if start + byte_len <= self.code.len() {
-                    self.pc = (start + byte_len) as CodeAddr;
-                    let Some(id) = ctx.objs.arr_alloc(count) else {
-                        return self.fail(fault::ARR_ALLOC);
-                    };
-                    let values = ctx.objs.arr_mut(id).unwrap();
-                    let mut tmp = [0u8; 4];
-                    for (i, v) in values.iter_mut().enumerate() {
-                        self.code.read_bytes(start + i * 4, &mut tmp);
-                        *v = i32::from_le_bytes(tmp);
-                    }
-                    self.push(id as i32);
-                } else {
-                    self.fail(fault::CODE_OOB);
-                }
-            }
-            OP_F_READ => {
-                let addr = self.read_u32();
-                let len = self.read_u16() as usize;
-                if len > (self.stack.len() - self.sp as usize) {
-                    self.fail(fault::STACK_OVERFLOW);
-                    return;
-                }
-                // Read in fixed chunks: the stack depth is a runtime value.
-                let Some(addr) = self.flash_addr(ctx, addr, len as u32) else {
-                    return self.fail(fault::BAD_OPERAND);
-                };
-                let mut buf = [0u8; 16];
-                let mut done = 0;
-                while done < len {
-                    let n = (len - done).min(buf.len());
-                    ctx.flash.read(addr + done as u32, &mut buf[..n]);
-                    for &b in &buf[..n] {
-                        self.push(b as i32);
-                    }
-                    done += n;
-                }
-            }
-            OP_F_WRITE => {
-                let addr = self.read_u32();
-                let len = self.read_u8() as usize;
-                let start = self.pc as usize;
-                if start + len <= self.code.len() {
-                    let mut buf = [0u8; 64];
-                    let n = len.min(buf.len());
-                    self.code.read_bytes(start, &mut buf[..n]);
-                    self.pc = (start + len) as CodeAddr;
-                    if n > 0 {
-                        let Some(addr) = self.flash_addr(ctx, addr, n as u32) else {
-                            return self.fail(fault::BAD_OPERAND);
-                        };
-                        ctx.flash.write(addr, &buf[..n]);
-                    }
-                } else {
-                    self.fail(fault::CODE_OOB);
-                }
-            }
-
-            // --- Builtins (args on stack) ---
-            OP_FILL_RECT
-            | OP_RECT
-            | OP_LINE
-            | OP_CIRCLE
-            | OP_FILL_CIRCLE
-            | OP_DRAW_IMAGE
-            | OP_DRAW_TEXT_LIT
-            | OP_DRAW_STR
-            | OP_ROUNDED_RECT
-            | OP_FILL_ROUNDED_RECT
-            | OP_ARC => self.draw_op(ctx, op),
-            OP_DELAY => {
-                let ms = self.pop() as u32;
-                self.wait_until = ctx.systick.millis().wrapping_add(ms);
-                self.state = VmState::Waiting;
-            }
-            OP_STR_LIT => {
-                // Inline text: u8 len + text bytes → interned pool string (an
-                // identical live literal is reused), push str_id
-                let len = self.read_u8() as usize;
-                let start = self.pc as usize;
-                if start + len <= self.code.len() {
-                    self.pc = (start + len) as CodeAddr;
-                    match self.code.with_bytes(start, len, |text| ctx.objs.str_intern(text)) {
-                        Some(id) => self.push(id as i32),
-                        None => self.fail(fault::STR_ALLOC),
-                    }
-                } else {
-                    self.fail(fault::CODE_OOB);
-                }
-            }
-            OP_ITOS => {
-                let val = self.pop();
-                match strpool::itos(&mut ctx.objs, val) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::STR_ALLOC),
-                }
-            }
-            OP_FTOS => {
-                let bits = self.pop() as u32;
-                match strpool::ftos(&mut ctx.objs, bits) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::STR_ALLOC),
-                }
-            }
-            OP_CONCAT => {
-                let (a, b) = self.pop2();
-                let (a, b) = (a as ObjPtr, b as ObjPtr);
-                match ctx.objs.str_concat(a, b) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::STR_ALLOC),
-                }
-            }
-            OP_PARSE_INT => {
-                let id = self.pop() as ObjPtr;
-                self.push(strpool::parse_int(&ctx.objs, id));
-            }
-            OP_PARSE_FLOAT => {
-                let id = self.pop() as ObjPtr;
-                self.push(strpool::parse_float(&ctx.objs, id) as i32);
-            }
-            OP_STR_LEN => {
-                let id = self.pop() as ObjPtr;
-                self.push(ctx.objs.str_len(id) as i32);
-            }
-            OP_STR_BYTE => {
-                let (id, idx) = self.pop2();
-                let bytes = ctx.objs.str_get(id as ObjPtr);
-                let b = usize::try_from(idx).ok().and_then(|i| bytes.get(i));
-                self.push(b.map_or(-1, |&b| b as i32));
-            }
-            OP_STR_CMP => {
-                let (a, b) = self.pop2();
-                let (a, b) = (a as ObjPtr, b as ObjPtr);
-                self.push(ctx.objs.str_compare(a, b));
-            }
-            OP_SET_TEXT => {
-                let str_id = self.pop() as ObjPtr;
-                if self.target.is_some() {
-                    ctx.objs.update_ext(self.target, |ext| {
-                        ext.text_id = str_id;
-                    });
-                    // Text change repaints on the next render() — same as the
-                    // W_SET text path.
-                    ctx.objs.mark_dirty(self.target);
-                }
-            }
-            OP_STR_CLEAR => ctx.objs.str_sweep(),
-            OP_STR_FREE => {
-                let str_id = self.pop() as ObjPtr;
-                ctx.objs.str_free(str_id);
-            }
-            OP_BEGIN_FRAME => {
-                render::wait_idle(ctx);
-                ctx.objs.screen_touched();
-                ctx.lcd.begin_frame();
-            }
-            OP_END_FRAME => {
-                render::wait_idle(ctx);
-                ctx.objs.screen_touched();
-                ctx.lcd.end_frame();
-            }
-            OP_SEND_USART => {
-                let arr_id = self.pop() as ObjPtr;
-                if let Some(arr) = ctx.objs.arr(arr_id) {
-                    for &val in arr {
-                        ctx.usart.write_byte(val as u8);
-                    }
-                }
-            }
-            OP_SEND_USART_STR => {
-                let str_id = self.pop() as ObjPtr;
-                let bytes = ctx.objs.str_get(str_id);
-                ctx.usart.write(bytes);
-            }
-            OP_RTC_READ => {
-                // Read RTC → allocate array [sec, min, hour, day, weekday, month, year]
-                let dt = ctx.rtc.read_time();
-                let data = [
-                    dt.second as i32,
-                    dt.minute as i32,
-                    dt.hour as i32,
-                    dt.day as i32,
-                    dt.weekday as i32,
-                    dt.month as i32,
-                    dt.year as i32,
-                ];
-                match ctx.objs.arr_from(&data) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::ARR_ALLOC),
-                }
-            }
-            OP_RTC_WRITE => {
-                // Pop arr_id, read [sec, min, hour, day, weekday, month, year], set RTC
-                let arr_id = self.pop();
-                match Self::find_array(ctx, arr_id) {
-                    Some(arr) => {
-                        if arr.len() >= 7 {
-                            let dt = crate::rtc::DateTime {
-                                second: arr[0] as u8,
-                                minute: arr[1] as u8,
-                                hour: arr[2] as u8,
-                                day: arr[3] as u8,
-                                weekday: arr[4] as u8,
-                                month: arr[5] as u8,
-                                year: arr[6] as u8,
-                            };
-                            ctx.rtc.set_time(&dt);
-                        } else {
-                            self.fail(fault::BAD_OPERAND);
-                        }
-                    }
-                    None => self.fail(fault::BAD_ARRAY),
-                }
-            }
-
-            OP_MILLIS => {
-                self.push(ctx.systick.millis() as i32);
-            }
-            OP_FPGA_CMD => {
-                render::wait_idle(ctx);
-                ctx.objs.screen_touched();
-                // fpgaCmd(cmd, data) — raw FPGA command + data
-                let (cmd, data) = self.pop2();
-                let (cmd, data) = (cmd as u16, data as u16);
-                ctx.lcd.send_command(cmd);
-                ctx.lcd.send_data(data);
-            }
-            OP_FPGA_DAT => {
-                render::wait_idle(ctx);
-                ctx.objs.screen_touched();
-                // fpgaData(data) — raw FPGA data (after a cmd)
-                let data = self.pop() as u16;
-                ctx.lcd.send_data(data);
-            }
-
-            OP_CRITICAL => {
-                self.critical = true;
-            }
-            OP_SET_BRIGHTNESS => {
-                let percent = self.pop() as u8;
-                ctx.backlight.set_brightness(percent);
-                // Saved by the board, applied at the next start.
-                crate::settings::note_brightness(percent, ctx.systick.millis());
-            }
-            OP_BRIGHTNESS => {
-                self.push(ctx.backlight.brightness() as i32);
-            }
-
-            // --- User GPIO ---
-            OP_PIN_MODE => {
-                let (pin, mode) = self.pop2();
-                if !ctx.gpio.set_mode(pin, mode) {
-                    self.fail(fault::GPIO);
-                }
-            }
-            OP_PIN_WRITE => {
-                let (pin, value) = self.pop2();
-                if !ctx.gpio.write(pin, value) {
-                    self.fail(fault::GPIO);
-                }
-            }
-            OP_PIN_READ => {
-                let pin = self.pop();
-                match ctx.gpio.read(pin) {
-                    Some(level) => self.push(level),
-                    None => self.fail(fault::GPIO),
-                }
-            }
-
-            // --- User EEPROM ---
-            OP_EEPROM_SIZE => self.push(ctx.eeprom.size()),
-            OP_EEPROM_READ => {
-                let addr = self.pop();
-                let mut b = [0u8; 1];
-                if self.eeprom_io(ctx, addr, &mut b, false) {
-                    self.push(b[0] as i32);
-                } else {
-                    self.fail(fault::EEPROM);
-                }
-            }
-            OP_EEPROM_WRITE => {
-                let (addr, value) = self.pop2();
-                if !self.eeprom_io(ctx, addr, &mut [value as u8], true) {
-                    self.fail(fault::EEPROM);
-                }
-            }
-            OP_EEPROM_READ_ARR | OP_EEPROM_WRITE_ARR => {
-                let count = self.pop();
-                let (addr, arr_id) = self.pop2();
-                self.eeprom_array(ctx, op == OP_EEPROM_WRITE_ARR, addr, arr_id, count);
-            }
-
-            // --- Programs ---
-            OP_RUN_PROGRAM => {
-                let (str_id, arg) = self.pop2();
-                let name = ctx.objs.str_get(str_id as ObjPtr);
-                let found = name.len() <= crate::fs::NAME_LEN
-                    && ctx.fs_of(self.domain).is_some_and(|fs| {
-                        fs.find_kind(&ctx.flash, name, crate::fs::RES_PROGRAM).is_some()
-                    });
-                if found {
-                    // Ends everything at once: no instruction of this program
-                    // runs after this one.
-                    self.next_program = Some(ProgramRef::new(name, arg));
-                    self.state = VmState::Exit;
-                } else {
-                    self.push(0);
-                }
-            }
-            OP_PROGRAM_ARG => self.push(self.program.arg),
-            OP_TASK_SPAWN..=OP_TASK_FG => self.task_op(ctx, op),
-            OP_FLEX_LAYOUT => {
-                let bx = self.pop();
-                self.flex_layout(ctx, bx);
-                self.push(0);
-            }
-            disk::OP_DISK_OPEN..=disk::OP_FILE_READ_ARR => self.storage_op(ctx, op),
-            gesture_ops::OP_ON_GESTURE..=gesture_ops::OP_GESTURE_INFO => self.gesture_op(ctx, op),
-            OP_PROGRAM_NAME => {
-                let index = self.pop();
-                let mut buf = [0u8; crate::fs::NAME_LEN];
-                let len = if index < 0 {
-                    let own = self.program.name();
-                    buf[..own.len()].copy_from_slice(own);
-                    own.len()
-                } else {
-                    ctx.fs_of(self.domain)
-                        .and_then(|fs| {
-                            let n = index.min(u16::MAX as i32) as u16;
-                            fs.nth_name_by_kind(&ctx.flash, crate::fs::RES_PROGRAM, n, &mut buf)
-                        })
-                        .unwrap_or(0)
-                };
-                match ctx.objs.str_alloc(&buf[..len]) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::STR_ALLOC),
-                }
-            }
-
-            // --- Sound (RES_SOUND resources, streamed by runtime's audio pump) ---
-            OP_SOUND_PLAY => {
-                let (str_id, looping) = self.pop2();
-                let name = ctx.objs.str_get(str_id as ObjPtr);
-                let ok = match ctx.fs_of(self.domain).cloned() {
-                    Some(fs) => ctx.audio.play(&fs, &ctx.flash, name, looping != 0),
-                    None => false,
-                };
-                self.push(ok as i32);
-            }
-            OP_SOUND_STOP => ctx.audio.stop(),
-            OP_SOUND_VOLUME => {
-                let vol = self.pop().clamp(0, 100) as u8;
-                ctx.audio.set_volume(vol);
-                crate::settings::note_volume(vol, ctx.systick.millis());
-            }
-            OP_SOUND_PLAYING => self.push(ctx.audio.playing() as i32),
-
-            // --- Animation engine ---
-            OP_ANIMATE => {
-                // Pushed order: widget, prop, to, duration, ctrl, on_end.
-                let (ctrl, on_end) = self.pop2();
-                let (ctrl, on_end) = (ctrl as u8, on_end as u16);
-                let duration = self.pop() as u16;
-                let to = self.pop();
-                let (widget, prop) = self.pop2();
-                let (widget, prop) = (WidgetId(widget as ObjPtr), prop as u8);
-                let now = ctx.systick.millis();
-                flex::flush(ctx); // FLEX_AUTO: tween from the laid-out value
-                self.start_anim(ctx, widget, prop, to, duration, ctrl, on_end, now);
-            }
-            OP_STOP_ANIM => {
-                let widget = WidgetId(self.pop() as ObjPtr);
-                self.stop_anim(widget);
-            }
-            OP_STOP_ANIM_PROP => {
-                let (widget, prop) = self.pop2();
-                let (widget, prop) = (WidgetId(widget as ObjPtr), prop as u8);
-                self.stop_anim_prop(widget, prop);
-            }
-
-            // --- File ops (flash filesystem, read-only) ---
-            OP_FILE_OPEN => {
-                let str_id = self.pop() as ObjPtr;
-                let name = ctx.objs.str_get(str_id);
-                let result = self.file_open(ctx, name);
-                self.push(result);
-            }
-            OP_FILE_READ => {
-                let handle = self.pop();
-                if let Some(slot) = self.storage_slot(ctx, handle) {
-                    let mut b = [0u8; 1];
-                    let r = match ctx.storage.read(slot, &mut b) {
-                        Ok(1) => b[0] as i32,
-                        _ => FILE_EOF,
-                    };
-                    return self.push(r);
-                }
-                match self.file_slot_mut(handle) {
-                    Some(f) => {
-                        if f.pos >= f.size {
-                            self.push(FILE_EOF);
-                        } else {
-                            let addr = f.offset + f.pos;
-                            let mut buf = [0u8; 1];
-                            ctx.flash.read(addr, &mut buf);
-                            f.pos += 1;
-                            self.push(buf[0] as i32);
-                        }
-                    }
-                    None => self.fail(fault::BAD_FILE),
-                }
-            }
-            OP_FILE_SIZE => {
-                let handle = self.pop();
-                if let Some(slot) = self.storage_slot(ctx, handle) {
-                    let r = ctx.storage.size(slot).map_or_else(|e| e, |n| n as i32);
-                    return self.push(r);
-                }
-                match self.file_slot(handle) {
-                    Some(f) => self.push(f.size as i32),
-                    None => self.fail(fault::BAD_FILE),
-                }
-            }
-            OP_FILE_CLOSE => {
-                let handle = self.pop();
-                if let Some(slot) = self.storage_slot(ctx, handle) {
-                    ctx.storage.close(slot);
-                    return;
-                }
-                match self.file_slot_index(handle) {
-                    Some(idx) => self.open_files[idx] = None,
-                    None => self.fail(fault::BAD_FILE),
-                }
-            }
-            OP_FILE_SEEK => {
-                let (handle, pos) = self.pop2();
-                if let Some(slot) = self.storage_slot(ctx, handle) {
-                    let _ = ctx.storage.seek(slot, pos);
-                    return;
-                }
-                match self.file_slot_mut(handle) {
-                    Some(f) => f.pos = (pos.max(0) as u32).min(f.size),
-                    None => self.fail(fault::BAD_FILE),
-                }
-            }
-            OP_SHOW_MODAL => {
-                self.handle_show_modal(ctx);
-            }
-            OP_SET_DIALOG_RESULT => {
-                let result = self.pop();
-                if let Some(top) = self.modal_stack.last_mut() {
-                    if !top.has_result {
-                        top.result = result;
-                        top.has_result = true;
-                    }
-                }
-            }
-            OP_ARR_TO_STR => {
-                let (arr_id, len) = self.pop2();
-                let mut buf = [0u8; 256];
-                let take = match Self::find_array(ctx, arr_id) {
-                    Some(data) => {
-                        let take = if len < 0 {
-                            data.len()
-                        } else {
-                            (len as usize).min(data.len())
-                        };
-                        if take <= buf.len() {
-                            for i in 0..take {
-                                buf[i] = data[i] as u8;
-                            }
-                        }
-                        take
-                    }
-                    None => return self.fail(fault::BAD_ARRAY),
-                };
-                if take > buf.len() {
-                    self.fail(fault::BAD_OPERAND);
-                } else {
-                    match ctx.objs.str_alloc(&buf[..take]) {
-                        Some(id) => self.push(id as i32),
-                        None => self.fail(fault::STR_ALLOC),
-                    }
-                }
-            }
-
-            OP_SPRINTF => {
-                let argc = self.read_u8() as usize;
-                let mut args = [0i32; 8];
-                let actual = argc.min(8);
-                for i in (0..actual).rev() {
-                    args[i] = self.pop();
-                }
-                let fmt_id = self.pop() as ObjPtr;
-                // Copied: `sprintf` allocates in the pool the format lives in.
-                let fmt = ctx.objs.str_get(fmt_id).to_vec();
-                match strpool::sprintf(&mut ctx.objs, &fmt, &args[..actual]) {
-                    Some(id) => self.push(id as i32),
-                    None => self.fail(fault::STR_ALLOC),
-                }
-            }
-
-            OP_SYSCALL => {
-                let syscall_id = self.read_u8();
-                let argc = self.read_u8() as usize;
-                let actual = argc.min(MAX_SYSCALL_ARGS);
-                let mut args = [0i32; MAX_SYSCALL_ARGS];
-                for i in (0..actual).rev() {
-                    args[i] = self.pop();
-                }
-                // App syscalls (0x80..=0x8A) are the core's: `runApp` ends the task.
-                if matches!(syscall_id, crate::apps::SYS_APP_BOOT | crate::apps::SYS_APP_SET_BOOT) {
-                    let r = crate::apps::boot_syscall(
-                        syscall_id,
-                        &args[..actual],
-                        &mut ctx.objs,
-                        P::app_files(),
-                        P::saved_boot_app,
-                        P::set_boot_app,
-                    );
-                    match r {
-                        Some(v) => self.push(v),
-                        None => self.fail(fault::STR_ALLOC),
-                    }
-                    return;
-                }
-                if (crate::apps::SYS_APP_CURRENT..=crate::apps::SYS_APP_EXIT).contains(&syscall_id) {
-                    return self.app_call(ctx, syscall_id, &args[..actual]);
-                }
-                if (crate::apps::SYS_APP_COUNT..crate::apps::SYS_APP_CURRENT).contains(&syscall_id) {
-                    match crate::apps::syscall(syscall_id, &args[..actual], &mut ctx.objs, P::app_files()) {
-                        Some(crate::apps::Call::Value(v)) => self.push(v),
-                        Some(crate::apps::Call::Exit) => {
-                            self.next_program = None;
-                            self.state = VmState::Exit;
-                        }
-                        None => self.fail(fault::STR_ALLOC),
-                    }
-                    return;
-                }
-                match self.syscall_fn {
-                    Some(f) => match f(syscall_id, &args[..actual], &mut ctx.objs) {
-                        Some(v) => self.push(v),
-                        None => self.fail(fault::SYSCALL),
-                    },
-                    None => self.fail(fault::SYSCALL),
-                }
-            }
-
-            // --- Float32 (soft-float) ---
-            OP_ITOF => {
-                let i = self.pop();
-                self.push((i as f32).to_bits() as i32);
-            }
-            OP_FTOI => {
-                let bits = self.pop() as u32;
-                self.push(f32::from_bits(bits) as i32);
-            }
-            OP_FADD => {
-                let (a, b) = self.pop2_f32();
-                self.push((a + b).to_bits() as i32);
-            }
-            OP_FSUB => {
-                let (a, b) = self.pop2_f32();
-                self.push((a - b).to_bits() as i32);
-            }
-            OP_FMUL => {
-                let (a, b) = self.pop2_f32();
-                self.push((a * b).to_bits() as i32);
-            }
-            OP_FDIV => {
-                let (a, b) = self.pop2_f32();
-                self.push(if b != 0.0 { a / b } else { 0.0 }.to_bits() as i32);
-            }
-            OP_FNEG => {
-                let a = f32::from_bits(self.pop() as u32);
-                self.push((-a).to_bits() as i32);
-            }
-            OP_FEQ => {
-                let (a, b) = self.pop2_f32();
-                self.push(if a == b { 1 } else { 0 });
-            }
-            OP_FLT => {
-                let (a, b) = self.pop2_f32();
-                self.push(if a < b { 1 } else { 0 });
-            }
-            OP_FLE => {
-                let (a, b) = self.pop2_f32();
-                self.push(if a <= b { 1 } else { 0 });
-            }
-            OP_FGT => {
-                let (a, b) = self.pop2_f32();
-                self.push(if a > b { 1 } else { 0 });
-            }
-            OP_FGE => {
-                let (a, b) = self.pop2_f32();
-                self.push(if a >= b { 1 } else { 0 });
-            }
-            OP_FNE => {
-                let (a, b) = self.pop2_f32();
-                self.push(if a != b { 1 } else { 0 });
-            }
-
-            // --- Float math (trig / sqrt / rounding) ---
-            OP_FSIN => {
-                let v = f32::from_bits(self.pop() as u32);
-                self.push(libm::sinf(v).to_bits() as i32);
-            }
-            OP_FCOS => {
-                let v = f32::from_bits(self.pop() as u32);
-                self.push(libm::cosf(v).to_bits() as i32);
-            }
-            OP_FSQRT => {
-                let v = f32::from_bits(self.pop() as u32);
-                self.push(libm::sqrtf(v).to_bits() as i32);
-            }
-            OP_FABS => {
-                let v = f32::from_bits(self.pop() as u32);
-                self.push(libm::fabsf(v).to_bits() as i32);
-            }
-            OP_FATAN2 => {
-                let (y, x) = self.pop2_f32();
-                self.push(libm::atan2f(y, x).to_bits() as i32);
-            }
-            OP_FFLOOR => {
-                let v = f32::from_bits(self.pop() as u32);
-                self.push(libm::floorf(v).to_bits() as i32);
-            }
-            OP_FCEIL => {
-                let v = f32::from_bits(self.pop() as u32);
-                self.push(libm::ceilf(v).to_bits() as i32);
-            }
-
-            OP_JCMP | OP_JCMP_VI | OP_JCMP_VV | OP_BIN_I | OP_BIN_I32 | OP_BIN_V | OP_STORE_OP => {
-                self.exec_super(op, None, SLOT_ANY)
-            }
-            Q_FIRST..=Q_LAST => self.exec_quick(ctx, op),
-            OP_ADD_VI => {
-                let [raw, lo, hi] = self.fetch();
-                let imm = i16::from_le_bytes([lo, hi]) as i32;
-                if self.state != VmState::Error {
-                    let slot = self.resolve_slot(raw);
-                    let v = self.var_get(slot).wrapping_add(imm);
-                    self.var_set(slot, v);
-                }
-            }
-            OP_CALL_IMP => {
-                let i = self.read_u16() as usize;
-                match self.links.get(i).copied() {
-                    Some(target) if (self.call_sp as usize) < self.call_stack.len() => {
-                        self.call_stack[self.call_sp as usize] = CallFrame {
-                            ret_addr: self.pc | self.utag,
-                            frame_base: self.frame_base as u16,
-                            frame_size: self.frame_size,
-                        };
-                        self.call_sp += 1;
-                        self.frame_base += self.frame_size as u32;
-                        self.frame_size = 0;
-                        self.goto(target);
-                    }
-                    Some(_) => self.fail(fault::CALL_OVERFLOW),
-                    None => self.fail(fault::BAD_OPERAND),
-                }
-            }
-            OP_FN_REF => {
-                let id = self.read_u16();
-                self.push(((self.unit as i32) << 12) | (id & 0x0FFF) as i32);
-            }
-            OP_FRAME_A => {
-                // FRAME n; STORE nargs-1; ..; STORE 0 (the arguments, last on top)
-                let [count, nargs] = self.fetch();
-                if self.frame_base + count as u32 > self.var_slots {
-                    self.fail(fault::VARS_FULL);
-                } else {
-                    self.frame_size = count;
-                    let base = self.frame_base;
-                    for i in (0..nargs as u32).rev() {
-                        let v = self.pop();
-                        self.var_set(base + i, v);
-                    }
-                }
-            }
-            OP_ARR_LOAD_V => {
-                let raw = self.read_u8();
-                let idx = self.pop();
-                if self.state != VmState::Error {
-                    let arr_id = self.var_get(self.resolve_slot(raw));
-                    self.arr_load(ctx, arr_id, idx);
-                }
-            }
-
-            _ => self.fail(fault::BAD_OPCODE),
-        }
-    }
-
-    /// Superinstruction tail: jump to `target` if `a <cond> b`.
-    #[inline(always)]
-    fn jump_if(&mut self, cond: u8, a: i32, b: i32, target: CodeAddr) {
-        if self.state == VmState::Error {
-            return;
-        }
-        match int_cmp(cond, a, b) {
-            Some(true) => self.pc = target,
-            Some(false) => {}
-            None => self.fail(fault::BAD_OPCODE),
-        }
-    }
-
-    /// Superinstruction tail: top of stack = top <op> b, in place.
-    #[inline(always)]
-    fn top_binop(&mut self, op: u8, b: i32) {
-        if self.state == VmState::Error {
-            return;
-        }
-        if self.sp <= self.sp_floor {
-            self.fail(fault::STACK_UNDERFLOW);
-            return;
-        }
-        let i = (self.sp - 1) as usize;
-        // SAFETY: sp <= stack.len() (see pop2_raw) and sp > sp_floor >= 0.
-        let top = unsafe { self.stack.get_unchecked_mut(i) };
-        match int_binop(op, *top, b) {
-            Some(v) => *top = v,
-            None => self.fail(fault::BAD_OPCODE),
-        }
-    }
-
-    /// A quickened form (`QUICK`; pc past its opcode): its instruction with
-    /// the form's cond / op and slot kind.
-    #[inline(never)]
-    fn exec_quick<P: Platform>(&mut self, ctx: &Ctx<P>, q: u8) {
-        let (op, sub, kind) = QUICK[(q - Q_FIRST) as usize];
-        match op {
-            // As the plain LOAD / STORE / ADD_VI in `exec_one`.
-            OP_LOAD => {
-                let raw = force_slot(self.read_u8(), kind);
-                let slot = self.resolve_slot(raw);
-                let v = self.var_get(slot);
-                self.push(v);
-            }
-            OP_STORE => {
-                let raw = force_slot(self.read_u8(), kind);
-                let slot = self.resolve_slot(raw);
-                let v = self.pop();
-                self.var_set(slot, v);
-            }
-            OP_ADD_VI => {
-                let [raw, lo, hi] = self.fetch();
-                let imm = i16::from_le_bytes([lo, hi]) as i32;
-                if self.state != VmState::Error {
-                    let slot = self.resolve_slot(force_slot(raw, kind));
-                    let v = self.var_get(slot).wrapping_add(imm);
-                    self.var_set(slot, v);
-                }
-            }
-            OP_ARR_LOAD_V => {
-                let raw = force_slot(self.read_u8(), kind);
-                let idx = self.pop();
-                if self.state != VmState::Error {
-                    let arr_id = self.var_get(self.resolve_slot(raw));
-                    self.arr_load(ctx, arr_id, idx);
-                }
-            }
-            _ => self.exec_super(op, Some(sub), kind),
-        }
-    }
-
-    /// A superinstruction (pc past its opcode), its cond / op operand
-    /// replaced by `sub` when given (a quickened form, `QUICK`: the operand
-    /// byte is still read, then ignored).
-    #[inline(always)]
-    fn exec_super(&mut self, op: u8, sub: Option<u8>, kind: u8) {
-        match op {
-            OP_JCMP => {
-                let cond = sub.unwrap_or(self.read_u8());
-                let target = self.read_addr();
-                let (a, b) = self.pop2();
-                self.jump_if(cond, a, b, target);
-            }
-            OP_JCMP_VI => {
-                let [cond, raw, lo, hi] = self.fetch();
-                let imm = i16::from_le_bytes([lo, hi]) as i32;
-                let target = self.read_addr();
-                let a = self.var_get(self.resolve_slot(force_slot(raw, kind)));
-                self.jump_if(sub.unwrap_or(cond), a, imm, target);
-            }
-            OP_JCMP_VV => {
-                let [cond, ra, rb] = self.fetch();
-                let target = self.read_addr();
-                let a = self.var_get(self.resolve_slot(ra));
-                let b = self.var_get(self.resolve_slot(rb));
-                self.jump_if(sub.unwrap_or(cond), a, b, target);
-            }
-            OP_BIN_I => {
-                let [op, lo, hi] = self.fetch();
-                self.top_binop(sub.unwrap_or(op), i16::from_le_bytes([lo, hi]) as i32);
-            }
-            OP_BIN_I32 => {
-                let [op, a, b, c, d] = self.fetch();
-                self.top_binop(sub.unwrap_or(op), i32::from_le_bytes([a, b, c, d]));
-            }
-            OP_BIN_V => {
-                let [op, raw] = self.fetch();
-                let b = self.var_get(self.resolve_slot(force_slot(raw, kind)));
-                self.top_binop(sub.unwrap_or(op), b);
-            }
-            _ => {
-                // OP_STORE_OP
-                let [op, raw] = self.fetch();
-                let b = self.pop();
-                if self.state != VmState::Error {
-                    let slot = self.resolve_slot(force_slot(raw, kind));
-                    match int_binop(sub.unwrap_or(op), self.var_get(slot), b) {
-                        Some(v) => self.var_set(slot, v),
-                        None => self.fail(fault::BAD_OPCODE),
-                    }
-                }
-            }
-        }
+        tc::run(self, ctx, 1, 0, true);
     }
 
     /// The `multi_program` task opcodes (0xD4..=0xDA).
@@ -3439,14 +2206,6 @@ impl Vm {
         } else {
             self.fail(fault::STACK_UNDERFLOW);
             StackPair { a: 0, b: 0 }
-        }
-    }
-
-    fn peek(&self) -> i32 {
-        if self.sp > self.sp_floor {
-            self.stack[(self.sp - 1) as usize]
-        } else {
-            0
         }
     }
 
@@ -4214,16 +2973,6 @@ impl Vm {
             return None;
         }
         ctx.objs.arr(arr_id as ObjPtr)
-    }
-
-    fn arr_load<P: Platform>(&mut self, ctx: &Ctx<P>, arr_id: i32, idx: i32) {
-        match Self::find_array(ctx, arr_id) {
-            Some(arr) => match arr.get(idx as usize) {
-                Some(&v) if idx >= 0 => self.push(v),
-                _ => self.fail(fault::ARRAY_INDEX),
-            },
-            None => self.fail(fault::BAD_ARRAY),
-        }
     }
 
     fn arr_store<P: Platform>(&mut self, ctx: &mut Ctx<P>, arr_id: i32, idx: i32, val: i32) {
@@ -5245,14 +3994,35 @@ mod anim_tests {
         vm
     }
 
-    /// Threaded dispatch (`tc::run`) against the `exec_one` loop on random
-    /// programs: the hot opcodes with random operands, slow ones (calls,
-    /// returns, syscalls, yields, halts), jumps in and out of the
-    /// code, cut-off instructions, each run with a few budgets. Same state,
-    /// stack, variables, pc and instruction count; on a fault the same fault
-    /// and fault pc (CODE_OOB not compared, see `tc`'s docs).
+    /// `tick`'s burst without `tc::run`'s budget: one `step` at a time, the
+    /// budget counted here (a critical section runs past it).
+    fn burst_steps<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, mut budget: u32) -> u64 {
+        let mut n: u64 = 0;
+        loop {
+            vm.step(ctx);
+            n += 1;
+            if vm.state != VmState::Running {
+                break;
+            }
+            if vm.critical {
+                continue;
+            }
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+        }
+        n
+    }
+
+    /// A burst (`tc::run`) against single steps on random programs: the
+    /// hot opcodes with random operands, out-of-line ones (calls, returns,
+    /// syscalls, yields, halts), jumps in and out of the code, cut-off
+    /// instructions, each run with a few budgets. Same state, stack,
+    /// variables, pc and instruction count; on a fault the same fault and
+    /// fault pc (CODE_OOB not compared, see `tc`'s docs).
     #[test]
-    fn threaded_dispatch_matches_exec_one() {
+    fn bursts_match_single_steps() {
         const OPS: &[(u8, usize)] = &[
             (OP_POP, 0), (OP_DUP, 0), (OP_SWAP, 0), (OP_ADD, 0), (OP_SUB, 0), (OP_MUL, 0),
             (OP_DIV, 0), (OP_MOD, 0), (OP_NEG, 0), (OP_AND, 0), (OP_OR, 0), (OP_NOT, 0),
@@ -5366,8 +4136,8 @@ mod anim_tests {
                     if a.state != VmState::Running {
                         break;
                     }
-                    let na = a.burst_ref(&mut ca, budget);
-                    let nb = tc::run(&mut b, &mut cb, budget) as u64;
+                    let na = burst_steps(&mut a, &mut ca, budget);
+                    let nb = tc::run(&mut b, &mut cb, budget, 0, false) as u64;
                     let what = alloc::format!("program {prog} budget {budget}: {code:02x?}");
                     if a.state == VmState::Error && a.fault == fault::CODE_OOB {
                         // Perhaps an instruction cut off by the end of the code:
@@ -5407,8 +4177,8 @@ mod anim_tests {
             a.state = VmState::Running;
             b.state = VmState::Running;
             loop {
-                let na = a.burst_ref(&mut ca, budget);
-                let nb = tc::run(&mut b, &mut cb, budget) as u64;
+                let na = burst_steps(&mut a, &mut ca, budget);
+                let nb = tc::run(&mut b, &mut cb, budget, 0, false) as u64;
                 assert_eq!((na, a.pc, a.var_get(0)), (nb, b.pc, b.var_get(0)), "budget {budget}");
                 assert!(a.state == b.state);
                 match a.state {
@@ -5426,8 +4196,8 @@ mod anim_tests {
     }
 
     /// The app syscalls are the core's: threaded dispatch hands them to
-    /// `exec_one` instead of the platform's handler (which knows none of
-    /// them), so `appCount()` in `loop()` doesn't fault.
+    /// `Vm::op_syscall` instead of the platform's handler (which knows none
+    /// of them), so `appCount()` in `loop()` doesn't fault.
     #[test]
     fn threaded_dispatch_answers_app_syscalls() {
         fn sys(_: u8, _: &[i32], _: &mut ObjPool) -> Option<i32> {
@@ -5445,7 +4215,7 @@ mod anim_tests {
         vm.global_count = 2;
         vm.frame_base = 2;
         vm.state = VmState::Running;
-        tc::run(&mut vm, &mut ctx, 100);
+        tc::run(&mut vm, &mut ctx, 100, 0, false);
         assert!(vm.state == VmState::Halted, "fault {}", vm.fault);
         // The installed-app list is cached process-wide (other tests install).
         assert!(vm.var_get(0) >= 0 && vm.var_get(1) == -1);
@@ -6234,10 +5004,10 @@ mod anim_tests {
     }
 
 
-    /// Each quickened form (`QUICK`) against its instruction, through
-    /// `exec_one` and the threaded dispatch, with a junk cond / op operand
-    /// and the slot operand's kind bit flipped (both ignored by the form);
-    /// the threaded dispatch rewrites the instruction to it.
+    /// Each quickened form (`QUICK`) against its instruction, in single
+    /// steps and in bursts, with a junk cond / op operand and the slot
+    /// operand's kind bit flipped (both ignored by the form); running the
+    /// instruction rewrites it to the form.
     #[test]
     fn quickened_superops_match() {
         const VALS: [i32; 6] = [0, 1, -1, 7, -13, i32::MIN];
@@ -6353,7 +5123,7 @@ mod anim_tests {
         fn stepped(code: &[u8]) -> Vm {
             let (mut vm, mut ctx) = arr_vm(code);
             while vm.state == VmState::Running {
-                vm.exec_one(&mut ctx);
+                vm.step(&mut ctx);
             }
             vm
         }
@@ -6378,7 +5148,7 @@ mod anim_tests {
                         quick[k] ^= 0x80;
                     }
                     let want = top(&stepped(&plain));
-                    assert_eq!(top(&stepped(&quick)), want, "exec_one, {what}");
+                    assert_eq!(top(&stepped(&quick)), want, "stepped, {what}");
                     assert_eq!(top(&threaded(&quick)), want, "threaded, {what}");
                     let vm = threaded(&plain);
                     assert_eq!(top(&vm), want, "threaded plain, {what}");
@@ -6428,7 +5198,7 @@ mod anim_tests {
                     if threaded {
                         vm.tick(&mut ctx, 1000);
                     } else {
-                        vm.exec_one(&mut ctx);
+                        vm.step(&mut ctx);
                     }
                 }
                 assert!(vm.state == VmState::Halted, "{code:x?}");

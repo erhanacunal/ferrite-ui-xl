@@ -1,28 +1,36 @@
-//! Threaded dispatch of the hot opcodes (`explicit_tail_calls`).
+//! The VM's execution: threaded dispatch (`explicit_tail_calls`).
 //!
-//! `Vm::tick`'s burst runs here. Each handled opcode is a function that ends
+//! Every instruction runs here (`run`: `Vm::tick`'s bursts, callbacks,
+//! `Vm::step`). Each opcode has a handler, a function that ends
 //! by tail-calling the next opcode's handler (`become`): no shared dispatch
 //! point, so each handler's indirect branch is predicted on its own, and the
 //! code pointer, the eval-stack pointer and the budget left travel in
 //! argument registers (r1..r3 on ARM) instead of `Vm`'s `pc` / `sp` fields.
 //! They are written back to `Vm` only when the burst leaves this loop.
 //!
-//! Opcodes without a handler here (the tables' default, `slow`) write the
-//! state back, run the instruction through `Vm::exec_one` (the reference
-//! implementation, which every other path still uses) and continue. The
-//! burst ends when the VM leaves `Running` or the budget is spent, as in
-//! the `exec_one` loop (a critical section continues one instruction at a
-//! time past it, `budget_out`).
+//! The hot instructions are handlers here. The others (widgets, strings,
+//! drawing, storage, calls into the platform...) are `Vm` methods in
+//! `ops.rs`, run out of line (`cold!`): the handler writes `pc` / `sp` back,
+//! calls the method, which works on the VM's fields, and resumes from them
+//! (`resume`). RET and SYSCALL have both: the handler runs the common case
+//! and falls back to the method. An undefined opcode faults BAD_OPCODE.
+//!
+//! A burst ends when the VM leaves `Running`, the budget is spent (a
+//! critical section continues one instruction at a time past it,
+//! `budget_out`) or, running a callback, when it returns (`Vm::tc_floor`).
+//! `Vm::step` runs one instruction. A burst may start inside another (an
+//! out-of-line instruction running a callback: `render()` -> `on_paint`);
+//! `run` saves and restores the outer one's state.
 //!
 //! Handlers are generic over the platform `P` (one table per platform,
 //! `Table::<P>::T`; a firmware has one): the burst's `Ctx<P>` is at hand
-//! (`ctx`), so a handler may reach any of it, as `exec_one` does.
+//! (`ctx`).
 //!
 //! Quickening: an instruction with a quickened form (`QUICK`: a
 //! superinstruction by its cond / op and slot kind, LOAD / STORE / ADD_VI /
 //! ARR_LOAD_V by their slot's kind) rewrites its opcode to that form the first time it runs here
 //! (`quicken!`); the form's handler has the operation / slot kind built in,
-//! with no dispatch on the operand (`q_*`). `exec_one` runs both the same.
+//! with no dispatch on the operand (`q_*`).
 //!
 //! Cold paths (faults) are tail calls with the handler's own four arguments
 //! (the fault code a const parameter): no argument goes on the stack, so the
@@ -30,12 +38,12 @@
 //!
 //! Code reads are unchecked: `VmCode` keeps `CODE_PAD` bytes of an undefined
 //! opcode after the code, so an instruction cut off by the end still reads
-//! inside the buffer and the next dispatch lands on `slow`, whose
-//! `exec_one` faults CODE_OOB. Jump and call targets are checked. Such an
-//! instruction (only in malformed bytecode) runs with operands from the pad
-//! (or faults on the stack first), and the fault pc is past the end rather
-//! than at it. An opcode a handler here runs is always inside the code (the
-//! pad's opcodes go to `slow`), so `quicken!` writes inside it.
+//! inside the buffer and the next dispatch lands on `bad_op`, which faults
+//! CODE_OOB there. Jump and call targets are checked. Such an instruction
+//! (only in malformed bytecode) runs with operands from the pad (or faults
+//! on the stack first), and the fault pc is past the end rather than at it.
+//! An opcode a handler here runs is always inside the code (the pad's
+//! opcodes go to `bad_op`), so `quicken!` writes inside it.
 
 use super::*;
 
@@ -61,7 +69,7 @@ macro_rules! jump {
         let t: usize = $t;
         let sp: *mut i32 = $sp;
         if t >= $vm.code.len() {
-            return jump_out::<P>($vm, t, sp, $n);
+            return jump_out($vm, t, sp, $n);
         }
         next!($vm, unsafe { $vm.code.ptr().add(t) }, sp, $n)
     }};
@@ -123,30 +131,40 @@ fn ctx<'a, P: Platform>(vm: &Vm) -> &'a mut Ctx<P> {
     unsafe { &mut *(vm.tc_ctx as *mut Ctx<P>) }
 }
 
-/// The instruction at `vm.pc` through `exec_one` (inlined here once).
-#[inline(never)]
-fn exec_slow<P: Platform>(vm: &mut Vm) {
-    vm.exec_one(ctx::<P>(vm));
-}
-
-/// Runs `vm` (state `Running`, `budget` >= 1) until it leaves `Running` or
-/// `budget` instructions ran (more in a critical section); the count run.
-pub(super) fn run<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, budget: u32) -> u32 {
-    let cp = ctx as *mut Ctx<P>;
-    vm.tc_ctx = cp as usize;
+/// Runs `vm` (state `Running`, `budget` >= 1) until it leaves `Running`,
+/// `budget` instructions ran (more in a critical section, unless `one`: then
+/// exactly one) or the running callbacks drop below `floor` (0: never); the
+/// count run.
+pub(super) fn run<P: Platform>(vm: &mut Vm, ctx: &mut Ctx<P>, budget: u32, floor: usize, one: bool) -> u32 {
+    // A burst inside another (from an out-of-line instruction): keep the
+    // outer one's state (its stack bounds are refreshed when it resumes).
+    let outer = (vm.tc_ctx, vm.tc_limit, vm.tc_base, vm.tc_n, vm.tc_floor, vm.tc_one);
+    vm.tc_ctx = ctx as *mut Ctx<P> as usize;
     vm.tc_limit = budget;
     vm.tc_base = 0;
     vm.tc_n = 0;
-    if vm.pc as usize >= vm.code.len() {
-        vm.exec_one(ctx); // CODE_OOB
-        return 1;
-    }
-    refresh(vm);
-    // SAFETY: pc < len; sp <= stack.len() (see `Vm::pop2_raw`).
-    let (pc, sp) = unsafe { (vm.code.ptr().add(vm.pc as usize), vm.stack.as_mut_ptr().add(vm.sp as usize)) };
-    let op = unsafe { *pc } as usize;
-    tab::<P>()[op](vm, unsafe { pc.add(1) }, sp, budget);
-    vm.tc_n
+    vm.tc_floor = floor;
+    vm.tc_one = one;
+    let n = if (vm.pc as usize) < vm.code.len() {
+        refresh(vm);
+        // SAFETY: pc < len; sp <= stack.len() (see `Vm::pop2_raw`).
+        let (pc, sp) = unsafe { (vm.code.ptr().add(vm.pc as usize), vm.stack.as_mut_ptr().add(vm.sp as usize)) };
+        let op = unsafe { *pc } as usize;
+        tab::<P>()[op](vm, unsafe { pc.add(1) }, sp, budget);
+        vm.tc_n
+    } else {
+        code_oob(vm);
+        1
+    };
+    (vm.tc_ctx, vm.tc_limit, vm.tc_base, vm.tc_n, vm.tc_floor, vm.tc_one) = outer;
+    n
+}
+
+/// The instruction at `vm.pc` is past the end of the code: CODE_OOB there.
+#[cold]
+fn code_oob(vm: &mut Vm) {
+    vm.op_pc = vm.pc;
+    vm.fail(fault::CODE_OOB);
 }
 
 /// Instructions run when the one with budget `n` left is the last.
@@ -156,12 +174,12 @@ fn ran(vm: &Vm, n: u32) -> u32 {
 }
 
 /// The budget is spent and `pc` is the next instruction: leave, unless in a
-/// critical section, which goes on one instruction at a time (the `exec_one`
-/// loop doesn't count its instructions against the budget).
+/// critical section, which goes on one instruction at a time (its
+/// instructions don't count against the budget; `Vm::step` runs just one).
 #[cold]
 #[inline(never)]
 fn budget_out<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    if vm.critical {
+    if vm.critical && !vm.tc_one {
         vm.tc_base = ran(vm, n);
         vm.tc_limit = 1;
         // SAFETY: as in `next!`.
@@ -173,8 +191,8 @@ fn budget_out<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     vm.tc_n = ran(vm, n);
 }
 
-/// Stack bounds for the checks (`sp_floor` and the stack may change in a
-/// slow instruction).
+/// Stack bounds for the checks (`sp_floor` and the stack may change in an
+/// out-of-line instruction).
 #[inline(always)]
 fn refresh(vm: &mut Vm) {
     let base = vm.stack.as_mut_ptr() as usize;
@@ -205,37 +223,81 @@ fn fail_at<const CODE: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     vm.fail(CODE);
 }
 
-/// A jump or call to a target outside the code: the checked path faults it.
+/// `pc` / `sp` are `Vm`'s (out of the burst) and `pc` is past the end of the
+/// code: leave, faulting CODE_OOB as the next instruction if the burst goes
+/// on (budget left, or a critical section).
 #[cold]
 #[inline(never)]
-fn jump_out<P: Platform>(vm: &mut Vm, target: usize, sp: *mut i32, n: u32) {
-    vm.pc = target as CodeAddr;
-    save_sp(vm, sp);
+fn out_of_code(vm: &mut Vm, n: u32) {
     vm.tc_n = ran(vm, n);
-    if n > 1 || vm.critical {
-        exec_slow::<P>(vm); // CODE_OOB, as the next instruction
+    if n > 1 || (vm.critical && !vm.tc_one) {
+        code_oob(vm);
         vm.tc_n += 1;
     }
 }
 
-/// Any opcode without a handler here: through `exec_one`.
+/// A jump or call to a target outside the code.
+#[cold]
 #[inline(never)]
-fn slow<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
-    vm.pc = off(vm, pc) - 1; // at the opcode: exec_one reads it again
+fn jump_out(vm: &mut Vm, target: usize, sp: *mut i32, n: u32) {
+    vm.pc = target as CodeAddr;
     save_sp(vm, sp);
-    exec_slow::<P>(vm);
-    if vm.state != VmState::Running {
+    out_of_code(vm, n);
+}
+
+/// An undefined opcode (BAD_OPCODE), or the pad past the end of the code
+/// (CODE_OOB there, see the module docs).
+#[cold]
+#[inline(never)]
+fn bad_op(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+    let at = off(vm, pc) - 1;
+    if at as usize >= vm.code.len() {
+        vm.op_pc = at;
+        vm.pc = at;
+        save_sp(vm, sp);
+        vm.tc_n = ran(vm, n);
+        vm.fail(fault::CODE_OOB);
+        return;
+    }
+    become fail_at::<{ fault::BAD_OPCODE }>(vm, pc, sp, n)
+}
+
+/// An instruction run out of line (`ops.rs`): `$e` with the instruction's
+/// state in `Vm` (`op_pc` at the opcode, `pc` past it, `sp`), `$ctx` the
+/// burst's `Ctx`, `$op` the opcode; then on from `Vm`'s state.
+macro_rules! cold {
+    ($name:ident, |$vm:ident, $ctx:ident, $op:ident| $e:expr) => {
+        #[inline(never)]
+        #[allow(unused_variables)]
+        fn $name<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
+            let at = off(vm, pc) - 1;
+            vm.op_pc = at;
+            vm.pc = at + 1;
+            save_sp(vm, sp);
+            {
+                // SAFETY: the opcode is inside the code (module docs).
+                let $op = unsafe { *pc.sub(1) };
+                let $ctx = ctx::<P>(vm);
+                let $vm = &mut *vm;
+                $e;
+            }
+            become resume::<P>(vm, pc, sp, n)
+        }
+    };
+}
+
+/// After an out-of-line instruction: on from `Vm`'s `pc` / `sp` (`_pc`,
+/// `_sp`: the handler's, unused; there for `become`), unless it left
+/// `Running`, ended the callback the burst runs (`tc_floor`) or the code.
+#[inline(never)]
+fn resume<P: Platform>(vm: &mut Vm, _pc: *const u8, _sp: *mut i32, n: u32) {
+    if vm.state != VmState::Running || vm.cb_frames.len() < vm.tc_floor {
         vm.tc_n = ran(vm, n);
         return;
     }
     if vm.pc as usize >= vm.code.len() {
-        // Out of the code (a RET, say): leave; the checked path faults it.
-        vm.tc_n = ran(vm, n);
-        if n > 1 || vm.critical {
-            exec_slow::<P>(vm); // CODE_OOB, as the next instruction
-            vm.tc_n += 1;
-        }
-        return;
+        // Out of the code (a RET, say).
+        return out_of_code(vm, n);
     }
     refresh(vm);
     // SAFETY: as in `run`.
@@ -497,18 +559,18 @@ fn op_call<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 /// A plain return: no callback or modal dialog running (their returns need
-/// `exec_one`'s bookkeeping), a frame to pop.
+/// `Vm::op_ret`'s bookkeeping), a frame to pop.
 fn op_ret<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let depth = vm.call_sp as usize;
     if depth == 0 || !vm.cb_frames.is_empty() || !vm.modal_stack.is_empty() {
-        become slow::<P>(vm, pc, sp, n)
+        become out_ret::<P>(vm, pc, sp, n)
     }
-    // SAFETY: 0 < depth <= call_stack.len() (op_call / exec_one check).
+    // SAFETY: 0 < depth <= call_stack.len() (the calls check).
     let f = unsafe { *vm.call_stack.get_unchecked(depth - 1) };
-    // A return into another unit (a library's caller): `exec_one` switches.
+    // A return into another unit (a library's caller): `Vm::op_ret` switches.
     let ret = f.ret_addr ^ vm.utag;
     if ret >> 24 != 0 {
-        become slow::<P>(vm, pc, sp, n)
+        become out_ret::<P>(vm, pc, sp, n)
     }
     vm.call_sp = (depth - 1) as u8;
     vm.frame_base = f.frame_base as u32;
@@ -517,20 +579,20 @@ fn op_ret<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
 }
 
 /// SYSCALL id argc: the platform's handler on the top `argc` values (fewer
-/// on the stack, or no handler: `exec_one`, which faults). The app syscalls
-/// (`SYS_APP_COUNT..=SYS_APP_SET_BOOT`) are the core's, not the platform's:
-/// `exec_one` answers them.
+/// on the stack, or no handler: `Vm::op_syscall`, which faults). The app
+/// syscalls (`SYS_APP_COUNT..=SYS_APP_SET_BOOT`) are the core's, not the
+/// platform's: `Vm::op_syscall` answers them.
 fn op_syscall<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
     let Some(f) = vm.syscall_fn else {
-        become slow::<P>(vm, pc, sp, n)
+        become out_syscall::<P>(vm, pc, sp, n)
     };
     let (id, argc) = unsafe { (*pc, *pc.add(1) as usize) };
     if (crate::apps::SYS_APP_COUNT..=crate::apps::SYS_APP_SET_BOOT).contains(&id) {
-        become slow::<P>(vm, pc, sp, n)
+        become out_syscall::<P>(vm, pc, sp, n)
     }
     let k = argc.min(MAX_SYSCALL_ARGS);
     if (sp as usize) < vm.tc_lo + 4 * k {
-        become slow::<P>(vm, pc, sp, n)
+        become out_syscall::<P>(vm, pc, sp, n)
     }
     let mut args = [0i32; MAX_SYSCALL_ARGS];
     // SAFETY: k values on the stack (checked); `args` holds k.
@@ -785,7 +847,7 @@ fn q_add_vi_l<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut i32
 
 /// `*$res` = element `$idx` of the array `$id`, the stack ending past it
 /// (ARR_LOAD, ARR_LOAD_V); a fault (BAD_ARRAY / ARRAY_INDEX) with the
-/// operands popped (the stack ending at `$res`), as `exec_one`.
+/// operands popped (the stack ending at `$res`).
 macro_rules! arr_load {
     ($vm:ident, $pc:ident, $res:ident, $n:ident, $id:expr, $idx:expr, $after:expr) => {{
         let (id, idx): (i32, i32) = ($id, $idx);
@@ -830,6 +892,112 @@ fn q_arr_load_v_g<P: Platform, const C: u8>(vm: &mut Vm, pc: *const u8, sp: *mut
     arr_load!(vm, pc, res, n, vm.var_get(global(vm, unsafe { *pc })), unsafe { *res }, unsafe { pc.add(1) })
 }
 
+// --- The instructions run out of line (`ops.rs`) ---
+
+cold!(out_halt, |vm, ctx, op| vm.op_halt());
+cold!(out_ret, |vm, ctx, op| vm.op_ret(ctx));
+cold!(out_yield, |vm, ctx, op| vm.op_yield());
+cold!(out_w_dirty, |vm, ctx, op| vm.op_w_dirty(ctx));
+cold!(out_w_render, |vm, ctx, op| vm.op_w_render(ctx));
+cold!(out_arr_store, |vm, ctx, op| vm.op_arr_store(ctx));
+cold!(out_arr_len, |vm, ctx, op| vm.op_arr_len(ctx));
+cold!(out_w_alloc, |vm, ctx, op| vm.op_w_alloc(ctx));
+cold!(out_w_alltar, |vm, ctx, op| vm.op_w_alltar(ctx));
+cold!(out_arr_free, |vm, ctx, op| vm.op_arr_free(ctx));
+cold!(out_w_target, |vm, ctx, op| vm.op_w_target(ctx));
+cold!(out_w_target_s, |vm, ctx, op| vm.op_w_target_s(ctx));
+cold!(out_w_set, |vm, ctx, op| vm.op_w_set(ctx));
+cold!(out_w_get, |vm, ctx, op| vm.op_w_get(ctx));
+cold!(out_w_parent, |vm, ctx, op| vm.op_w_parent(ctx));
+cold!(out_w_parent_s, |vm, ctx, op| vm.op_w_parent_s(ctx));
+cold!(out_w_load, |vm, ctx, op| vm.op_w_load(ctx));
+cold!(out_w_setall, |vm, ctx, op| vm.op_w_setall(ctx));
+cold!(out_w_set_len, |vm, ctx, op| vm.op_w_set_len(ctx));
+cold!(out_arr_alloc, |vm, ctx, op| vm.op_arr_alloc(ctx));
+cold!(out_arr_alloc_s, |vm, ctx, op| vm.op_arr_alloc_s(ctx));
+cold!(out_arr_init, |vm, ctx, op| vm.op_arr_init(ctx));
+cold!(out_f_read, |vm, ctx, op| vm.op_f_read(ctx));
+cold!(out_f_write, |vm, ctx, op| vm.op_f_write(ctx));
+cold!(out_draw, |vm, ctx, op| vm.op_draw(ctx, op));
+cold!(out_delay, |vm, ctx, op| vm.op_delay(ctx));
+cold!(out_str_lit, |vm, ctx, op| vm.op_str_lit(ctx));
+cold!(out_itos, |vm, ctx, op| vm.op_itos(ctx));
+cold!(out_ftos, |vm, ctx, op| vm.op_ftos(ctx));
+cold!(out_concat, |vm, ctx, op| vm.op_concat(ctx));
+cold!(out_parse_int, |vm, ctx, op| vm.op_parse_int(ctx));
+cold!(out_parse_float, |vm, ctx, op| vm.op_parse_float(ctx));
+cold!(out_str_len, |vm, ctx, op| vm.op_str_len(ctx));
+cold!(out_str_byte, |vm, ctx, op| vm.op_str_byte(ctx));
+cold!(out_str_cmp, |vm, ctx, op| vm.op_str_cmp(ctx));
+cold!(out_set_text, |vm, ctx, op| vm.op_set_text(ctx));
+cold!(out_str_clear, |vm, ctx, op| vm.op_str_clear(ctx));
+cold!(out_str_free, |vm, ctx, op| vm.op_str_free(ctx));
+cold!(out_begin_frame, |vm, ctx, op| vm.op_begin_frame(ctx));
+cold!(out_end_frame, |vm, ctx, op| vm.op_end_frame(ctx));
+cold!(out_send_usart, |vm, ctx, op| vm.op_send_usart(ctx));
+cold!(out_send_usart_str, |vm, ctx, op| vm.op_send_usart_str(ctx));
+cold!(out_rtc_read, |vm, ctx, op| vm.op_rtc_read(ctx));
+cold!(out_rtc_write, |vm, ctx, op| vm.op_rtc_write(ctx));
+cold!(out_millis, |vm, ctx, op| vm.op_millis(ctx));
+cold!(out_fpga_cmd, |vm, ctx, op| vm.op_fpga_cmd(ctx));
+cold!(out_fpga_dat, |vm, ctx, op| vm.op_fpga_dat(ctx));
+cold!(out_critical, |vm, ctx, op| vm.op_critical());
+cold!(out_set_brightness, |vm, ctx, op| vm.op_set_brightness(ctx));
+cold!(out_brightness, |vm, ctx, op| vm.op_brightness(ctx));
+cold!(out_pin_mode, |vm, ctx, op| vm.op_pin_mode(ctx));
+cold!(out_pin_write, |vm, ctx, op| vm.op_pin_write(ctx));
+cold!(out_pin_read, |vm, ctx, op| vm.op_pin_read(ctx));
+cold!(out_eeprom_size, |vm, ctx, op| vm.op_eeprom_size(ctx));
+cold!(out_eeprom_read, |vm, ctx, op| vm.op_eeprom_read(ctx));
+cold!(out_eeprom_write, |vm, ctx, op| vm.op_eeprom_write(ctx));
+cold!(out_eeprom_array, |vm, ctx, op| vm.op_eeprom_array(ctx, op));
+cold!(out_run_program, |vm, ctx, op| vm.op_run_program(ctx));
+cold!(out_program_arg, |vm, ctx, op| vm.op_program_arg());
+cold!(out_task, |vm, ctx, op| vm.op_task(ctx, op));
+cold!(out_flex_layout, |vm, ctx, op| vm.op_flex_layout(ctx));
+cold!(out_disk, |vm, ctx, op| vm.op_disk(ctx, op));
+cold!(out_gesture, |vm, ctx, op| vm.op_gesture(ctx, op));
+cold!(out_program_name, |vm, ctx, op| vm.op_program_name(ctx));
+cold!(out_sound_play, |vm, ctx, op| vm.op_sound_play(ctx));
+cold!(out_sound_stop, |vm, ctx, op| vm.op_sound_stop(ctx));
+cold!(out_sound_volume, |vm, ctx, op| vm.op_sound_volume(ctx));
+cold!(out_sound_playing, |vm, ctx, op| vm.op_sound_playing(ctx));
+cold!(out_animate, |vm, ctx, op| vm.op_animate(ctx));
+cold!(out_stop_anim, |vm, ctx, op| vm.op_stop_anim());
+cold!(out_stop_anim_prop, |vm, ctx, op| vm.op_stop_anim_prop());
+cold!(out_file_open, |vm, ctx, op| vm.op_file_open(ctx));
+cold!(out_file_read, |vm, ctx, op| vm.op_file_read(ctx));
+cold!(out_file_size, |vm, ctx, op| vm.op_file_size(ctx));
+cold!(out_file_close, |vm, ctx, op| vm.op_file_close(ctx));
+cold!(out_file_seek, |vm, ctx, op| vm.op_file_seek(ctx));
+cold!(out_show_modal, |vm, ctx, op| vm.op_show_modal(ctx));
+cold!(out_set_dialog_result, |vm, ctx, op| vm.op_set_dialog_result());
+cold!(out_arr_to_str, |vm, ctx, op| vm.op_arr_to_str(ctx));
+cold!(out_sprintf, |vm, ctx, op| vm.op_sprintf(ctx));
+cold!(out_syscall, |vm, ctx, op| vm.op_syscall(ctx));
+cold!(out_itof, |vm, ctx, op| vm.op_itof());
+cold!(out_ftoi, |vm, ctx, op| vm.op_ftoi());
+cold!(out_fadd, |vm, ctx, op| vm.op_fadd());
+cold!(out_fsub, |vm, ctx, op| vm.op_fsub());
+cold!(out_fmul, |vm, ctx, op| vm.op_fmul());
+cold!(out_fdiv, |vm, ctx, op| vm.op_fdiv());
+cold!(out_fneg, |vm, ctx, op| vm.op_fneg());
+cold!(out_feq, |vm, ctx, op| vm.op_feq());
+cold!(out_flt, |vm, ctx, op| vm.op_flt());
+cold!(out_fle, |vm, ctx, op| vm.op_fle());
+cold!(out_fgt, |vm, ctx, op| vm.op_fgt());
+cold!(out_fge, |vm, ctx, op| vm.op_fge());
+cold!(out_fne, |vm, ctx, op| vm.op_fne());
+cold!(out_fsin, |vm, ctx, op| vm.op_fsin());
+cold!(out_fcos, |vm, ctx, op| vm.op_fcos());
+cold!(out_fsqrt, |vm, ctx, op| vm.op_fsqrt());
+cold!(out_fabs, |vm, ctx, op| vm.op_fabs());
+cold!(out_fatan2, |vm, ctx, op| vm.op_fatan2());
+cold!(out_ffloor, |vm, ctx, op| vm.op_ffloor());
+cold!(out_fceil, |vm, ctx, op| vm.op_fceil());
+cold!(out_call_imp, |vm, ctx, op| vm.op_call_imp());
+cold!(out_fn_ref, |vm, ctx, op| vm.op_fn_ref());
+
 // --- The tables ---
 
 /// The dispatch table of platform `P` (one per platform: a board's firmware
@@ -846,7 +1014,134 @@ fn tab<P: Platform>() -> &'static [Handler; 256] {
 }
 
 const fn table<P: Platform>() -> [Handler; 256] {
-    let mut t: [Handler; 256] = [slow::<P> as Handler; 256];
+    let mut t: [Handler; 256] = [bad_op as Handler; 256];
+    t[OP_HALT as usize] = out_halt::<P>;
+    t[OP_RET as usize] = out_ret::<P>;
+    t[OP_YIELD as usize] = out_yield::<P>;
+    t[OP_W_DIRTY as usize] = out_w_dirty::<P>;
+    t[OP_W_RENDER as usize] = out_w_render::<P>;
+    t[OP_ARR_STORE as usize] = out_arr_store::<P>;
+    t[OP_ARR_LEN as usize] = out_arr_len::<P>;
+    t[OP_W_ALLOC as usize] = out_w_alloc::<P>;
+    t[OP_W_ALLTAR as usize] = out_w_alltar::<P>;
+    t[OP_ARR_FREE as usize] = out_arr_free::<P>;
+    t[OP_W_TARGET as usize] = out_w_target::<P>;
+    t[OP_W_TARGET_S as usize] = out_w_target_s::<P>;
+    t[OP_W_SET as usize] = out_w_set::<P>;
+    t[OP_W_GET as usize] = out_w_get::<P>;
+    t[OP_W_PARENT as usize] = out_w_parent::<P>;
+    t[OP_W_PARENT_S as usize] = out_w_parent_s::<P>;
+    t[OP_W_LOAD as usize] = out_w_load::<P>;
+    t[OP_W_SETALL as usize] = out_w_setall::<P>;
+    t[OP_W_SET_LEN as usize] = out_w_set_len::<P>;
+    t[OP_ARR_ALLOC as usize] = out_arr_alloc::<P>;
+    t[OP_ARR_ALLOC_S as usize] = out_arr_alloc_s::<P>;
+    t[OP_ARR_INIT as usize] = out_arr_init::<P>;
+    t[OP_F_READ as usize] = out_f_read::<P>;
+    t[OP_F_WRITE as usize] = out_f_write::<P>;
+    t[OP_FILL_RECT as usize] = out_draw::<P>;
+    t[OP_RECT as usize] = out_draw::<P>;
+    t[OP_LINE as usize] = out_draw::<P>;
+    t[OP_CIRCLE as usize] = out_draw::<P>;
+    t[OP_FILL_CIRCLE as usize] = out_draw::<P>;
+    t[OP_DRAW_IMAGE as usize] = out_draw::<P>;
+    t[OP_DRAW_TEXT_LIT as usize] = out_draw::<P>;
+    t[OP_DRAW_STR as usize] = out_draw::<P>;
+    t[OP_ROUNDED_RECT as usize] = out_draw::<P>;
+    t[OP_FILL_ROUNDED_RECT as usize] = out_draw::<P>;
+    t[OP_ARC as usize] = out_draw::<P>;
+    t[OP_DELAY as usize] = out_delay::<P>;
+    t[OP_STR_LIT as usize] = out_str_lit::<P>;
+    t[OP_ITOS as usize] = out_itos::<P>;
+    t[OP_FTOS as usize] = out_ftos::<P>;
+    t[OP_CONCAT as usize] = out_concat::<P>;
+    t[OP_PARSE_INT as usize] = out_parse_int::<P>;
+    t[OP_PARSE_FLOAT as usize] = out_parse_float::<P>;
+    t[OP_STR_LEN as usize] = out_str_len::<P>;
+    t[OP_STR_BYTE as usize] = out_str_byte::<P>;
+    t[OP_STR_CMP as usize] = out_str_cmp::<P>;
+    t[OP_SET_TEXT as usize] = out_set_text::<P>;
+    t[OP_STR_CLEAR as usize] = out_str_clear::<P>;
+    t[OP_STR_FREE as usize] = out_str_free::<P>;
+    t[OP_BEGIN_FRAME as usize] = out_begin_frame::<P>;
+    t[OP_END_FRAME as usize] = out_end_frame::<P>;
+    t[OP_SEND_USART as usize] = out_send_usart::<P>;
+    t[OP_SEND_USART_STR as usize] = out_send_usart_str::<P>;
+    t[OP_RTC_READ as usize] = out_rtc_read::<P>;
+    t[OP_RTC_WRITE as usize] = out_rtc_write::<P>;
+    t[OP_MILLIS as usize] = out_millis::<P>;
+    t[OP_FPGA_CMD as usize] = out_fpga_cmd::<P>;
+    t[OP_FPGA_DAT as usize] = out_fpga_dat::<P>;
+    t[OP_CRITICAL as usize] = out_critical::<P>;
+    t[OP_SET_BRIGHTNESS as usize] = out_set_brightness::<P>;
+    t[OP_BRIGHTNESS as usize] = out_brightness::<P>;
+    t[OP_PIN_MODE as usize] = out_pin_mode::<P>;
+    t[OP_PIN_WRITE as usize] = out_pin_write::<P>;
+    t[OP_PIN_READ as usize] = out_pin_read::<P>;
+    t[OP_EEPROM_SIZE as usize] = out_eeprom_size::<P>;
+    t[OP_EEPROM_READ as usize] = out_eeprom_read::<P>;
+    t[OP_EEPROM_WRITE as usize] = out_eeprom_write::<P>;
+    t[OP_EEPROM_READ_ARR as usize] = out_eeprom_array::<P>;
+    t[OP_EEPROM_WRITE_ARR as usize] = out_eeprom_array::<P>;
+    t[OP_RUN_PROGRAM as usize] = out_run_program::<P>;
+    t[OP_PROGRAM_ARG as usize] = out_program_arg::<P>;
+    let mut op = OP_TASK_SPAWN;
+    while op <= OP_TASK_FG {
+        t[op as usize] = out_task::<P>;
+        op += 1;
+    }
+    t[OP_FLEX_LAYOUT as usize] = out_flex_layout::<P>;
+    let mut op = disk::OP_DISK_OPEN;
+    while op <= disk::OP_FILE_READ_ARR {
+        t[op as usize] = out_disk::<P>;
+        op += 1;
+    }
+    let mut op = gesture_ops::OP_ON_GESTURE;
+    while op <= gesture_ops::OP_GESTURE_INFO {
+        t[op as usize] = out_gesture::<P>;
+        op += 1;
+    }
+    t[OP_PROGRAM_NAME as usize] = out_program_name::<P>;
+    t[OP_SOUND_PLAY as usize] = out_sound_play::<P>;
+    t[OP_SOUND_STOP as usize] = out_sound_stop::<P>;
+    t[OP_SOUND_VOLUME as usize] = out_sound_volume::<P>;
+    t[OP_SOUND_PLAYING as usize] = out_sound_playing::<P>;
+    t[OP_ANIMATE as usize] = out_animate::<P>;
+    t[OP_STOP_ANIM as usize] = out_stop_anim::<P>;
+    t[OP_STOP_ANIM_PROP as usize] = out_stop_anim_prop::<P>;
+    t[OP_FILE_OPEN as usize] = out_file_open::<P>;
+    t[OP_FILE_READ as usize] = out_file_read::<P>;
+    t[OP_FILE_SIZE as usize] = out_file_size::<P>;
+    t[OP_FILE_CLOSE as usize] = out_file_close::<P>;
+    t[OP_FILE_SEEK as usize] = out_file_seek::<P>;
+    t[OP_SHOW_MODAL as usize] = out_show_modal::<P>;
+    t[OP_SET_DIALOG_RESULT as usize] = out_set_dialog_result::<P>;
+    t[OP_ARR_TO_STR as usize] = out_arr_to_str::<P>;
+    t[OP_SPRINTF as usize] = out_sprintf::<P>;
+    t[OP_SYSCALL as usize] = out_syscall::<P>;
+    t[OP_ITOF as usize] = out_itof::<P>;
+    t[OP_FTOI as usize] = out_ftoi::<P>;
+    t[OP_FADD as usize] = out_fadd::<P>;
+    t[OP_FSUB as usize] = out_fsub::<P>;
+    t[OP_FMUL as usize] = out_fmul::<P>;
+    t[OP_FDIV as usize] = out_fdiv::<P>;
+    t[OP_FNEG as usize] = out_fneg::<P>;
+    t[OP_FEQ as usize] = out_feq::<P>;
+    t[OP_FLT as usize] = out_flt::<P>;
+    t[OP_FLE as usize] = out_fle::<P>;
+    t[OP_FGT as usize] = out_fgt::<P>;
+    t[OP_FGE as usize] = out_fge::<P>;
+    t[OP_FNE as usize] = out_fne::<P>;
+    t[OP_FSIN as usize] = out_fsin::<P>;
+    t[OP_FCOS as usize] = out_fcos::<P>;
+    t[OP_FSQRT as usize] = out_fsqrt::<P>;
+    t[OP_FABS as usize] = out_fabs::<P>;
+    t[OP_FATAN2 as usize] = out_fatan2::<P>;
+    t[OP_FFLOOR as usize] = out_ffloor::<P>;
+    t[OP_FCEIL as usize] = out_fceil::<P>;
+    t[OP_CALL_IMP as usize] = out_call_imp::<P>;
+    t[OP_FN_REF as usize] = out_fn_ref::<P>;
+    // The handlers here (after the out-of-line ones: RET and SYSCALL have both).
     t[OP_POP as usize] = op_pop::<P>;
     t[OP_DUP as usize] = op_dup::<P>;
     t[OP_SWAP as usize] = op_swap::<P>;

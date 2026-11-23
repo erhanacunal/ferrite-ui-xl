@@ -1,14 +1,14 @@
 //! Dynamic opcode profile (board `GET|POST /api/vmprof`, sim
 //! `FERRITE_SIM_VMPROF=SECS`; `scripts/vmprof.py` names and sorts it).
 //!
-//! While `ON`, `Vm::tick` runs its burst through `exec_one` (not the
-//! threaded dispatch) and `exec_one` counts each instruction before running
-//! it: the opcode, a superinstruction's cond / op operand, and for each
+//! While `ON`, the VM runs one instruction at a time (`Vm::burst`,
+//! `Vm::step`) and counts each before running it: the opcode, a
+//! superinstruction's cond / op operand, and for each
 //! variable-slot operand whether it is a local or a global. Every VM (all
 //! tasks, callbacks, setup) adds to the same counters. A quickened form
 //! (`QUICK`) counts as its instruction, cond / op and slot kind, so the
-//! profile reads the same before and after quickening. Off, `exec_one` pays one
-//! relaxed load and a branch.
+//! profile reads the same before and after quickening. Off, a burst pays
+//! one relaxed load and a branch.
 //!
 //! The counters are written on CPU0 (the runtime loop) and read anywhere.
 

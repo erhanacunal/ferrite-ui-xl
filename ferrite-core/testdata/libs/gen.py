@@ -47,7 +47,7 @@ library("util_bad.fl", "1.3.0", "util_bad.bin")
 src = HERE / "app.fl"
 image = ferrite_lang.build_image(src.read_text(encoding="utf-8"), filename=str(src),
                                  include_dirs=[str(FERRITE_UI / "lib")],
-                                 superops=True, var_slots=True,
+                                 superops=True, var_slots=True, wide=True,
                                  libraries=[ferrite_build.read_library(HERE / "util.bin")])
 (HERE / "app.prg").write_bytes(bytes(image))
 print(f"app.prg: {len(image)} bytes")

@@ -10,3 +10,4 @@ test_size.*
 # Secrets (WiFi passphrase, chip firmware): never committed, in any folder
 private/
 wifi.cfg
+!ferrite-core/testdata/libs/*.bin

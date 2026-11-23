@@ -112,7 +112,6 @@ pub struct LibImage {
     pub version: u32,
     code: VmCode,
     functions: Vec<FuncEntry>,
-    wide: bool,
     globals: u32,
     /// Its globals plus one call chain's locals.
     var_slots: u32,
@@ -139,7 +138,6 @@ impl LibImage {
             version,
             code: VmCode::new(image),
             functions: h.functions,
-            wide: h.wide,
             globals,
             var_slots: (h.var_slots.unwrap_or(0) as u32).max(globals),
             call_depth: tables.call_depth,
@@ -162,7 +160,6 @@ pub(super) struct Unit {
     /// None while it runs (then in `Vm::code`).
     code: Option<VmCode>,
     functions: Vec<FuncEntry>,
-    wide: bool,
     gbase: u32,
     /// Keeps a library loaded while this VM uses it.
     _lib: Option<Arc<LibImage>>,
@@ -196,8 +193,6 @@ impl Vm {
         let old = &mut self.units[cur];
         old.code = Some(core::mem::replace(&mut self.code, code));
         old.functions = core::mem::replace(&mut self.functions, functions);
-        old.wide = self.wide_addr;
-        self.wide_addr = self.units[new].wide;
         self.gbase = self.units[new].gbase;
         self.unit = u;
         self.utag = (u as u32) << 24;
@@ -277,12 +272,11 @@ impl Vm {
         let mut slots = self.var_slots;
         let mut depth = 0u32;
         let mut units = Vec::with_capacity(libs.len() + 1);
-        units.push(Unit { code: None, functions: Vec::new(), wide: self.wide_addr, gbase: 0, _lib: None });
+        units.push(Unit { code: None, functions: Vec::new(), gbase: 0, _lib: None });
         for lib in libs {
             units.push(Unit {
                 code: Some(lib.code.clone()),
                 functions: lib.functions.clone(),
-                wide: lib.wide,
                 gbase,
                 _lib: Some(lib.clone()),
             });

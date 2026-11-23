@@ -23,6 +23,6 @@ src_path = HERE / "conds.fl"
 for superops, name in ((False, "conds.prg"), (True, "conds_super.prg")):
     image = ferrite_lang.build_image(src_path.read_text(encoding="utf-8"), filename=str(src_path),
                                      include_dirs=[str(FERRITE_UI / "lib"), str(HERE)],
-                                     superops=superops, var_slots=superops)
+                                     superops=superops, var_slots=superops, wide=True)
     (HERE / name).write_bytes(bytes(image))
     print(f"{name}: {len(image)} bytes")

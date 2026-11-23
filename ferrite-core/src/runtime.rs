@@ -3572,7 +3572,7 @@ mod multi_tests {
     const ON_EXIT: u8 = FunctionKind::OnTaskExit as u8;
 
     /// `loop() { yield; }`: the first function, so its jump target is 0.
-    const IDLE: &[u8] = &[YIELD, JMP, 0, 0];
+    const IDLE: &[u8] = &[YIELD, JMP, 0, 0, 0, 0];
 
     fn lit(s: &[u8]) -> Vec<u8> {
         let mut v = alloc::vec![STR_LIT, s.len() as u8];
@@ -3589,9 +3589,9 @@ mod multi_tests {
         parts.concat()
     }
 
-    /// v4 image with 8 globals; functions laid out in order.
+    /// v4 image (wide-address) with 8 globals; functions laid out in order.
     fn prog(funcs: &[(u8, Vec<u8>)]) -> Vec<u8> {
-        let mut img = alloc::vec![4, funcs.len() as u8, 0, 8, 0, 0, 0, 0, 0];
+        let mut img = alloc::vec![4, funcs.len() as u8, 0, 8, 0, 0x04, 0, 0, 0];
         let mut off = 0u32;
         for (i, (kind, code)) in funcs.iter().enumerate() {
             img.extend_from_slice(&(i as u16).to_le_bytes());
@@ -3818,7 +3818,7 @@ mod multi_tests {
     #[test]
     fn main_run_program_ends_every_child() {
         // main: spawn kid in setup; its loop runs runProgram("solo").
-        let loop_ = cat(&[&[YIELD], &lit(b"solo"), &[PUSH_0, RUN_PROGRAM, JMP, 0, 0]]);
+        let loop_ = cat(&[&[YIELD], &lit(b"solo"), &[PUSH_0, RUN_PROGRAM, JMP, 0, 0, 0, 0]]);
         let setup = cat(&[&lit(b"kid"), &[PUSH_0, SPAWN, POP, PUSH_0, RET]]);
         let main = prog(&[(LOOP, loop_), (SETUP, setup)]);
         let solo = prog(&[(LOOP, IDLE.to_vec()), (SETUP, alloc::vec![PUSH_0, RET])]);

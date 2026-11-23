@@ -267,9 +267,7 @@ const IMAGE_FLAG_WIDE_ADDR: u16 = 0x04;
 /// 480x800 on the 800x480 panel, see `LcdImpl::set_portrait`).
 const IMAGE_FLAG_PORTRAIT: u16 = 0x08;
 
-/// Bytecode address: pc, return addresses, callback entry points. `u32` with
-/// the `wide_code` feature (RAM-rich BSPs), `u16` otherwise so the GD32 build
-/// keeps call frames and queued callbacks small.
+/// Bytecode address: pc, return addresses, callback entry points.
 pub type CodeAddr = u32;
 
 // --- 1-byte opcode map (IL-style) ---
@@ -330,10 +328,10 @@ const OP_PUSH_I16: u8 = 0x31; // + i16 LE
 const OP_PUSH_I32: u8 = 0x32; // + i32 LE
 const OP_LOAD: u8 = 0x33; // + u8 slot
 const OP_STORE: u8 = 0x34; // + u8 slot
-const OP_JMP: u8 = 0x35; // + u16 target (u32 in wide-address images)
-const OP_JZ: u8 = 0x36; // + u16 target (u32 in wide-address images)
-const OP_JNZ: u8 = 0x37; // + u16 target (u32 in wide-address images)
-const OP_CALL: u8 = 0x38; // + u16 target (u32 in wide-address images)
+const OP_JMP: u8 = 0x35; // + u32 target
+const OP_JZ: u8 = 0x36; // + u32 target
+const OP_JNZ: u8 = 0x37; // + u32 target
+const OP_CALL: u8 = 0x38; // + u32 target
 const OP_W_TARGET: u8 = 0x39; // + u8 widget_id
 const OP_W_SET: u8 = 0x3A; // + u8 prop_id (value from stack)
 const OP_W_GET: u8 = 0x3B; // + u8 prop_id
@@ -981,8 +979,6 @@ pub struct Vm {
     // Slots the program's globals and locals may use (image header v5, or
     // LEGACY_VAR_SLOTS): FRAME faults past it.
     var_slots: u32,
-    // Jump/call operands are u32 (image header IMAGE_FLAG_WIDE_ADDR).
-    wide_addr: bool,
     // Portrait screen from the image header (IMAGE_FLAG_PORTRAIT).
     pub portrait: bool,
     // `(widgets, extensions)` the program allocates, from a v4 image header
@@ -1089,7 +1085,6 @@ impl Vm {
             call_base: CALL_STACK_SIZE as u8,
             lib_tables: None,
             var_slots: LEGACY_VAR_SLOTS as u32,
-            wide_addr: false,
             portrait: false,
             in_paint: false,
             page_base: 0,
@@ -1242,7 +1237,6 @@ impl Vm {
             let opcodes = image;
             // Back in the program's unit before its code is replaced.
             self.clear_units();
-            self.wide_addr = wide;
             self.code = VmCode::new(opcodes);
             self.functions = funcs;
             self.global_count = gc as u32;
@@ -1272,7 +1266,6 @@ impl Vm {
         self.clear_units();
         self.code = VmCode::new(data);
         self.tree_hint = None;
-        self.wide_addr = false;
         self.functions.clear();
     }
 
@@ -2082,16 +2075,10 @@ impl Vm {
         self.read_i32() as u32
     }
 
-    /// JMP/JZ/JNZ/CALL target: u16, or u32 in wide-address images (only
-    /// loadable with the `wide_code` feature, so the cast never truncates;
-    /// narrow builds compile the u32 path out).
+    /// JMP/JZ/JNZ/CALL target: u32 (XL reads wide-address images only).
     #[inline]
     fn read_addr(&mut self) -> CodeAddr {
-        if true && self.wide_addr {
-            self.read_u32() as CodeAddr
-        } else {
-            self.read_u16() as CodeAddr
-        }
+        self.read_u32() as CodeAddr
     }
 
     // --- Execute a single instruction ---
@@ -4477,7 +4464,8 @@ impl Vm {
 /// Format v4 (adds widget/ext counts):
 ///   v3 header + widget_count(u8) + ext_count(u8) + [...]
 ///   flags bit 0: render_mode (0=dirty, 1=buffered; ignored: XL renders dirty only)
-///   flags bit 2: wide_addr (jump/call targets are u32)
+///   flags bit 2: wide_addr (jump/call targets are u32; XL loads no image
+///   without it)
 ///   flags bit 3: portrait (screen rotated 90°)
 #[allow(clippy::type_complexity)]
 /// A parsed image header (`parse_image_header`).
@@ -4567,11 +4555,11 @@ fn parse_image_header(data: &[u8]) -> Option<ImageHeader> {
     Some(ImageHeader { functions, opcode_start, global_count, tree_hint, wide, portrait, var_slots, libs })
 }
 
-/// Whether this build can address an image's bytecode: every offset in
-/// `code_len` must fit `CodeAddr`, and wide (u32-operand) images need the
-/// `wide_code` feature to decode at all.
+/// Whether the VM can run an image's bytecode: a wide-address image (u32
+/// jump/call targets, the only kind XL reads; ferrite-ui `caps.wide_addr`)
+/// whose every offset in `code_len` fits `CodeAddr`.
 fn code_addressable(wide: bool, code_len: usize) -> bool {
-    (true || !wide) && code_len <= CodeAddr::MAX as usize
+    wide && code_len <= CodeAddr::MAX as usize
 }
 
 // --- Packed u32 helper ---
@@ -5300,9 +5288,8 @@ mod anim_tests {
             seed
         };
         for prog in 0..2000 {
-            // A quarter in wide-address images (u32 targets).
-            let wide = prog % 4 == 3;
-            let aw = if wide { 4 } else { 2 };
+            // Targets are u32 (`aw` bytes; OPS counts 2).
+            let aw = 4;
             let len = 4 + rnd() as usize % 60;
             let mut code = alloc::vec::Vec::new();
             // Instruction starts, and where each jump target goes.
@@ -5332,19 +5319,15 @@ mod anim_tests {
                     targets.push(code.len() - aw);
                 }
             }
-            // Jump to an instruction, now and then past the code (and, wide,
-            // past 64 K).
+            // Jump to an instruction, now and then past the code or past
+            // 64 K.
             for &at in &targets {
                 let t = match rnd() % 16 {
                     0 => len + rnd() as usize % 300,
-                    1 if wide => 0x1_0000 + starts[rnd() as usize % starts.len()],
+                    1 => 0x1_0000 + starts[rnd() as usize % starts.len()],
                     _ => starts[rnd() as usize % starts.len()],
                 };
-                if wide {
-                    code[at..at + 4].copy_from_slice(&(t as u32).to_le_bytes());
-                } else {
-                    code[at..at + 2].copy_from_slice(&(t as u16).to_le_bytes());
-                }
+                code[at..at + 4].copy_from_slice(&(t as u32).to_le_bytes());
             }
             if rnd() % 4 == 0 {
                 code.truncate(code.len() - 1); // an instruction cut off
@@ -5362,7 +5345,6 @@ mod anim_tests {
                     (id != 7).then(|| args.iter().fold(id as i32, |s, &x| s.wrapping_mul(31).wrapping_add(x)))
                 }
                 for v in [&mut a, &mut b] {
-                    v.wide_addr = wide;
                     v.syscall_fn = Some(sys);
                     v.global_count = 8;
                     v.frame_base = 8;
@@ -5419,8 +5401,8 @@ mod anim_tests {
         // g0 = 0; CRITICAL; loop: g0 += 1; if g0 < 40 goto loop; YIELD; g0 = 99
         let code = [
             OP_PUSH_0, OP_STORE, 0, OP_CRITICAL, // 0..4
-            OP_ADD_VI, 0, 1, 0, OP_JCMP_VI, OP_LT, 0, 40, 0, 4, 0, // 4..15
-            OP_YIELD, OP_PUSH_I8, 99, OP_STORE, 0, OP_HALT, // 15..21
+            OP_ADD_VI, 0, 1, 0, OP_JCMP_VI, OP_LT, 0, 40, 0, 4, 0, 0, 0, // 4..17
+            OP_YIELD, OP_PUSH_I8, 99, OP_STORE, 0, OP_HALT, // 17..23
         ];
         for budget in [1u32, 2, 5] {
             let (mut ca, mut cb) = (mock_ctx(), mock_ctx());
@@ -5760,14 +5742,14 @@ mod anim_tests {
     fn run_program_inside_a_callback_ends_the_main_program_too() {
         let mut ctx = ctx_with_programs();
         let settings = ctx.objs.str_alloc(b"settings").unwrap() as u8;
-        // main @0: loop forever (JMP 0)   callback @3: runProgram("settings", 0); RET
+        // main @0: loop forever (JMP 0)   callback @5: runProgram("settings", 0); RET
         let code = [
-            OP_JMP, 0, 0,
+            OP_JMP, 0, 0, 0, 0,
             OP_PUSH_I8, settings, OP_PUSH_0, OP_RUN_PROGRAM, OP_RET,
         ];
         let mut vm = cb_vm(&code);
         vm.tick(&mut ctx, 10);
-        vm.enqueue_callback(3, &[]);
+        vm.enqueue_callback(5, &[]);
         assert!(vm.drain_callbacks(&mut ctx));
         assert!(vm.state == VmState::Exit, "fault {}", vm.fault());
         vm.tick(&mut ctx, 10);
@@ -6157,7 +6139,7 @@ mod anim_tests {
         fn branch(setup: &[u8], jcmp: &[u8]) -> i32 {
             let mut c = setup.to_vec();
             c.extend_from_slice(jcmp);
-            let t = (c.len() + 2 + 2) as u16;
+            let t = (c.len() + 4 + 2) as u32;
             c.extend_from_slice(&t.to_le_bytes());
             c.extend_from_slice(&[OP_PUSH_0, OP_HALT, OP_PUSH_1, OP_HALT]);
             let vm = run_code(&c);
@@ -6193,7 +6175,7 @@ mod anim_tests {
         // A sub-op that is not a binary op faults.
         let vm = run_code(&[OP_PUSH_1, OP_BIN_I, OP_POP, 0, 0]);
         assert_eq!(vm.fault(), fault::BAD_OPCODE);
-        let vm = run_code(&[OP_PUSH_1, OP_PUSH_1, OP_JCMP, OP_ADD, 0, 0]);
+        let vm = run_code(&[OP_PUSH_1, OP_PUSH_1, OP_JCMP, OP_ADD, 0, 0, 0, 0]);
         assert_eq!(vm.fault(), fault::BAD_OPCODE);
         // BIN_I on an empty stack underflows.
         let vm = run_code(&[OP_BIN_I, OP_ADD, 1, 0]);
@@ -6209,27 +6191,27 @@ mod anim_tests {
         let [nl, nh] = N.to_le_bytes();
         // i = g1, acc = g2. Plain: while (i < N) { acc = acc + (i*7)%13; i = i + 1; }
         let mut plain = std::vec![OP_PUSH_0, OP_STORE, 1, OP_PUSH_0, OP_STORE, 2];
-        let top = plain.len() as u16;
+        let top = plain.len() as u32;
         plain.extend_from_slice(&[OP_LOAD, 1, OP_PUSH_I16, nl, nh, OP_LT, OP_JZ]);
         let exit_at = plain.len();
-        plain.extend_from_slice(&[0, 0]);
+        plain.extend_from_slice(&[0, 0, 0, 0]);
         plain.extend_from_slice(&[
             OP_LOAD, 2, OP_LOAD, 1, OP_PUSH_I8, 7, OP_MUL, OP_PUSH_I8, 13, OP_MOD, OP_ADD, OP_STORE, 2,
             OP_LOAD, 1, OP_PUSH_1, OP_ADD, OP_STORE, 1, OP_JMP,
         ]);
         plain.extend_from_slice(&top.to_le_bytes());
-        let end = plain.len() as u16;
-        plain[exit_at..exit_at + 2].copy_from_slice(&end.to_le_bytes());
+        let end = plain.len() as u32;
+        plain[exit_at..exit_at + 4].copy_from_slice(&end.to_le_bytes());
         plain.push(OP_HALT);
         // Fused, inverted: JMP test; body: ...; test: JCMP_VI i < N body
-        let mut fused = std::vec![OP_PUSH_0, OP_STORE, 1, OP_PUSH_0, OP_STORE, 2, OP_JMP, 0, 0];
-        let body = fused.len() as u16;
+        let mut fused = std::vec![OP_PUSH_0, OP_STORE, 1, OP_PUSH_0, OP_STORE, 2, OP_JMP, 0, 0, 0, 0];
+        let body = fused.len() as u32;
         fused.extend_from_slice(&[
             OP_LOAD, 1, OP_BIN_I, OP_MUL, 7, 0, OP_BIN_I, OP_MOD, 13, 0, OP_STORE_OP, OP_ADD, 2,
             OP_ADD_VI, 1, 1, 0,
         ]);
-        let test = fused.len() as u16;
-        fused[7..9].copy_from_slice(&test.to_le_bytes());
+        let test = fused.len() as u32;
+        fused[7..11].copy_from_slice(&test.to_le_bytes());
         fused.extend_from_slice(&[OP_JCMP_VI, OP_LT, 1, nl, nh]);
         fused.extend_from_slice(&body.to_le_bytes());
         fused.push(OP_HALT);
@@ -6295,7 +6277,7 @@ mod anim_tests {
                         }
                         _ => c.extend_from_slice(&[op, sub, 1, 2]),
                     }
-                    let t = (c.len() + 2 + 2) as u16;
+                    let t = (c.len() + 4 + 2) as u32;
                     c.extend_from_slice(&t.to_le_bytes());
                     c.extend_from_slice(&[OP_PUSH_0, OP_HALT, OP_PUSH_1, OP_HALT]);
                 }
@@ -6467,7 +6449,7 @@ mod anim_tests {
     fn profile_counts_superinstructions() {
         // g1 = 0; loop: g1 += 1; if g1 != 100 goto loop
         let code = std::vec![
-            OP_PUSH_0, OP_STORE, 0x81, OP_ADD_VI, 0x81, 1, 0, OP_JCMP_VI, OP_NE, 0x81, 100, 0, 3, 0, OP_HALT,
+            OP_PUSH_0, OP_STORE, 0x81, OP_ADD_VI, 0x81, 1, 0, OP_JCMP_VI, OP_NE, 0x81, 100, 0, 3, 0, 0, 0, OP_HALT,
         ];
         let mut ctx = mock_ctx();
         let mut vm = Vm::new();
@@ -6709,7 +6691,8 @@ mod anim_tests {
         assert_eq!(vm.fault_pc(), 0);
     }
 
-    /// v4 image with no functions: header flags + opcodes.
+    /// v4 image with no functions: header flags + opcodes (pass
+    /// IMAGE_FLAG_WIDE_ADDR for a loadable one).
     fn image(flags: u16, code: &[u8]) -> Vec<u8> {
         let [f0, f1] = flags.to_le_bytes();
         let mut img = alloc::vec![4, 0, 0, 0, 0, f0, f1, 0, 0];
@@ -6744,7 +6727,7 @@ mod anim_tests {
         // 300 functions — well past the old 64-entry stack buffer.
         const FUNCS: u16 = 300;
         let [c0, c1] = FUNCS.to_le_bytes();
-        let mut img = alloc::vec![4, c0, c1, 0, 0, 0, 0, 0, 0];
+        let mut img = alloc::vec![4, c0, c1, 0, 0, IMAGE_FLAG_WIDE_ADDR as u8, 0, 0, 0];
         for i in 0..FUNCS {
             img.extend_from_slice(&(i + 1).to_le_bytes()); // func_id
             img.extend_from_slice(&[FunctionKind::UserFunction as u8, 0]);
@@ -6772,7 +6755,7 @@ mod anim_tests {
     #[test]
     fn load_ram_owned_keeps_the_buffer() {
         let mut vm = Vm::new();
-        let mut img = image(0, &[OP_PUSH_1, OP_HALT]);
+        let mut img = image(IMAGE_FLAG_WIDE_ADDR, &[OP_PUSH_1, OP_HALT]);
         // Room for the pad (a real image's function table leaves it).
         img.reserve_exact(CODE_PAD);
         let ptr = img.as_ptr();
@@ -6786,17 +6769,13 @@ mod anim_tests {
     }
 
     #[test]
-    fn wide_image_needs_wide_code() {
+    fn only_wide_address_images_load() {
         let mut vm = Vm::new();
-        let ok = vm.load_ram(&image(IMAGE_FLAG_WIDE_ADDR, &[OP_HALT]));
-        assert_eq!(ok, true);
-    }
-
-    #[test]
-    fn narrow_build_rejects_code_past_64k() {
-        let mut vm = Vm::new();
-        let ok = vm.load_ram(&image(0, &alloc::vec![OP_HALT; 0x1_0001]));
-        assert_eq!(ok, true);
+        assert!(vm.load_ram(&image(IMAGE_FLAG_WIDE_ADDR, &[OP_HALT])));
+        assert!(vm.load_ram(&image(IMAGE_FLAG_WIDE_ADDR, &alloc::vec![OP_HALT; 0x1_0001])));
+        // u16 jump/call targets: a ferrite-ui image for another device.
+        assert!(!vm.load_ram(&image(0, &[OP_HALT])));
+        assert!(!vm.load_ram(&[5, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, OP_HALT]));
     }
 
     #[test]
@@ -6822,15 +6801,16 @@ mod anim_tests {
     /// v5 image: `globals` globals, `var_slots` variable slots.
     fn image_v5(globals: u8, var_slots: u16, code: &[u8]) -> Vec<u8> {
         let [s0, s1] = var_slots.to_le_bytes();
-        let mut img = alloc::vec![5, 0, 0, globals, 0, 0, 0, 0, 0, s0, s1];
+        let mut img = alloc::vec![5, 0, 0, globals, 0, IMAGE_FLAG_WIDE_ADDR as u8, 0, 0, 0, s0, s1];
         img.extend_from_slice(code);
         img
     }
 
     /// main: CALL f; HALT. f: FRAME 3; CALL g; RET. g: FRAME 2; RET.
     /// With 2 globals g's locals end at slot 2 + 3 + 2 = 7.
-    const NESTED_FRAMES: [u8; 13] =
-        [OP_CALL, 4, 0, OP_HALT, OP_FRAME, 3, OP_CALL, 10, 0, OP_RET, OP_FRAME, 2, OP_RET];
+    const NESTED_FRAMES: [u8; 17] = [
+        OP_CALL, 6, 0, 0, 0, OP_HALT, OP_FRAME, 3, OP_CALL, 14, 0, 0, 0, OP_RET, OP_FRAME, 2, OP_RET,
+    ];
 
     #[test]
     fn v5_header_sizes_the_variable_table() {
@@ -6842,7 +6822,7 @@ mod anim_tests {
         vm.run(&mut ctx);
         assert_eq!(vm.fault(), fault::NONE);
         // An older header keeps the old table; var_slots never undercuts the globals.
-        assert!(vm.load_ram(&image(0, &[OP_HALT])));
+        assert!(vm.load_ram(&image(IMAGE_FLAG_WIDE_ADDR, &[OP_HALT])));
         assert_eq!(vm.var_slots, LEGACY_VAR_SLOTS as u32);
         assert!(vm.load_ram(&image_v5(9, 4, &[OP_HALT])));
         assert_eq!(vm.var_slots, 9);
@@ -6856,7 +6836,7 @@ mod anim_tests {
         let mut ctx = mock_ctx();
         vm.run(&mut ctx);
         assert_eq!(vm.fault(), fault::VARS_FULL);
-        assert_eq!(vm.fault_pc(), 10);
+        assert_eq!(vm.fault_pc(), 14);
     }
 
     #[test]
@@ -6865,7 +6845,7 @@ mod anim_tests {
         // argument lands in VAR_PAD (debug_assert in var_set otherwise).
         let mut vm = Vm::new();
         // PUSH_1; PUSH_1; CALL f; HALT. f: FRAME_A 1 2; RET.
-        let code = [OP_PUSH_1, OP_PUSH_1, OP_CALL, 6, 0, OP_HALT, OP_FRAME_A, 1, 2, OP_RET];
+        let code = [OP_PUSH_1, OP_PUSH_1, OP_CALL, 8, 0, 0, 0, OP_HALT, OP_FRAME_A, 1, 2, OP_RET];
         assert!(vm.load_ram(&image_v5(0, 1, &code)));
         let mut ctx = mock_ctx();
         vm.run(&mut ctx);

@@ -11,7 +11,7 @@ how often, with the superinstructions' cond / op operands and the slot kinds
 (release sim, virtual clock, the same taps / swipes) with
 FERRITE_SIM_VMPROF=1 and reads the report the sim writes when it ends.
 --host zeroes and starts the board's counters (POST /api/vmprof), waits,
-stops them and reads them; the VM runs through exec_one meanwhile (slower),
+stops them and reads them; the VM runs one instruction at a time meanwhile (slower),
 the counts are the same. Names come from ferrite-ui's ferrite_cc.OP_NAMES;
 the quickened forms (marked *) from vm.rs QUICK. --top N limits the opcode
 list; --each prints every scenario, not only the sum.

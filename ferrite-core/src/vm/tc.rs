@@ -353,6 +353,38 @@ macro_rules! unary {
 unary!(op_neg, |a| a.wrapping_neg());
 unary!(op_not, |a| (a == 0) as i32);
 
+/// f32 operands as their bits on the stack.
+#[inline(always)]
+fn f(v: i32) -> f32 {
+    f32::from_bits(v as u32)
+}
+
+#[inline(always)]
+fn bits(v: f32) -> i32 {
+    v.to_bits() as i32
+}
+
+bin!(op_fadd, |a, b| bits(f(a) + f(b)));
+bin!(op_fsub, |a, b| bits(f(a) - f(b)));
+bin!(op_fmul, |a, b| bits(f(a) * f(b)));
+bin!(op_fdiv, |a, b| bits(if f(b) != 0.0 { f(a) / f(b) } else { 0.0 }));
+bin!(op_feq, |a, b| (f(a) == f(b)) as i32);
+bin!(op_flt, |a, b| (f(a) < f(b)) as i32);
+bin!(op_fle, |a, b| (f(a) <= f(b)) as i32);
+bin!(op_fgt, |a, b| (f(a) > f(b)) as i32);
+bin!(op_fge, |a, b| (f(a) >= f(b)) as i32);
+bin!(op_fne, |a, b| (f(a) != f(b)) as i32);
+bin!(op_fatan2, |a, b| bits(libm::atan2f(f(a), f(b))));
+unary!(op_itof, |a| bits(a as f32));
+unary!(op_ftoi, |a| f(a) as i32);
+unary!(op_fneg, |a| bits(-f(a)));
+unary!(op_fsin, |a| bits(libm::sinf(f(a))));
+unary!(op_fcos, |a| bits(libm::cosf(f(a))));
+unary!(op_fsqrt, |a| bits(libm::sqrtf(f(a))));
+unary!(op_fabs, |a| bits(libm::fabsf(f(a))));
+unary!(op_ffloor, |a| bits(libm::floorf(f(a))));
+unary!(op_fceil, |a| bits(libm::ceilf(f(a))));
+
 macro_rules! push_const {
     ($name:ident, $v:expr) => {
         fn $name<P: Platform>(vm: &mut Vm, pc: *const u8, sp: *mut i32, n: u32) {
@@ -975,26 +1007,6 @@ cold!(out_set_dialog_result, |vm, ctx, op| vm.op_set_dialog_result());
 cold!(out_arr_to_str, |vm, ctx, op| vm.op_arr_to_str(ctx));
 cold!(out_sprintf, |vm, ctx, op| vm.op_sprintf(ctx));
 cold!(out_syscall, |vm, ctx, op| vm.op_syscall(ctx));
-cold!(out_itof, |vm, ctx, op| vm.op_itof());
-cold!(out_ftoi, |vm, ctx, op| vm.op_ftoi());
-cold!(out_fadd, |vm, ctx, op| vm.op_fadd());
-cold!(out_fsub, |vm, ctx, op| vm.op_fsub());
-cold!(out_fmul, |vm, ctx, op| vm.op_fmul());
-cold!(out_fdiv, |vm, ctx, op| vm.op_fdiv());
-cold!(out_fneg, |vm, ctx, op| vm.op_fneg());
-cold!(out_feq, |vm, ctx, op| vm.op_feq());
-cold!(out_flt, |vm, ctx, op| vm.op_flt());
-cold!(out_fle, |vm, ctx, op| vm.op_fle());
-cold!(out_fgt, |vm, ctx, op| vm.op_fgt());
-cold!(out_fge, |vm, ctx, op| vm.op_fge());
-cold!(out_fne, |vm, ctx, op| vm.op_fne());
-cold!(out_fsin, |vm, ctx, op| vm.op_fsin());
-cold!(out_fcos, |vm, ctx, op| vm.op_fcos());
-cold!(out_fsqrt, |vm, ctx, op| vm.op_fsqrt());
-cold!(out_fabs, |vm, ctx, op| vm.op_fabs());
-cold!(out_fatan2, |vm, ctx, op| vm.op_fatan2());
-cold!(out_ffloor, |vm, ctx, op| vm.op_ffloor());
-cold!(out_fceil, |vm, ctx, op| vm.op_fceil());
 cold!(out_call_imp, |vm, ctx, op| vm.op_call_imp());
 cold!(out_fn_ref, |vm, ctx, op| vm.op_fn_ref());
 
@@ -1119,26 +1131,26 @@ const fn table<P: Platform>() -> [Handler; 256] {
     t[OP_ARR_TO_STR as usize] = out_arr_to_str::<P>;
     t[OP_SPRINTF as usize] = out_sprintf::<P>;
     t[OP_SYSCALL as usize] = out_syscall::<P>;
-    t[OP_ITOF as usize] = out_itof::<P>;
-    t[OP_FTOI as usize] = out_ftoi::<P>;
-    t[OP_FADD as usize] = out_fadd::<P>;
-    t[OP_FSUB as usize] = out_fsub::<P>;
-    t[OP_FMUL as usize] = out_fmul::<P>;
-    t[OP_FDIV as usize] = out_fdiv::<P>;
-    t[OP_FNEG as usize] = out_fneg::<P>;
-    t[OP_FEQ as usize] = out_feq::<P>;
-    t[OP_FLT as usize] = out_flt::<P>;
-    t[OP_FLE as usize] = out_fle::<P>;
-    t[OP_FGT as usize] = out_fgt::<P>;
-    t[OP_FGE as usize] = out_fge::<P>;
-    t[OP_FNE as usize] = out_fne::<P>;
-    t[OP_FSIN as usize] = out_fsin::<P>;
-    t[OP_FCOS as usize] = out_fcos::<P>;
-    t[OP_FSQRT as usize] = out_fsqrt::<P>;
-    t[OP_FABS as usize] = out_fabs::<P>;
-    t[OP_FATAN2 as usize] = out_fatan2::<P>;
-    t[OP_FFLOOR as usize] = out_ffloor::<P>;
-    t[OP_FCEIL as usize] = out_fceil::<P>;
+    t[OP_ITOF as usize] = op_itof::<P>;
+    t[OP_FTOI as usize] = op_ftoi::<P>;
+    t[OP_FADD as usize] = op_fadd::<P>;
+    t[OP_FSUB as usize] = op_fsub::<P>;
+    t[OP_FMUL as usize] = op_fmul::<P>;
+    t[OP_FDIV as usize] = op_fdiv::<P>;
+    t[OP_FNEG as usize] = op_fneg::<P>;
+    t[OP_FEQ as usize] = op_feq::<P>;
+    t[OP_FLT as usize] = op_flt::<P>;
+    t[OP_FLE as usize] = op_fle::<P>;
+    t[OP_FGT as usize] = op_fgt::<P>;
+    t[OP_FGE as usize] = op_fge::<P>;
+    t[OP_FNE as usize] = op_fne::<P>;
+    t[OP_FSIN as usize] = op_fsin::<P>;
+    t[OP_FCOS as usize] = op_fcos::<P>;
+    t[OP_FSQRT as usize] = op_fsqrt::<P>;
+    t[OP_FABS as usize] = op_fabs::<P>;
+    t[OP_FATAN2 as usize] = op_fatan2::<P>;
+    t[OP_FFLOOR as usize] = op_ffloor::<P>;
+    t[OP_FCEIL as usize] = op_fceil::<P>;
     t[OP_CALL_IMP as usize] = out_call_imp::<P>;
     t[OP_FN_REF as usize] = out_fn_ref::<P>;
     // The handlers here (after the out-of-line ones: RET and SYSCALL have both).

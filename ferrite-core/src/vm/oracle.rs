@@ -549,4 +549,106 @@ impl Vm {
             None => self.fail(fault::BAD_ARRAY),
         }
     }
+
+    // --- Float32 (a `tc` handler each) ---
+    fn op_itof(&mut self) {
+        let i = self.pop();
+        self.push((i as f32).to_bits() as i32);
+    }
+
+    fn op_ftoi(&mut self) {
+        let bits = self.pop() as u32;
+        self.push(f32::from_bits(bits) as i32);
+    }
+
+    fn op_fadd(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push((a + b).to_bits() as i32);
+    }
+
+    fn op_fsub(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push((a - b).to_bits() as i32);
+    }
+
+    fn op_fmul(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push((a * b).to_bits() as i32);
+    }
+
+    fn op_fdiv(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push(if b != 0.0 { a / b } else { 0.0 }.to_bits() as i32);
+    }
+
+    fn op_fneg(&mut self) {
+        let a = f32::from_bits(self.pop() as u32);
+        self.push((-a).to_bits() as i32);
+    }
+
+    fn op_feq(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push(if a == b { 1 } else { 0 });
+    }
+
+    fn op_flt(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push(if a < b { 1 } else { 0 });
+    }
+
+    fn op_fle(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push(if a <= b { 1 } else { 0 });
+    }
+
+    fn op_fgt(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push(if a > b { 1 } else { 0 });
+    }
+
+    fn op_fge(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push(if a >= b { 1 } else { 0 });
+    }
+
+    fn op_fne(&mut self) {
+        let (a, b) = self.pop2_f32();
+        self.push(if a != b { 1 } else { 0 });
+    }
+
+    // --- Float math (trig / sqrt / rounding) ---
+    fn op_fsin(&mut self) {
+        let v = f32::from_bits(self.pop() as u32);
+        self.push(libm::sinf(v).to_bits() as i32);
+    }
+
+    fn op_fcos(&mut self) {
+        let v = f32::from_bits(self.pop() as u32);
+        self.push(libm::cosf(v).to_bits() as i32);
+    }
+
+    fn op_fsqrt(&mut self) {
+        let v = f32::from_bits(self.pop() as u32);
+        self.push(libm::sqrtf(v).to_bits() as i32);
+    }
+
+    fn op_fabs(&mut self) {
+        let v = f32::from_bits(self.pop() as u32);
+        self.push(libm::fabsf(v).to_bits() as i32);
+    }
+
+    fn op_fatan2(&mut self) {
+        let (y, x) = self.pop2_f32();
+        self.push(libm::atan2f(y, x).to_bits() as i32);
+    }
+
+    fn op_ffloor(&mut self) {
+        let v = f32::from_bits(self.pop() as u32);
+        self.push(libm::floorf(v).to_bits() as i32);
+    }
+
+    fn op_fceil(&mut self) {
+        let v = f32::from_bits(self.pop() as u32);
+        self.push(libm::ceilf(v).to_bits() as i32);
+    }
 }

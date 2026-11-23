@@ -4046,6 +4046,11 @@ mod anim_tests {
             (Q_ADD_VI_L, 3), (Q_ARR_LOAD_V_L, 1), (Q_ARR_LOAD_V_G, 1),
             // Arrays: global 1 / local 1 hold one, other variables mostly not.
             (OP_ARR_LOAD, 0), (OP_ARR_LOAD_V, 1), (OP_ARR_LOAD_V, 1),
+            // f32 on the stack's raw bits (NaNs and infinities included).
+            (OP_ITOF, 0), (OP_FTOI, 0), (OP_FADD, 0), (OP_FSUB, 0), (OP_FMUL, 0),
+            (OP_FDIV, 0), (OP_FNEG, 0), (OP_FEQ, 0), (OP_FLT, 0), (OP_FLE, 0),
+            (OP_FGT, 0), (OP_FGE, 0), (OP_FNE, 0), (OP_FSIN, 0), (OP_FCOS, 0),
+            (OP_FSQRT, 0), (OP_FABS, 0), (OP_FATAN2, 0), (OP_FFLOOR, 0), (OP_FCEIL, 0),
         ];
         // The quickened jumps (JCMP, JCMP_VI, JCMP_VV forms).
         let q_jump = |op: u8| (Q_FIRST..Q_FIRST + 18).contains(&op);
